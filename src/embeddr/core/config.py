@@ -10,7 +10,9 @@ from pathlib import Path
 def get_data_dir():
     # Default to ~/.local/share/embeddr on Linux, or ~/embeddr as a fallback
     default_path = Path.home() / ".local" / "share" / "embeddr"
-    if not default_path.parent.exists():  # If .local/share doesn't exist (non-linux or weird setup)
+    if (
+        not default_path.parent.exists()
+    ):  # If .local/share doesn't exist (non-linux or weird setup)
         default_path = Path.home() / "embeddr"
 
     return os.environ.get("EMBEDDR_DATA_DIR", str(default_path))

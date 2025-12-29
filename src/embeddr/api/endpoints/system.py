@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Query, HTTPException
 from typing import List
 from embeddr.core.logging_utils import get_logs
-from embeddr_core.services.embedding import get_loaded_model_name, load_model, unload_model
+from embeddr_core.services.embedding import (
+    get_loaded_model_name,
+    load_model,
+    unload_model,
+)
 
 router = APIRouter()
 
@@ -9,7 +13,7 @@ router = APIRouter()
 @router.get("/logs", response_model=List[str])
 async def get_system_logs(
     limit: int = Query(100, ge=1, le=1000),
-    filter: str | None = Query(None, description="Filter logs by string")
+    filter: str | None = Query(None, description="Filter logs by string"),
 ):
     """
     Get the latest system logs.
@@ -25,17 +29,15 @@ def get_available_models():
     loaded_model = get_loaded_model_name()
 
     models = [
-        {"id": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
-            "name": "ViT-BigG-14"},
+        {"id": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", "name": "ViT-BigG-14"},
         {"id": "laion/CLIP-ViT-g-14-laion2B-s34B-b88K", "name": "ViT-G-14"},
         {"id": "openai/clip-vit-base-patch32", "name": "ViT-Base-32"},
         {"id": "openai/clip-vit-base-patch16", "name": "ViT-Base-16"},
-        {"id": "openai/clip-vit-large-patch14",
-            "name": "ViT-Large-14"},
+        {"id": "openai/clip-vit-large-patch14", "name": "ViT-Large-14"},
     ]
 
     for m in models:
-        m["loaded"] = (m["id"] == loaded_model)
+        m["loaded"] = m["id"] == loaded_model
 
     return models
 
