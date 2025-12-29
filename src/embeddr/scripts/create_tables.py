@@ -1,7 +1,5 @@
-from embeddr import models
 from embeddr.db.session import create_db_and_tables
 import sys
-import os
 from pathlib import Path
 
 # Add parent directory to path

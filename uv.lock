@@ -346,7 +346,7 @@ wheels = [
 ]
 
 [[package]]
-name = "embeddr-api-local"
+name = "embeddr-cli"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

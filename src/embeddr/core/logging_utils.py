@@ -24,8 +24,9 @@ def setup_log_capture():
     access_logger = logging.getLogger("uvicorn.access")
 
     deque_handler = DequeHandler()
-    deque_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    deque_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
 
     root_logger.addHandler(deque_handler)
     uv_logger.addHandler(deque_handler)

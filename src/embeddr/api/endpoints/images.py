@@ -1,4 +1,3 @@
-from typing import List
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select, func
@@ -12,7 +11,11 @@ import shutil
 import uuid
 from PIL import Image
 from embeddr_core.services.vector_store import get_vector_store
-from embeddr_core.services.embedding import get_text_embedding, get_image_embedding, get_loaded_model_name
+from embeddr_core.services.embedding import (
+    get_text_embedding,
+    get_image_embedding,
+    get_loaded_model_name,
+)
 
 router = APIRouter()
 
@@ -21,14 +24,15 @@ router = APIRouter()
 async def upload_image(
     file: UploadFile = File(...),
     prompt: str = Form(None),
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     # Find or create default library "Uploads"
     upload_dir = Path(settings.DATA_DIR) / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    library = session.exec(select(LibraryPath).where(
-        LibraryPath.path == str(upload_dir))).first()
+    library = session.exec(
+        select(LibraryPath).where(LibraryPath.path == str(upload_dir))
+    ).first()
     if not library:
         library = LibraryPath(path=str(upload_dir), name="Uploads")
         session.add(library)
@@ -58,7 +62,7 @@ async def upload_image(
         width=width,
         height=height,
         mime_type=mime_type,
-        prompt=prompt
+        prompt=prompt,
     )
     session.add(local_image)
     session.commit()
@@ -72,10 +76,11 @@ async def upload_image(
         model_name = get_loaded_model_name() or "openai/clip-vit-base-patch32"
         embedding = get_image_embedding(image_bytes, model_name=model_name)
         store = get_vector_store(model_name=model_name)
-        store.add(local_image.id, embedding, {
-            "path": local_image.path,
-            "library_id": library.id
-        })
+        store.add(
+            local_image.id,
+            embedding,
+            {"path": local_image.path, "library_id": library.id},
+        )
     except Exception as e:
         print(f"Failed to generate embedding: {e}")
 
@@ -103,7 +108,7 @@ def list_images(
     collection_id: int | None = None,
     sort: str = "new",
     q: str | None = None,
-    model: str | None = Query(None)
+    model: str | None = Query(None),
 ):
     # Use loaded model if available and no specific model requested
     if model is None:
@@ -121,21 +126,32 @@ def list_images(
 
             allowed_ids = None
             if collection_id:
-                allowed_ids = set(session.exec(select(CollectionItem.image_id).where(
-                    CollectionItem.collection_id == collection_id)).all())
+                allowed_ids = set(
+                    session.exec(
+                        select(CollectionItem.image_id).where(
+                            CollectionItem.collection_id == collection_id
+                        )
+                    ).all()
+                )
                 if not allowed_ids:
                     return {"total": 0, "items": [], "skip": skip, "limit": limit}
 
             results = store.search(
-                query_vector, limit=limit, offset=skip, filter=search_filter, allowed_ids=allowed_ids)
+                query_vector,
+                limit=limit,
+                offset=skip,
+                filter=search_filter,
+                allowed_ids=allowed_ids,
+            )
 
             ids = [id for id, score in results]
 
             if not ids:
                 return {"total": 0, "items": [], "skip": skip, "limit": limit}
 
-            images = session.exec(select(LocalImage).where(
-                LocalImage.id.in_(ids))).all()
+            images = session.exec(
+                select(LocalImage).where(LocalImage.id.in_(ids))
+            ).all()
             image_map = {img.id: img for img in images}
 
             ordered_images = []
@@ -147,7 +163,7 @@ def list_images(
                 "total": len(ordered_images),  # Approximate
                 "items": ordered_images,
                 "skip": skip,
-                "limit": limit
+                "limit": limit,
             }
         except Exception as e:
             print(f"Search error: {e}")
@@ -158,14 +174,18 @@ def list_images(
 
     if library_id:
         query = query.where(LocalImage.library_path_id == library_id)
-        count_query = count_query.where(
-            LocalImage.library_path_id == library_id)
+        count_query = count_query.where(LocalImage.library_path_id == library_id)
 
     if collection_id:
         query = query.join(CollectionItem).where(
-            CollectionItem.collection_id == collection_id)
-        count_query = select(func.count()).select_from(LocalImage).join(CollectionItem).where(
-            CollectionItem.collection_id == collection_id)
+            CollectionItem.collection_id == collection_id
+        )
+        count_query = (
+            select(func.count())
+            .select_from(LocalImage)
+            .join(CollectionItem)
+            .where(CollectionItem.collection_id == collection_id)
+        )
 
     if sort == "new":
         query = query.order_by(LocalImage.created_at.desc())
@@ -178,12 +198,7 @@ def list_images(
     # Get items
     images = session.exec(query.offset(skip).limit(limit)).all()
 
-    return {
-        "total": total,
-        "items": images,
-        "skip": skip,
-        "limit": limit
-    }
+    return {"total": total, "items": images, "skip": skip, "limit": limit}
 
 
 @router.get("/{image_id}", response_model=LocalImage)
@@ -201,8 +216,7 @@ def get_image_file(image_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Image not found")
 
     if not os.path.exists(image.path):
-        raise HTTPException(
-            status_code=404, detail="Image file not found on disk")
+        raise HTTPException(status_code=404, detail="Image file not found on disk")
 
     return FileResponse(image.path)
 
@@ -244,7 +258,7 @@ def get_similar_images(
     library_id: int | None = None,
     collection_id: int | None = None,
     model: str | None = Query(None),
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     # Use loaded model if available and no specific model requested
     if model is None:
@@ -263,22 +277,27 @@ def get_similar_images(
 
     allowed_ids = None
     if collection_id:
-        allowed_ids = set(session.exec(select(CollectionItem.image_id).where(
-            CollectionItem.collection_id == collection_id)).all())
+        allowed_ids = set(
+            session.exec(
+                select(CollectionItem.image_id).where(
+                    CollectionItem.collection_id == collection_id
+                )
+            ).all()
+        )
         if not allowed_ids:
             return {"total": 0, "items": [], "skip": skip, "limit": limit}
 
     # Search
-    results = store.search(vector, limit=limit,
-                           offset=skip, filter=search_filter, allowed_ids=allowed_ids)
+    results = store.search(
+        vector, limit=limit, offset=skip, filter=search_filter, allowed_ids=allowed_ids
+    )
 
     ids = [id for id, score in results]
 
     if not ids:
         return {"total": 0, "items": [], "skip": skip, "limit": limit}
 
-    images = session.exec(select(LocalImage).where(
-        LocalImage.id.in_(ids))).all()
+    images = session.exec(select(LocalImage).where(LocalImage.id.in_(ids))).all()
     image_map = {img.id: img for img in images}
 
     ordered_images = []
@@ -290,5 +309,5 @@ def get_similar_images(
         "total": len(ordered_images),
         "items": ordered_images,
         "skip": skip,
-        "limit": limit
+        "limit": limit,
     }

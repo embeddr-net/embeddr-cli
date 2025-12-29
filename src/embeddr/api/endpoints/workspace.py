@@ -34,20 +34,22 @@ class LibraryPathWithCount(BaseModel):
 def add_library_path(path_data: PathCreate, session: Session = Depends(get_session)):
     # Check if path exists on disk
     import os
+
     if not os.path.exists(path_data.path):
         if path_data.create_if_missing:
             try:
                 os.makedirs(path_data.path, exist_ok=True)
             except Exception as e:
                 raise HTTPException(
-                    status_code=500, detail=f"Failed to create directory: {e}")
+                    status_code=500, detail=f"Failed to create directory: {e}"
+                )
         else:
-            raise HTTPException(
-                status_code=400, detail="Path does not exist on server")
+            raise HTTPException(status_code=400, detail="Path does not exist on server")
 
     # Check if already exists in DB
-    existing = session.exec(select(LibraryPath).where(
-        LibraryPath.path == path_data.path)).first()
+    existing = session.exec(
+        select(LibraryPath).where(LibraryPath.path == path_data.path)
+    ).first()
     if existing:
         raise HTTPException(status_code=400, detail="Path already added")
 
@@ -60,17 +62,16 @@ def add_library_path(path_data: PathCreate, session: Session = Depends(get_sessi
 
 @router.get("/paths", response_model=List[LibraryPathWithCount])
 def list_library_paths(session: Session = Depends(get_session)):
-    statement = select(LibraryPath, func.count(LocalImage.id)).outerjoin(
-        LocalImage).group_by(LibraryPath.id)
+    statement = (
+        select(LibraryPath, func.count(LocalImage.id))
+        .outerjoin(LocalImage)
+        .group_by(LibraryPath.id)
+    )
     results = session.exec(statement).all()
 
     return [
-        LibraryPathWithCount(
-            id=lib.id,
-            path=lib.path,
-            name=lib.name,
-            image_count=count
-        ) for lib, count in results
+        LibraryPathWithCount(id=lib.id, path=lib.path, name=lib.name, image_count=count)
+        for lib, count in results
     ]
 
 
@@ -85,7 +86,9 @@ def remove_library_path(path_id: int, session: Session = Depends(get_session)):
 
 
 @router.put("/paths/{path_id}", response_model=LibraryPath)
-def update_library_path(path_id: int, path_data: PathUpdate, session: Session = Depends(get_session)):
+def update_library_path(
+    path_id: int, path_data: PathUpdate, session: Session = Depends(get_session)
+):
     path = session.get(LibraryPath, path_id)
     if not path:
         raise HTTPException(status_code=404, detail="Path not found")
@@ -109,8 +112,7 @@ def generate_thumbnails(path_id: int, session: Session = Depends(get_session)):
     output_dir = Path(settings.THUMBNAILS_DIR) / str(path.id)
 
     count = generate_thumbnails_for_library(
-        library_path=Path(path.path),
-        output_dir=output_dir
+        library_path=Path(path.path), output_dir=output_dir
     )
 
     return {"message": "Thumbnail generation complete", "generated": count}
@@ -121,7 +123,7 @@ def generate_embeddings(
     path_id: int,
     model: str | None = Query(None),
     batch_size: int = 10,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     path = session.get(LibraryPath, path_id)
     if not path:
@@ -151,7 +153,7 @@ def generate_embeddings(
                 model_name=model_name,
                 batch_size=batch_size,
                 stop_event=stop_event,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
             )
 
     try:
@@ -160,7 +162,7 @@ def generate_embeddings(
             job_wrapper,
             library_id=path.id,
             model_name=model,
-            batch_size=batch_size
+            batch_size=batch_size,
         )
         return {"message": "Embedding generation started", "job_id": job_id}
     except ValueError as e:

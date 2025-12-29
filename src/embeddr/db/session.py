@@ -5,8 +5,9 @@ from functools import lru_cache
 
 @lru_cache()
 def get_engine():
-    connect_args = {
-        "check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+    connect_args = (
+        {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+    )
     return create_engine(settings.DATABASE_URL, connect_args=connect_args)
 
 

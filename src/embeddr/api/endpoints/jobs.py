@@ -1,8 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from embeddr_core.services.job_manager import job_manager
 from typing import Dict, Any
 import shutil
-import os
 
 router = APIRouter()
 
@@ -23,10 +22,7 @@ def stop_job():
 @router.get("/stats")
 def get_system_stats() -> Dict[str, Any]:
     """Get system stats including GPU usage if available."""
-    stats = {
-        "gpu": None,
-        "disk": {}
-    }
+    stats = {"gpu": None, "disk": {}}
 
     # Disk usage
     try:
@@ -35,7 +31,7 @@ def get_system_stats() -> Dict[str, Any]:
             "total_gb": round(total / (1024**3), 2),
             "used_gb": round(used / (1024**3), 2),
             "free_gb": round(free / (1024**3), 2),
-            "percent": round((used / total) * 100, 1)
+            "percent": round((used / total) * 100, 1),
         }
     except:
         pass
@@ -43,12 +39,19 @@ def get_system_stats() -> Dict[str, Any]:
     # GPU usage via torch if available
     try:
         import torch
+
         if torch.cuda.is_available():
             stats["gpu"] = {
                 "name": torch.cuda.get_device_name(0),
-                "memory_allocated_mb": round(torch.cuda.memory_allocated(0) / (1024**2), 2),
-                "memory_reserved_mb": round(torch.cuda.memory_reserved(0) / (1024**2), 2),
-                "max_memory_allocated_mb": round(torch.cuda.max_memory_allocated(0) / (1024**2), 2)
+                "memory_allocated_mb": round(
+                    torch.cuda.memory_allocated(0) / (1024**2), 2
+                ),
+                "memory_reserved_mb": round(
+                    torch.cuda.memory_reserved(0) / (1024**2), 2
+                ),
+                "max_memory_allocated_mb": round(
+                    torch.cuda.max_memory_allocated(0) / (1024**2), 2
+                ),
             }
     except ImportError:
         pass

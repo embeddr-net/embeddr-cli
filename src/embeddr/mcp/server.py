@@ -4,7 +4,11 @@ from embeddr.db.session import get_engine
 from embeddr_core.models.library import LocalImage, LibraryPath
 from embeddr_core.models.collection import Collection, CollectionItem
 from embeddr_core.services.vector_store import get_vector_store
-from embeddr_core.services.embedding import get_text_embedding, get_image_embedding, get_loaded_model_name
+from embeddr_core.services.embedding import (
+    get_text_embedding,
+    get_image_embedding,
+    get_loaded_model_name,
+)
 import base64
 
 # Initialize FastMCP server
@@ -33,8 +37,9 @@ def search_images(query: str, limit: int = 5) -> list[dict]:
             return []
 
         with get_db_session() as session:
-            images = session.exec(select(LocalImage).where(
-                LocalImage.id.in_(ids))).all()
+            images = session.exec(
+                select(LocalImage).where(LocalImage.id.in_(ids))
+            ).all()
             # Map scores to images
             score_map = {id: score for id, score in results}
 
@@ -43,7 +48,7 @@ def search_images(query: str, limit: int = 5) -> list[dict]:
                     "id": img.id,
                     "path": img.path,
                     "prompt": img.prompt,
-                    "score": score_map.get(img.id, 0)
+                    "score": score_map.get(img.id, 0),
                 }
                 for img in images
             ]
@@ -72,8 +77,9 @@ def search_by_image_id(image_id: int, limit: int = 5) -> list[dict]:
             return []
 
         with get_db_session() as session:
-            images = session.exec(select(LocalImage).where(
-                LocalImage.id.in_(ids))).all()
+            images = session.exec(
+                select(LocalImage).where(LocalImage.id.in_(ids))
+            ).all()
             score_map = {id: score for id, score in results}
 
             return [
@@ -81,7 +87,7 @@ def search_by_image_id(image_id: int, limit: int = 5) -> list[dict]:
                     "id": img.id,
                     "path": img.path,
                     "prompt": img.prompt,
-                    "score": score_map.get(img.id, 0)
+                    "score": score_map.get(img.id, 0),
                 }
                 for img in images
             ]
@@ -111,8 +117,9 @@ def search_by_image_upload(image_base64: str, limit: int = 5) -> list[dict]:
             return []
 
         with get_db_session() as session:
-            images = session.exec(select(LocalImage).where(
-                LocalImage.id.in_(ids))).all()
+            images = session.exec(
+                select(LocalImage).where(LocalImage.id.in_(ids))
+            ).all()
             score_map = {id: score for id, score in results}
 
             return [
@@ -120,7 +127,7 @@ def search_by_image_upload(image_base64: str, limit: int = 5) -> list[dict]:
                     "id": img.id,
                     "path": img.path,
                     "prompt": img.prompt,
-                    "score": score_map.get(img.id, 0)
+                    "score": score_map.get(img.id, 0),
                 }
                 for img in images
             ]
@@ -135,7 +142,9 @@ def list_libraries() -> str:
         libraries = session.exec(select(LibraryPath)).all()
         if not libraries:
             return "No libraries found."
-        return "\n".join([f"ID: {lib.id} | Name: {lib.name} | Path: {lib.path}" for lib in libraries])
+        return "\n".join(
+            [f"ID: {lib.id} | Name: {lib.name} | Path: {lib.path}" for lib in libraries]
+        )
 
 
 @mcp.resource("collections://list")
@@ -153,8 +162,9 @@ def create_collection(name: str) -> str:
     """Create a new image collection with the given name."""
     with get_db_session() as session:
         # Check if exists
-        existing = session.exec(select(Collection).where(
-            Collection.name == name)).first()
+        existing = session.exec(
+            select(Collection).where(Collection.name == name)
+        ).first()
         if existing:
             return f"Collection '{name}' already exists with ID {existing.id}"
 
@@ -224,8 +234,7 @@ def add_images_to_collection(image_ids: list[int], collection_id: int) -> str:
             if exists:
                 continue
 
-            item = CollectionItem(
-                collection_id=collection_id, image_id=image_id)
+            item = CollectionItem(collection_id=collection_id, image_id=image_id)
             session.add(item)
             added_count += 1
 
@@ -251,11 +260,4 @@ def get_collection_items(collection_id: int) -> list[dict]:
             .where(CollectionItem.collection_id == collection_id)
         ).all()
 
-        return [
-            {
-                "id": img.id,
-                "path": img.path,
-                "prompt": img.prompt
-            }
-            for img in items
-        ]
+        return [{"id": img.id, "path": img.path, "prompt": img.prompt} for img in items]
