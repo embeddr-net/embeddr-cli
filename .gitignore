@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+static/dist
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+*venv
+
+data*
+
+# Local API frontend build
+src/embeddr/web/*
