@@ -84,7 +84,19 @@ url = "http://localhost:8003/mcp/messages"
 
 > Anything that uses [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) will also work.
 
+## Screenshots
+
+### Home Page
+
+![webui index](.github/assets/webui_1.webp)
+
+### Settings Page
+
+![webui settings](.github/assets/webui_2.webp)
+
 ## Development
+
+Instructions to run a development version.
 
 ```sh
 git clone https://github.com/embeddr-net/embeddr-cli
@@ -98,7 +110,7 @@ uv pip install -e .
 uv run embeddr serve --reload 
 ```
 
-> This repo does not include the [frontend](https://github.com/embeddr-net/embeddr-frontend)
+> While releases do include the [frontend](https://github.com/embeddr-net/embeddr-frontend), this repo does not.
 >
 > You can run a [development frontend](https://github.com/embeddr-net/embeddr-frontend?tab=readme-ov-file#Development) or download the [latest version](https://github.com/embeddr-net/embeddr-frontend/releases) and extract it into `embeddr-cli/src/web/`
 
