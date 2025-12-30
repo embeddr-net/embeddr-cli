@@ -22,6 +22,8 @@ jobs:
                   persist-credentials: false
 
             - name: Download Frontend Artifact
+              env:
+                  GH_TOKEN: ${{ github.token }}
               run: |
                   # Download latest public release asset from frontend repo
                   gh release download --repo embeddr-net/embeddr-frontend --pattern "frontend-dist.zip" --dir .
