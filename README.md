@@ -65,6 +65,8 @@ Once installed to start Embeddr
 
 `comfy node install embeddr-extension`
 
+![comfyui_example](https://github.com/embeddr-net/embeddr-comfyui/blob/main/.github/assets/example_1.webp?raw=true)
+
 [View Registry](https://registry.comfy.org/publishers/nynxz/nodes/embeddr-extension)
 
 ### [Mistral Vibe MCP](https://github.com/mistralai/mistral-vibe)
