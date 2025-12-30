@@ -1,0 +1,80 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "v*"
+    workflow_dispatch:
+
+permissions:
+    contents: write
+    id-token: write # Required for PyPI Trusted Publishing
+
+jobs:
+    build:
+        name: Build Package
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout CLI
+              uses: actions/checkout@v6
+              with:
+                  persist-credentials: false
+
+            - name: Download Frontend Artifact
+              run: |
+                  # Download latest public release asset from frontend repo
+                  gh release download --repo embeddr-net/embeddr-frontend --pattern "frontend-dist.zip" --dir .
+
+                  # Create target directory
+                  mkdir -p src/embeddr/web
+
+                  # Unzip into target
+                  unzip frontend-dist.zip -d src/embeddr/web
+
+                  # Cleanup
+                  rm frontend-dist.zip
+
+            - name: Set up Python
+              uses: actions/setup-python@v6
+              with:
+                  python-version: "3.12"
+
+            - name: Install build dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install build
+
+            - name: Build Python Package
+              run: python -m build
+
+            - name: Upload artifacts
+              uses: actions/upload-artifact@v6
+              with:
+                  name: dist
+                  path: dist/
+
+    release:
+        name: Publish Release
+        needs: build
+        runs-on: ubuntu-latest
+        environment:
+            name: pypi
+            url: https://pypi.org/p/embeddr-cli
+
+        steps:
+            - name: Download artifacts
+              uses: actions/download-artifact@v6
+              with:
+                  name: dist
+                  path: dist/
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: dist/*
+                  generate_release_notes: true
+                  make_latest: true
+
+            - name: Publish to PyPI via OIDC
+              uses: pypa/gh-action-pypi-publish@release/v1
