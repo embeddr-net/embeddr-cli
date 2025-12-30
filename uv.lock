@@ -347,7 +347,7 @@ wheels = [
 
 [[package]]
 name = "embeddr-cli"
-version = "0.1.1"
+version = "0.1.3"
 source = { editable = "." }
 dependencies = [
     { name = "embeddr-core" },
@@ -370,7 +370,7 @@ torch = [
 
 [package.metadata]
 requires-dist = [
-    { name = "embeddr-core", specifier = ">=0.1.3" },
+    { name = "embeddr-core", specifier = ">=0.1.4" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.128.0" },
     { name = "fastmcp", specifier = ">=2.14.1" },
     { name = "numpy", specifier = ">=2.4.0" },
@@ -387,7 +387,7 @@ provides-extras = ["torch"]
 
 [[package]]
 name = "embeddr-core"
-version = "0.1.3"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -397,9 +397,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d9/35/90a97d562cefec880abe428091094c1591491a119dbd53b84c75ea1b18d7/embeddr_core-0.1.3.tar.gz", hash = "sha256:188423910d1876e96f67567ad17a578c4bf5c6d514e3c43e69cac234fe766ec2", size = 9882, upload-time = "2025-12-29T09:48:30.509Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/13/53e4444de59369aa27f3e6f6b0ddd877aa86faf8107e6c41a96eb5ade90d/embeddr_core-0.1.4.tar.gz", hash = "sha256:0e525e84062ea5c5fb06737838c6970b0db317bc020b750af266ea5095294d68", size = 23327, upload-time = "2025-12-30T07:37:17.525Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/34/2739ef0b822ebe1f49b34ea64d1c17737195c21eb37d1295e3482147d860/embeddr_core-0.1.3-py3-none-any.whl", hash = "sha256:300b527d305a5cea00d8869e227ebd857c8b5ba5a1caebb588173ba0afa2c3c5", size = 11913, upload-time = "2025-12-29T09:48:29.394Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/2e/6f08a064fd2f3f206e54659a4fd417c27516c8899885cb6383d2f986c822/embeddr_core-0.1.4-py3-none-any.whl", hash = "sha256:8461507e5192efe216624d0d4811ace10b2ed3a48405c201571a6bbaaafd2587", size = 24852, upload-time = "2025-12-30T07:37:15.715Z" },
 ]
 
 [[package]]
