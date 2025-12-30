@@ -84,7 +84,21 @@ url = "http://localhost:8003/mcp/messages"
 
 ## Development
 
-`coming soon`
+```sh
+git clone https://github.com/embeddr-net/embeddr-cli
+cd embeddr-cli
+uv venv
+uv pip install -e .
+
+# Install Torch
+
+# Start Embeddr API with live reload
+uv run embeddr serve --reload 
+```
+
+> This repo does not include the [frontend](https://github.com/embeddr-net/embeddr-frontend)
+>
+> You can run a [development frontend](https://github.com/embeddr-net/embeddr-frontend?tab=readme-ov-file#Development) or download the [latest version](https://github.com/embeddr-net/embeddr-frontend/releases) and extract it into `embeddr-cli/src/web/`
 
 ## Packages
 
