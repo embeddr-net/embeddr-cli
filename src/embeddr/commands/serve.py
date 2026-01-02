@@ -114,7 +114,15 @@ def dynamic_origins() -> list[str]:
     return [f"http://{host}:{port}"]
 
 
-def create_app(enable_mcp: bool = False, enable_docs: bool = False) -> FastAPI:
+def comfy_origins() -> list[str]:
+    logger.info("Loading ComfyUI CORS origins...")
+    return [
+        "http://localhost:8188",  # ComfyUI default
+        "http://127.0.0.1:8188",  # ComfyUI default
+    ]
+
+
+def create_app(enable_mcp: bool = False, enable_docs: bool = False, enable_comfy: bool = False) -> FastAPI:
     app = FastAPI(
         title="Embeddr Local",
         lifespan=lifespan,
@@ -127,6 +135,8 @@ def create_app(enable_mcp: bool = False, enable_docs: bool = False) -> FastAPI:
     allowed_origins: set[str] = set(default_local_origins(port))
     allowed_origins |= set(parse_env_origins())
     allowed_origins |= set(dynamic_origins())
+    if enable_comfy:
+        allowed_origins |= set(comfy_origins())
     if os.environ.get("EMBEDDR_ALLOW_DEV_ORIGINS", "false").lower() == "true":
         allowed_origins |= set(dev_origins())
 
@@ -198,6 +208,7 @@ def register(app: typer.Typer):
         dev_origins: bool = typer.Option(
             False, help="Enable development CORS origins."),
         mcp: bool = typer.Option(False, help="Enable MCP server."),
+        comfy: bool = typer.Option(False, help="Enable ComfyUI integration."),
         docs: bool = typer.Option(False, help="Enable API docs."),
     ):
         """
@@ -207,6 +218,7 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_HOST"] = host
         os.environ["EMBEDDR_PORT"] = str(port)
         os.environ["EMBEDDR_ENABLE_MCP"] = str(mcp).lower()
+        os.environ["EMBEDDR_ENABLE_COMFY"] = str(comfy).lower()
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
 
@@ -235,6 +247,10 @@ def register(app: typer.Typer):
 
 def create_app_factory() -> FastAPI:
     """Factory function for uvicorn reload mode"""
-    enable_mcp = os.environ.get("EMBEDDR_ENABLE_MCP", "false").lower() == "true"
-    enable_docs = os.environ.get("EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
-    return create_app(enable_mcp=enable_mcp, enable_docs=enable_docs)
+    enable_mcp = os.environ.get(
+        "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    enable_docs = os.environ.get(
+        "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
+    enable_comfy = os.environ.get(
+        "EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
+    return create_app(enable_mcp=enable_mcp, enable_docs=enable_docs, enable_comfy=enable_comfy)
