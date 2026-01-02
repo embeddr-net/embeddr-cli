@@ -1,20 +1,22 @@
-import typer
-import uvicorn
-from pathlib import Path
+import logging
 import os
 import sys
-import logging
 import warnings
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+import typer
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-# Internal imports - now from the embeddr package
-from embeddr.db.session import create_db_and_tables
 from embeddr.api import routes
 from embeddr.core.logging_utils import setup_logging
+
+# Internal imports - now from the embeddr package
+from embeddr.db.session import create_db_and_tables
 from embeddr.mcp.server import mcp
 
 # Add embeddr-core to path if it exists as a sibling
@@ -122,7 +124,9 @@ def comfy_origins() -> list[str]:
     ]
 
 
-def create_app(enable_mcp: bool = False, enable_docs: bool = False, enable_comfy: bool = False) -> FastAPI:
+def create_app(
+    enable_mcp: bool = False, enable_docs: bool = False, enable_comfy: bool = False
+) -> FastAPI:
     app = FastAPI(
         title="Embeddr Local",
         lifespan=lifespan,
@@ -187,6 +191,7 @@ def create_app(enable_mcp: bool = False, enable_docs: bool = False, enable_comfy
 
             # Otherwise return index.html for React Router to handle
             return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
     else:
         logger.warning(
             f"Frontend directory not found at {FRONTEND_DIR}. WebUI will not be available."
@@ -206,7 +211,8 @@ def register(app: typer.Typer):
         port: int = typer.Option(8003, help="The port to bind to."),
         reload: bool = typer.Option(False, help="Enable auto-reload."),
         dev_origins: bool = typer.Option(
-            False, help="Enable development CORS origins."),
+            False, help="Enable development CORS origins."
+        ),
         mcp: bool = typer.Option(False, help="Enable MCP server."),
         comfy: bool = typer.Option(False, help="Enable ComfyUI integration."),
         docs: bool = typer.Option(False, help="Enable API docs."),
@@ -238,7 +244,7 @@ def register(app: typer.Typer):
             )
         else:
             uvicorn.run(
-                create_app(enable_mcp=mcp, enable_docs=docs),
+                create_app(enable_mcp=mcp, enable_docs=docs, enable_comfy=comfy),
                 host=host,
                 port=port,
                 log_level="warning",
@@ -247,10 +253,9 @@ def register(app: typer.Typer):
 
 def create_app_factory() -> FastAPI:
     """Factory function for uvicorn reload mode"""
-    enable_mcp = os.environ.get(
-        "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
-    enable_docs = os.environ.get(
-        "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
-    enable_comfy = os.environ.get(
-        "EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
-    return create_app(enable_mcp=enable_mcp, enable_docs=enable_docs, enable_comfy=enable_comfy)
+    enable_mcp = os.environ.get("EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    enable_docs = os.environ.get("EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
+    enable_comfy = os.environ.get("EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
+    return create_app(
+        enable_mcp=enable_mcp, enable_docs=enable_docs, enable_comfy=enable_comfy
+    )

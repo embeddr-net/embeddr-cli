@@ -1,7 +1,8 @@
-from fastapi import APIRouter
-from embeddr_core.services.job_manager import job_manager
-from typing import Dict, Any
 import shutil
+from typing import Any, Dict
+
+from embeddr_core.services.job_manager import job_manager
+from fastapi import APIRouter
 
 router = APIRouter()
 
@@ -33,8 +34,9 @@ def get_system_stats() -> Dict[str, Any]:
             "free_gb": round(free / (1024**3), 2),
             "percent": round((used / total) * 100, 1),
         }
-    except:
-        pass
+    except Exception as e:
+        print(f"Failed to get disk usage: {e}")
+        stats["disk_error"] = str(e)
 
     # GPU usage via torch if available
     try:

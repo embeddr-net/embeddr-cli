@@ -53,5 +53,5 @@ def setup_logging():
 def get_logs(limit: int = 100, include_filter: str = None):
     logs = list(log_capture_deque)
     if include_filter:
-        logs = [l for l in logs if include_filter in l]
+        logs = [log for log in logs if include_filter in log]
     return logs[-limit:]

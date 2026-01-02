@@ -1,11 +1,10 @@
-from functools import lru_cache
 import os
 import platform
-from pydantic_settings import BaseSettings
-from pydantic import Field
-
-
+from functools import lru_cache
 from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 def get_data_dir() -> Path:
@@ -65,6 +64,7 @@ class Settings(BaseSettings):
     THUMBNAILS_DIR: Path = Field(default_factory=get_thumbnails_dir)
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)
     API_V1_STR: str = "/api/v1"
+    COMFYUI_URL: str = "http://127.0.0.1:8188"
 
     class Config:
         case_sensitive = True

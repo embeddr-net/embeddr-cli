@@ -1,6 +1,8 @@
-from sqlmodel import SQLModel, create_engine, Session
-from embeddr.core.config import settings
 from functools import lru_cache
+
+from sqlmodel import Session, SQLModel, create_engine
+
+from embeddr.core.config import settings
 
 
 @lru_cache()

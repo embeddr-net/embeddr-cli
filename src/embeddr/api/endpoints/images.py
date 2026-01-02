@@ -1,21 +1,30 @@
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
-from sqlmodel import Session, select, func
-from embeddr.db.session import get_session
-from embeddr_core.models.library import LocalImage, LibraryPath
-from embeddr_core.models.collection import CollectionItem
-from embeddr.core.config import settings
-from pathlib import Path
+import json
 import os
 import shutil
 import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import List
+
+from embeddr_core.models.collection import CollectionItem
+from embeddr_core.models.library import LibraryPath, LocalImage
 from PIL import Image
 from embeddr_core.services.vector_store import get_vector_store
 from embeddr_core.services.embedding import (
     get_text_embedding,
     get_image_embedding,
     get_loaded_model_name,
+    get_text_embedding,
 )
+from embeddr_core.services.vector_store import get_vector_store
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from PIL import Image
+from sqlalchemy.orm import selectinload
+from sqlmodel import Session, SQLModel, func, select
+
+from embeddr.core.config import settings
+from embeddr.db.session import get_session
 
 router = APIRouter()
 
@@ -51,7 +60,8 @@ async def upload_image(
         with Image.open(file_path) as img:
             width, height = img.size
             mime_type = Image.MIME.get(img.format)
-    except:
+    except Exception as e:
+        print(f"Failed to get image metadata: {e}")
         width = height = None
         mime_type = "image/png"
 
