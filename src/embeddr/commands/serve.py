@@ -86,6 +86,34 @@ async def lifespan(app: FastAPI):
     logger.info("Embeddr Local is shutting down...")
 
 
+def default_local_origins(port: str) -> list[str]:
+    return [
+        f"http://localhost:{port}",
+        f"http://127.0.0.1:{port}",
+    ]
+
+
+def parse_env_origins() -> list[str]:
+    origins = os.environ.get("EMBEDDR_CORS_ORIGINS", "")
+    if not origins:
+        return []
+    logger.info("Loading CORS origins from EMBEDDR_CORS_ORIGINS...")
+    return [origin.strip() for origin in origins.split(",") if origin.strip()]
+
+
+def dev_origins() -> list[str]:
+    logger.info("Loading development CORS origins...")
+    return [
+        "http://localhost:3000",  # React Dev Server
+    ]
+
+
+def dynamic_origins() -> list[str]:
+    host = os.environ.get("EMBEDDR_HOST", "127.0.0.1")
+    port = os.environ.get("EMBEDDR_PORT", "8003")
+    return [f"http://{host}:{port}"]
+
+
 def create_app(enable_mcp: bool = False, enable_docs: bool = False) -> FastAPI:
     app = FastAPI(
         title="Embeddr Local",
@@ -94,13 +122,24 @@ def create_app(enable_mcp: bool = False, enable_docs: bool = False) -> FastAPI:
         redoc_url="/api/v1/redoc" if enable_docs else None,
         openapi_url="/api/v1/openapi.json" if enable_docs else None,
     )
+
+    port = os.environ.get("EMBEDDR_PORT", "8003")
+    allowed_origins: set[str] = set(default_local_origins(port))
+    allowed_origins |= set(parse_env_origins())
+    allowed_origins |= set(dynamic_origins())
+    if os.environ.get("EMBEDDR_ALLOW_DEV_ORIGINS", "false").lower() == "true":
+        allowed_origins |= set(dev_origins())
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=list(allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
     )
+    typer.secho("🔐 Allowed CORS origins:", fg=typer.colors.CYAN)
+    for origin in allowed_origins:
+        typer.echo(f"   - {origin}")
 
     # Store MCP app in state if enabled
     if enable_mcp:
@@ -156,6 +195,8 @@ def register(app: typer.Typer):
         host: str = typer.Option("127.0.0.1", help="The host to bind to."),
         port: int = typer.Option(8003, help="The port to bind to."),
         reload: bool = typer.Option(False, help="Enable auto-reload."),
+        dev_origins: bool = typer.Option(
+            False, help="Enable development CORS origins."),
         mcp: bool = typer.Option(False, help="Enable MCP server."),
         docs: bool = typer.Option(False, help="Enable API docs."),
     ):
@@ -167,6 +208,7 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_PORT"] = str(port)
         os.environ["EMBEDDR_ENABLE_MCP"] = str(mcp).lower()
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
+        os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
 
         if reload:
             # When reloading, we can't pass the app instance directly
