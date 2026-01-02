@@ -1,11 +1,12 @@
-import typer
 import os
 import sys
-from embeddr.commands import serve, config
-from embeddr.core.config import refresh_settings, get_data_dir
-from embeddr.core.project import find_project_root, load_project_config
 from pathlib import Path
 
+import typer
+
+from embeddr.commands import config, serve
+from embeddr.core.config import get_data_dir, refresh_settings
+from embeddr.core.project import find_project_root, load_project_config
 
 app = typer.Typer()
 serve.register(app)
@@ -16,21 +17,18 @@ app.add_typer(config.app, name="config")
 @app.command()
 def init(
     name: str = typer.Option(None, help="Project name"),
-    path: Path = typer.Option(
-        Path.cwd(), help="Path to initialize project in"),
+    path: Path = typer.Option(Path.cwd(), help="Path to initialize project in"),
 ):
     """Initialize a new Embeddr project in the current directory."""
-    from embeddr.core.project import create_default_config, CONFIG_FILENAME
+    from embeddr.core.project import CONFIG_FILENAME, create_default_config
 
     if (path / CONFIG_FILENAME).exists():
-        typer.secho(
-            f"Project already initialized at {path}", fg=typer.colors.YELLOW)
+        typer.secho(f"Project already initialized at {path}", fg=typer.colors.YELLOW)
         return
 
     project_name = name or path.name
     create_default_config(path, project_name)
-    typer.secho(
-        f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
+    typer.secho(f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
     typer.echo(f"Created {CONFIG_FILENAME}")
 
 
@@ -65,8 +63,7 @@ def callback(
             if "host" in config["server"]:
                 os.environ.setdefault("EMBEDDR_HOST", config["server"]["host"])
             if "port" in config["server"]:
-                os.environ.setdefault(
-                    "EMBEDDR_PORT", str(config["server"]["port"]))
+                os.environ.setdefault("EMBEDDR_PORT", str(config["server"]["port"]))
 
         # Determine data directory
         if "paths" in config and "data_dir" in config["paths"]:

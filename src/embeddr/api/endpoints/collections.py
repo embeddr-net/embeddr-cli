@@ -1,10 +1,12 @@
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Body
-from sqlmodel import Session, select, func
-from embeddr.db.session import get_session
+
 from embeddr_core.models.collection import Collection, CollectionItem
 from embeddr_core.models.library import LocalImage
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
+from sqlmodel import Session, func, select
+
+from embeddr.db.session import get_session
 
 router = APIRouter()
 

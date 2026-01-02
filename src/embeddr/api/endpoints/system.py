@@ -1,11 +1,13 @@
-from fastapi import APIRouter, Query, HTTPException
 from typing import List
-from embeddr.core.logging_utils import get_logs
+
 from embeddr_core.services.embedding import (
     get_loaded_model_name,
     load_model,
     unload_model,
 )
+from fastapi import APIRouter, HTTPException, Query
+
+from embeddr.core.logging_utils import get_logs
 
 router = APIRouter()
 
