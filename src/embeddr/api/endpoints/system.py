@@ -1,15 +1,82 @@
-from typing import List
+from typing import List, Dict, Any
+import os
+import importlib.metadata
+
+from fastapi import APIRouter, HTTPException, Query, Depends
+from sqlmodel import Session, select, func
 
 from embeddr_core.services.embedding import (
     get_loaded_model_name,
     load_model,
     unload_model,
 )
-from fastapi import APIRouter, HTTPException, Query
+from embeddr_core.models.library import LocalImage, LibraryPath
 
 from embeddr.core.logging_utils import get_logs
+from embeddr.core.config_manager import config_manager, AppConfig
+from embeddr.core.config import settings
+from embeddr.db.session import get_engine
 
 router = APIRouter()
+
+
+def get_session():
+    with Session(get_engine()) as session:
+        yield session
+
+
+@router.get("/status")
+def get_system_status():
+    """
+    Get the status of system services.
+    """
+    return {
+        "mcp": os.environ.get("EMBEDDR_ENABLE_MCP", "false").lower() == "true",
+        "comfy": os.environ.get("EMBEDDR_ENABLE_COMFY", "false").lower() == "true",
+        "docs": os.environ.get("EMBEDDR_ENABLE_DOCS", "false").lower() == "true",
+    }
+
+
+@router.get("/info")
+def get_system_info(session: Session = Depends(get_session)):
+    """
+    Get system information including version, stats, etc.
+    """
+    try:
+        version = importlib.metadata.version("embeddr-cli")
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+
+    # Stats
+    image_count = session.exec(select(func.count(LocalImage.id))).one()
+    library_count = session.exec(select(func.count(LibraryPath.id))).one()
+
+    return {
+        "version": version,
+        "dev_mode": settings.DEV_MODE,
+        "stats": {
+            "images": image_count,
+            "libraries": library_count,
+        },
+        "db_version": "v1",  # Placeholder or fetch from alembic_version table
+    }
+
+
+@router.get("/config", response_model=AppConfig)
+def get_config():
+    """
+    Get current configuration.
+    """
+    return config_manager.config
+
+
+@router.patch("/config", response_model=AppConfig)
+def update_config(config_update: Dict[str, Any]):
+    """
+    Update configuration.
+    """
+    config_manager.update(config_update)
+    return config_manager.config
 
 
 @router.get("/logs", response_model=List[str])
