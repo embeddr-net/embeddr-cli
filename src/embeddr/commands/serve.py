@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import warnings
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from fastapi.staticfiles import StaticFiles
 
 from embeddr.api import routes
 from embeddr.core.logging_utils import setup_logging
+from embeddr.core.config import get_data_dir
+from embeddr.core.plugin_loader import load_python_plugins
+from embeddr.services.socket_manager import monitor_comfy_events
 
 # Internal imports - now from the embeddr package
 from embeddr.db.session import create_db_and_tables
@@ -27,6 +31,13 @@ DEFAULT_FRONTEND_DIR = PACKAGE_DIR / "web"
 core_path = Path(__file__).resolve().parents[4] / "embeddr-core" / "src"
 if core_path.exists():
     sys.path.append(str(core_path))
+
+try:
+    from embeddr_core.services.embedding import unload_model
+except ImportError:
+
+    def unload_model():
+        pass
 
 
 logger = logging.getLogger("embeddr.local")
@@ -59,6 +70,9 @@ async def lifespan(app: FastAPI):
     # Initialize DB, load models, etc.
     create_db_and_tables()
 
+    # Start ComfyUI WebSocket monitor
+    asyncio.create_task(monitor_comfy_events())
+
     typer.secho("\n✨ Embeddr Local API has started!", fg=typer.colors.GREEN, bold=True)
     typer.echo("   " + "-" * 45)
     typer.secho(f"   👉 Web UI:    http://{display_host}:{port}", fg=typer.colors.CYAN)
@@ -84,6 +98,9 @@ async def lifespan(app: FastAPI):
             yield
     else:
         yield
+
+    # Cleanup resources
+    unload_model()
 
     logger.info("Embeddr Local is shutting down...")
 
@@ -148,7 +165,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(allowed_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
     typer.secho("🔐 Allowed CORS origins:", fg=typer.colors.CYAN)
@@ -167,6 +184,19 @@ def create_app(
 
     # Include API Routes
     app.include_router(routes.router, prefix="/api/v1")
+
+    # Serve Plugins Directory
+    plugins_dir = os.environ.get("EMBEDDR_PLUGINS_DIR")
+    if not plugins_dir:
+        plugins_dir = str(Path.cwd() / "plugins")
+
+    if os.path.exists(plugins_dir):
+        app.mount("/plugins", StaticFiles(directory=plugins_dir), name="plugins")
+        logger.info(f"Serving plugins from {plugins_dir}")
+        # Load Python plugins
+        load_python_plugins(Path(plugins_dir), app)
+    else:
+        logger.info(f"Plugins directory not found at {plugins_dir}")
 
     # Serve Static Files (Frontend)
     if os.path.exists(FRONTEND_DIR):
@@ -216,6 +246,7 @@ def register(app: typer.Typer):
         mcp: bool = typer.Option(False, help="Enable MCP server."),
         comfy: bool = typer.Option(False, help="Enable ComfyUI integration."),
         docs: bool = typer.Option(False, help="Enable API docs."),
+        plugins_dir: str = typer.Option(None, help="Directory to serve plugins from."),
     ):
         """
         Start the Embeddr Local API server.
@@ -227,6 +258,46 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_ENABLE_COMFY"] = str(comfy).lower()
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
+
+        # Check if data directory exists
+        data_dir_env = os.environ.get("EMBEDDR_DATA_DIR")
+        if data_dir_env:
+            data_path = Path(data_dir_env)
+        else:
+            data_path = get_data_dir()
+
+        if not data_path.exists():
+            typer.secho(
+                f"\n⚠️  Data directory not found at: {data_path}", fg=typer.colors.YELLOW
+            )
+            if not typer.confirm("   Do you want to create it?"):
+                typer.echo("Aborting.")
+                raise typer.Exit()
+
+            # Create it now
+            try:
+                data_path.mkdir(parents=True, exist_ok=True)
+                typer.secho(
+                    f"   Created data directory at: {data_path}\n",
+                    fg=typer.colors.GREEN,
+                )
+            except Exception as e:
+                typer.secho(
+                    f"   Failed to create data directory: {e}", fg=typer.colors.RED
+                )
+                raise typer.Exit(1)
+
+        if plugins_dir:
+            os.environ["EMBEDDR_PLUGINS_DIR"] = str(Path(plugins_dir).resolve())
+        else:
+            # Default to data_dir/plugins
+            # We already resolved data_path above
+            base_dir = data_path
+
+            plugins_path = base_dir / "plugins"
+            # Create plugins directory if it doesn't exist
+            plugins_path.mkdir(parents=True, exist_ok=True)
+            os.environ["EMBEDDR_PLUGINS_DIR"] = str(plugins_path)
 
         if reload:
             # When reloading, we can't pass the app instance directly
