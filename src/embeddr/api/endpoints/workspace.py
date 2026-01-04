@@ -1,14 +1,16 @@
+from pathlib import Path
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func
-from embeddr.db.session import get_session
+
 from embeddr_core.models.library import LibraryPath, LocalImage
+from embeddr_core.services.embedding_manager import generate_embeddings_for_library
 from embeddr_core.services.scanner import scan_all_libraries
 from embeddr_core.services.thumbnails import generate_thumbnails_for_library
-from embeddr_core.services.embedding_manager import generate_embeddings_for_library
-from embeddr.core.config import settings
-from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlmodel import Session, func, select
+
+from embeddr.core.config import settings
+from embeddr.db.session import get_session
 
 router = APIRouter()
 
@@ -34,6 +36,15 @@ class LibraryPathWithCount(BaseModel):
 def add_library_path(path_data: PathCreate, session: Session = Depends(get_session)):
     # Check if path exists on disk
     import os
+
+    # If path is just a name (no slashes), assume it's a new library in the data dir
+    if "/" not in path_data.path and "\\" not in path_data.path:
+        # It's a name, create it in DATA_DIR/libraries
+        lib_dir = Path(settings.DATA_DIR) / "libraries" / path_data.path
+        path_data.path = str(lib_dir)
+        path_data.create_if_missing = True
+        if not path_data.name:
+            path_data.name = lib_dir.name
 
     if not os.path.exists(path_data.path):
         if path_data.create_if_missing:
@@ -129,8 +140,8 @@ def generate_embeddings(
     if not path:
         raise HTTPException(status_code=404, detail="Path not found")
 
-    from embeddr_core.services.job_manager import job_manager
     from embeddr_core.services.embedding import get_loaded_model_name
+    from embeddr_core.services.job_manager import job_manager
 
     # Use loaded model if available and no specific model requested
     if model is None:
@@ -142,8 +153,9 @@ def generate_embeddings(
     # But wait, generate_embeddings_for_library takes a session.
     # We should wrap it to create a new session.
 
-    from embeddr.db.session import get_engine
     from sqlmodel import Session as SQLSession
+
+    from embeddr.db.session import get_engine
 
     def job_wrapper(library_id, model_name, batch_size, stop_event, progress_callback):
         with SQLSession(get_engine()) as job_session:

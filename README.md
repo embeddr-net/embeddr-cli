@@ -69,6 +69,19 @@ Once installed to start Embeddr
 
 [View Registry](https://registry.comfy.org/publishers/nynxz/nodes/embeddr-extension)
 
+### mcp.json
+```json
+{
+  "mcpServers": {
+    "embeddr": {
+      "url": "http://localhost:8003/mcp/messages",
+      // Set a timeout for long image generations
+      "timeout": 120000 
+    },
+    ...
+  }
+}
+```
 ### [Mistral Vibe MCP](https://github.com/mistralai/mistral-vibe)
 
 - Run embeddr with `embeddr serve --mcp`
