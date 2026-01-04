@@ -49,6 +49,13 @@ def get_thumbnails_dir() -> Path:
     return Path(thumbnails_dir)
 
 
+def get_workflows_dir() -> Path:
+    data_dir = get_data_dir()
+    workflows_dir = os.path.join(data_dir, "workflows")
+    os.makedirs(workflows_dir, exist_ok=True)
+    return Path(workflows_dir)
+
+
 def get_vector_storage_dir() -> Path:
     data_dir = get_data_dir()
     vector_dir = os.path.join(data_dir, "vector_storage")
@@ -62,6 +69,7 @@ class Settings(BaseSettings):
     DATA_DIR: Path = Field(default_factory=get_data_dir)
     DATABASE_URL: str = Field(default_factory=get_db_url)
     THUMBNAILS_DIR: Path = Field(default_factory=get_thumbnails_dir)
+    WORKFLOWS_DIR: Path = Field(default_factory=get_workflows_dir)
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)
     API_V1_STR: str = "/api/v1"
     COMFYUI_URL: str = "http://127.0.0.1:8188"
