@@ -37,6 +37,15 @@ def add_library_path(path_data: PathCreate, session: Session = Depends(get_sessi
     # Check if path exists on disk
     import os
 
+    # If path is just a name (no slashes), assume it's a new library in the data dir
+    if "/" not in path_data.path and "\\" not in path_data.path:
+        # It's a name, create it in DATA_DIR/libraries
+        lib_dir = Path(settings.DATA_DIR) / "libraries" / path_data.path
+        path_data.path = str(lib_dir)
+        path_data.create_if_missing = True
+        if not path_data.name:
+            path_data.name = lib_dir.name
+
     if not os.path.exists(path_data.path):
         if path_data.create_if_missing:
             try:
