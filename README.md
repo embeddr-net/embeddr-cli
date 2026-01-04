@@ -3,8 +3,10 @@
 <img height="120" src="https://embeddr.net/embeddr_logo_transparent.png">
 
 <h1>Embeddr CLI</h1>
-A local CLI and web UI for searching images and prompts using embeddings.
+Your AI Image Lab for Search, Workflows, and Creative Control.
 </div>
+
+![web preview](.github/assets/webui_3.png)
 
 ## Installation
 
@@ -45,11 +47,12 @@ Once installed to start Embeddr
 ### `embeddr serve`
 
 ```sh
---help   Shows help.
---mcp    Enables Model Context Protocol.
---docs   Enable API docs.
---host   The host to bind to. [default: 127.0.0.1]
---port   The port to bind to. [default: 8003]
+--help          Shows help.
+--mcp           Enables Model Context Protocol.
+--docs          Enable API docs.
+--host          The host to bind to. [default: 127.0.0.1]
+--port          The port to bind to. [default: 8003]
+--plugins-dir   Directory to serve plugins from.
 ```
 
 ### `embeddr config`
@@ -97,15 +100,36 @@ url = "http://localhost:8003/mcp/messages"
 
 > Anything that uses [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) will also work.
 
+## Plugins
+
+Extend Embeddr with custom functionality. Plugins can add new UI panels, backend routes, and database models.
+
+1. **Download** or create a plugin.
+2. **Place** it in your plugins directory (default: `~/.local/share/embeddr/plugins`).
+3. **Restart** Embeddr.
+
+Check out the [Plugin Examples](https://github.com/embeddr-net/plugin-examples) for templates and guides.
+
 ## Screenshots
+
+### Editor (Zen Mode)
+With [Layer Editor Plugin](https://github.com/embeddr-net/plugin-examples)
+
+![web preview](.github/assets/webui_3.png)
 
 ### Home Page
 
 ![webui index](.github/assets/webui_1.webp)
 
+### Lineage Page
+
+![webui settings](.github/assets/lineage_large.png)
+
 ### Settings Page
 
 ![webui settings](.github/assets/webui_2.webp)
+
+
 
 ## Development
 
