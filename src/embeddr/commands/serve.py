@@ -45,13 +45,16 @@ setup_logging()
 logger.info("Embeddr Local is starting up...")
 
 # Suppress websockets deprecation warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="uvicorn")
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, module="uvicorn")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, module="websockets")
 
 # Define the path to the frontend build directory
 # Root is parents[3] (embeddr-local-api)
 ROOT_DIR = Path(__file__).resolve().parents[3]
-FRONTEND_DIR = Path(os.environ.get("EMBEDDR_FRONTEND_DIR", DEFAULT_FRONTEND_DIR))
+FRONTEND_DIR = Path(os.environ.get(
+    "EMBEDDR_FRONTEND_DIR", DEFAULT_FRONTEND_DIR))
 
 # Create MCP App globally to access its lifespan
 # mcp_app = mcp.http_app(transport="http", path="/messages")
@@ -62,8 +65,10 @@ async def lifespan(app: FastAPI):
     # Retrieve config from env (set by serve command)
     host = os.environ.get("EMBEDDR_HOST", "127.0.0.1")
     port = os.environ.get("EMBEDDR_PORT", "8003")
-    mcp_enabled = os.environ.get("EMBEDDR_ENABLE_MCP", "false").lower() == "true"
-    docs_enabled = os.environ.get("EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
+    mcp_enabled = os.environ.get(
+        "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    docs_enabled = os.environ.get(
+        "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
 
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
 
@@ -73,9 +78,11 @@ async def lifespan(app: FastAPI):
     # Start ComfyUI WebSocket monitor
     asyncio.create_task(monitor_comfy_events())
 
-    typer.secho("\n✨ Embeddr Local API has started!", fg=typer.colors.GREEN, bold=True)
+    typer.secho("\n✨ Embeddr Local API has started!",
+                fg=typer.colors.GREEN, bold=True)
     typer.echo("   " + "-" * 45)
-    typer.secho(f"   👉 Web UI:    http://{display_host}:{port}", fg=typer.colors.CYAN)
+    typer.secho(
+        f"   👉 Web UI:    http://{display_host}:{port}", fg=typer.colors.CYAN)
 
     if mcp_enabled:
         typer.secho(
@@ -90,7 +97,8 @@ async def lifespan(app: FastAPI):
         )
 
     typer.echo("   " + "-" * 45)
-    typer.secho("   Press Ctrl+C to stop server\n", fg=typer.colors.BRIGHT_BLACK)
+    typer.secho("   Press Ctrl+C to stop server\n",
+                fg=typer.colors.BRIGHT_BLACK)
 
     # Manage MCP lifespan if enabled
     if hasattr(app.state, "mcp_app") and app.state.mcp_app:
@@ -202,7 +210,8 @@ def create_app(
     if os.path.exists(FRONTEND_DIR):
         assets_dir = os.path.join(FRONTEND_DIR, "assets")
         if os.path.exists(assets_dir):
-            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+            app.mount("/assets", StaticFiles(directory=assets_dir),
+                      name="assets")
 
         # Catch-all route for SPA (Single Page Application)
         @app.get("/{full_path:path}")
@@ -246,7 +255,8 @@ def register(app: typer.Typer):
         mcp: bool = typer.Option(False, help="Enable MCP server."),
         comfy: bool = typer.Option(False, help="Enable ComfyUI integration."),
         docs: bool = typer.Option(False, help="Enable API docs."),
-        plugins_dir: str = typer.Option(None, help="Directory to serve plugins from."),
+        plugins_dir: str = typer.Option(
+            None, help="Directory to serve plugins from."),
     ):
         """
         Start the Embeddr Local API server.
@@ -288,7 +298,8 @@ def register(app: typer.Typer):
                 raise typer.Exit(1)
 
         if plugins_dir:
-            os.environ["EMBEDDR_PLUGINS_DIR"] = str(Path(plugins_dir).resolve())
+            os.environ["EMBEDDR_PLUGINS_DIR"] = str(
+                Path(plugins_dir).resolve())
         else:
             # Default to data_dir/plugins
             # We already resolved data_path above
@@ -315,7 +326,8 @@ def register(app: typer.Typer):
             )
         else:
             uvicorn.run(
-                create_app(enable_mcp=mcp, enable_docs=docs, enable_comfy=comfy),
+                create_app(enable_mcp=mcp, enable_docs=docs,
+                           enable_comfy=comfy),
                 host=host,
                 port=port,
                 log_level="warning",
@@ -324,9 +336,12 @@ def register(app: typer.Typer):
 
 def create_app_factory() -> FastAPI:
     """Factory function for uvicorn reload mode"""
-    enable_mcp = os.environ.get("EMBEDDR_ENABLE_MCP", "false").lower() == "true"
-    enable_docs = os.environ.get("EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
-    enable_comfy = os.environ.get("EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
+    enable_mcp = os.environ.get(
+        "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    enable_docs = os.environ.get(
+        "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
+    enable_comfy = os.environ.get(
+        "EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
     return create_app(
         enable_mcp=enable_mcp, enable_docs=enable_docs, enable_comfy=enable_comfy
     )
