@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve
+from embeddr.commands import config, serve, db
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
 
@@ -12,6 +12,7 @@ app = typer.Typer()
 serve.register(app)
 
 app.add_typer(config.app, name="config")
+app.add_typer(db.app, name="db")
 
 
 @app.command()
