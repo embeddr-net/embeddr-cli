@@ -1,6 +1,6 @@
 [project]
 name = "embeddr-cli"
-version = "0.1.4"
+version = "0.1.4alpha"
 description = "Embeddr Local CLI Application"
 readme = "README.md"
 requires-python = ">=3.12"
