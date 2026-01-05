@@ -182,7 +182,7 @@ def create_app(
 
     # Store MCP app in state if enabled
     if enable_mcp:
-        mcp_app = mcp.http_app(transport="streamable-http", path="/messages")
+        mcp_app = mcp.http_app(transport="sse", path="/messages")
         app.state.mcp_app = mcp_app
         # Mount MCP Server
         # This exposes the MCP server over HTTP (Streamable) at /mcp/messages
