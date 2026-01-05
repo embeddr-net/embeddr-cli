@@ -35,7 +35,9 @@ class WorkflowRunRequest(BaseModel):
 
 @router.post("/{workflow_id}/run")
 async def run_workflow(
-    workflow_id: int, req: WorkflowRunRequest, session: Session = Depends(get_session)
+    workflow_id: int,
+    req: WorkflowRunRequest,
+    session: Session = Depends(get_session)
 ):
     workflow = session.get(Workflow, workflow_id)
     if not workflow:
@@ -57,6 +59,19 @@ async def run_workflow(
             for k, v in node_inputs.items():
                 graph[node_id]["inputs"][k] = v
 
+    # Fix defaults for Embeddr nodes
+    for node_id, node in graph.items():
+        class_type = node.get("class_type") or node.get("type")
+        if class_type == "embeddr.SaveToFolder":
+            node_inputs = node.get("inputs", {})
+            if "library" not in node_inputs or not node_inputs["library"]:
+                node_inputs["library"] = "Default"
+            if "collection" not in node_inputs or not node_inputs["collection"]:
+                node_inputs["collection"] = "None"
+            if "caption" not in node_inputs:
+                node_inputs["caption"] = ""
+            node["inputs"] = node_inputs
+
     # 3. Send to ComfyUI
     # client is already initialized
     try:
@@ -72,7 +87,8 @@ async def get_workflow_history(prompt_id: str):
     client = AsyncComfyClient()
     try:
         if not await client.is_available():
-            raise HTTPException(status_code=503, detail="ComfyUI is not available")
+            raise HTTPException(
+                status_code=503, detail="ComfyUI is not available")
 
         history = await client.get_history(prompt_id)
 
@@ -87,25 +103,27 @@ async def get_workflow_history(prompt_id: str):
         for node_id, node_output in outputs.items():
             if "images" in node_output:
                 for img in node_output["images"]:
-                    results.append(
-                        {
-                            "node_id": node_id,
-                            "filename": img.get("filename"),
-                            "subfolder": img.get("subfolder"),
-                            "type": img.get("type"),
-                        }
-                    )
+                    results.append({
+                        "node_id": node_id,
+                        "filename": img.get("filename"),
+                        "subfolder": img.get("subfolder"),
+                        "type": img.get("type")
+                    })
 
             if "embeddr_ids" in node_output:
                 for eid in node_output["embeddr_ids"]:
-                    results.append(
-                        {"node_id": node_id, "type": "embeddr_id", "value": eid}
-                    )
+                    results.append({
+                        "node_id": node_id,
+                        "type": "embeddr_id",
+                        "value": eid
+                    })
 
             if "text" in node_output:
-                results.append(
-                    {"node_id": node_id, "type": "text", "value": node_output["text"]}
-                )
+                results.append({
+                    "node_id": node_id,
+                    "type": "text",
+                    "value": node_output["text"]
+                })
 
         return {"status": "completed", "outputs": results}
     finally:
@@ -113,15 +131,13 @@ async def get_workflow_history(prompt_id: str):
 
 
 @router.post("", response_model=Workflow)
-def create_workflow(
-    workflow_in: WorkflowCreate, session: Session = Depends(get_session)
-):
+def create_workflow(workflow_in: WorkflowCreate, session: Session = Depends(get_session)):
     workflow = Workflow(
         name=workflow_in.name,
         description=workflow_in.description,
         data=workflow_in.data,
         meta=workflow_in.metadata or {},
-        is_active=workflow_in.is_active,
+        is_active=workflow_in.is_active
     )
     session.add(workflow)
     session.commit()
@@ -144,7 +160,9 @@ def sync_workflows(session: Session = Depends(get_session)):
 
 @router.get("", response_model=List[Workflow])
 def list_workflows(
-    skip: int = 0, limit: int = 100, session: Session = Depends(get_session)
+    skip: int = 0,
+    limit: int = 100,
+    session: Session = Depends(get_session)
 ):
     workflows = session.exec(select(Workflow).offset(skip).limit(limit)).all()
     return workflows
@@ -162,7 +180,7 @@ def get_workflow(workflow_id: int, session: Session = Depends(get_session)):
 def update_workflow(
     workflow_id: int,
     workflow_in: WorkflowUpdate,
-    session: Session = Depends(get_session),
+    session: Session = Depends(get_session)
 ):
     workflow = session.get(Workflow, workflow_id)
     if not workflow:
