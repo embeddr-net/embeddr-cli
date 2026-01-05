@@ -1,6 +1,7 @@
 import uuid
 import logging
 import copy
+import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
@@ -144,9 +145,9 @@ class GenerationService:
                 pass
 
             elif class_type == "embeddr.SaveToFolder":
-                if "library" not in node_inputs:
+                if "library" not in node_inputs or not node_inputs["library"]:
                     node_inputs["library"] = "Default"
-                if "collection" not in node_inputs:
+                if "collection" not in node_inputs or not node_inputs["collection"]:
                     node_inputs["collection"] = "None"
                 if "caption" not in node_inputs:
                     node_inputs["caption"] = ""
@@ -179,25 +180,31 @@ class GenerationService:
         return graph
 
     async def handle_comfy_event(self, event_type: str, data: Dict[str, Any]):
+        return await asyncio.to_thread(self.handle_comfy_event_sync, event_type, data)
+
+    def handle_comfy_event_sync(self, event_type: str, data: Dict[str, Any]):
         """
         Updates generation state based on ComfyUI WebSocket events.
         """
         print(f"[GenService] Handling event: {event_type} Data: {data}")
         if event_type == "execution_start":
             prompt_id = data.get("prompt_id")
-            await self._update_status_by_prompt_id(prompt_id, "processing")
+            self._update_status_by_prompt_id_sync(prompt_id, "processing")
 
         elif event_type == "executed":
             prompt_id = data.get("prompt_id")
             output = data.get("output", {})
-            await self._complete_generation(prompt_id, output)
+            self._complete_generation_sync(prompt_id, output)
 
         elif event_type == "execution_error":
             prompt_id = data.get("prompt_id")
             error_msg = data.get("exception_message", "Unknown error")
-            await self._fail_generation(prompt_id, error_msg)
+            self._fail_generation_sync(prompt_id, error_msg)
 
     async def _update_status_by_prompt_id(self, prompt_id: str, status: str):
+        return await asyncio.to_thread(self._update_status_by_prompt_id_sync, prompt_id, status)
+
+    def _update_status_by_prompt_id_sync(self, prompt_id: str, status: str):
         if not prompt_id:
             return
 
@@ -213,9 +220,13 @@ class GenerationService:
             self.session.add(generation)
             self.session.commit()
         else:
-            print(f"[GenService] No generation found for prompt_id {prompt_id}")
+            print(
+                f"[GenService] No generation found for prompt_id {prompt_id}")
 
     async def _complete_generation(self, prompt_id: str, output: Dict[str, Any]):
+        return await asyncio.to_thread(self._complete_generation_sync, prompt_id, output)
+
+    def _complete_generation_sync(self, prompt_id: str, output: Dict[str, Any]):
         if not prompt_id:
             return
 
@@ -227,7 +238,8 @@ class GenerationService:
             generation.status = "completed"
 
             # Initialize outputs if None
-            current_outputs = list(generation.outputs) if generation.outputs else []
+            current_outputs = list(
+                generation.outputs) if generation.outputs else []
 
             # Helper to check for duplicates
             def is_duplicate_image(img_list, new_img):
@@ -266,13 +278,17 @@ class GenerationService:
             if "embeddr_ids" in output:
                 for eid in output["embeddr_ids"]:
                     if not is_duplicate_id(current_outputs, eid):
-                        current_outputs.append({"type": "embeddr_id", "value": eid})
+                        current_outputs.append(
+                            {"type": "embeddr_id", "value": eid})
 
             generation.outputs = current_outputs
             self.session.add(generation)
             self.session.commit()
 
     async def _fail_generation(self, prompt_id: str, error: str):
+        return await asyncio.to_thread(self._fail_generation_sync, prompt_id, error)
+
+    def _fail_generation_sync(self, prompt_id: str, error: str):
         if not prompt_id:
             return
 
@@ -330,7 +346,8 @@ class GenerationService:
 
                         for node_out in outputs_data.values():
                             if "images" in node_out:
-                                combined_output["images"].extend(node_out["images"])
+                                combined_output["images"].extend(
+                                    node_out["images"])
                             if "embeddr_ids" in node_out:
                                 combined_output["embeddr_ids"].extend(
                                     node_out["embeddr_ids"]
