@@ -50,6 +50,17 @@ def get_workflow_details(workflow_id: int) -> str:
             for item in exposed:
                 node_id = item.get("node_id", "?")
                 field = item.get("field", "?")
+
+                # Filter out internal fields for SaveToFolder
+                # We check the node type in the workflow data
+                if workflow.data:
+                    node = workflow.data.get(str(node_id))
+                    if node:
+                        class_type = node.get("class_type") or node.get("type")
+                        if class_type == "embeddr.SaveToFolder":
+                            if field in ["library", "collection"]:
+                                continue
+
                 label = item.get("label", field)
                 details.append(f"  - Node {node_id}, Input '{field}': {label}")
         elif isinstance(exposed, dict):
@@ -92,6 +103,20 @@ async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) ->
                 if "inputs" in graph[node_id]:
                     graph[node_id]["inputs"][input_name] = value
                     patched_count += 1
+
+        # Fix defaults for Embeddr nodes
+        for node_id, node in graph.items():
+            class_type = node.get("class_type") or node.get("type")
+            if class_type == "embeddr.SaveToFolder":
+                node_inputs = node.get("inputs", {})
+                if "library" not in node_inputs or not node_inputs["library"]:
+                    node_inputs["library"] = "Default"
+                if "collection" not in node_inputs or not node_inputs["collection"]:
+                    node_inputs["collection"] = "None"
+                if "caption" not in node_inputs:
+                    node_inputs["caption"] = ""
+                # Ensure inputs dict exists
+                node["inputs"] = node_inputs
 
         # 3. Send to ComfyUI
         client = AsyncComfyClient()
