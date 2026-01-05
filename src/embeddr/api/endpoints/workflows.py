@@ -49,7 +49,8 @@ async def run_workflow(
     client = AsyncComfyClient()
 
     if not await client.is_available():
-        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+        raise HTTPException(
+            status_code=503, detail="ComfyUI is not available")
 
     # 2. Patch the graph with inputs
     for node_id, node_inputs in req.inputs.items():
