@@ -41,11 +41,18 @@ def get_workflow_details(workflow_id: int) -> str:
         ]
 
         # Parse metadata for exposed inputs
-        # Structure: { "exposed_inputs": { "node_id": { "input_name": { "description": "...", "type": "..." } } } }
-        exposed = workflow.meta.get("exposed_inputs", {})
+        # Structure: List of { "node_id": "...", "field": "...", "label": "...", ... }
+        exposed = workflow.meta.get("exposed_inputs", [])
         if not exposed:
             details.append("  None")
-        else:
+        elif isinstance(exposed, list):
+            for item in exposed:
+                node_id = item.get("node_id", "?")
+                field = item.get("field", "?")
+                label = item.get("label", field)
+                details.append(f"  - Node {node_id}, Input '{field}': {label}")
+        elif isinstance(exposed, dict):
+            # Fallback for legacy dictionary format
             for node_id, inputs in exposed.items():
                 for input_name, info in inputs.items():
                     desc = info.get("description", "No description")
