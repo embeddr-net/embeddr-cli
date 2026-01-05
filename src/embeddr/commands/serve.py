@@ -183,7 +183,7 @@ def create_app(
 
     # Store MCP app in state if enabled
     if enable_mcp:
-        mcp_app = mcp.http_app(transport="sse", path="/messages")
+        mcp_app = mcp.http_app(transport="streamable-http", path="/messages")
         app.state.mcp_app = mcp_app
         # Mount MCP Server
         # This exposes the MCP server over HTTP (Streamable) at /mcp/messages
@@ -269,6 +269,12 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_ENABLE_COMFY"] = str(comfy).lower()
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
+
+        if mcp and reload:
+            typer.secho(
+                "\n⚠️  Warning: Running MCP with reload enabled may cause connection issues.",
+                fg=typer.colors.YELLOW,
+            )
 
         # Check if data directory exists
         data_dir_env = os.environ.get("EMBEDDR_DATA_DIR")
