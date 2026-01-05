@@ -48,6 +48,16 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def process_event_sync(msg_type, msg_data):
+    try:
+        engine = get_engine()
+        with Session(engine) as session:
+            service = GenerationService(session)
+            service.handle_comfy_event_sync(msg_type, msg_data)
+    except Exception as e:
+        logger.error(f"Failed to update generation state: {e}")
+
+
 async def monitor_comfy_events():
     """
     Connects to ComfyUI's WebSocket and forwards messages to our connected clients.
@@ -91,17 +101,7 @@ async def monitor_comfy_events():
                                     "executed",
                                     "execution_error",
                                 ]:
-                                    try:
-                                        engine = get_engine()
-                                        with Session(engine) as session:
-                                            service = GenerationService(session)
-                                            await service.handle_comfy_event(
-                                                msg_type, msg_data
-                                            )
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Failed to update generation state: {e}"
-                                        )
+                                    await asyncio.to_thread(process_event_sync, msg_type, msg_data)
 
                                 # 2. Broadcast to Frontend
                                 await manager.broadcast(
@@ -118,7 +118,8 @@ async def monitor_comfy_events():
                                 # Binary message (usually preview)
                                 # Format: 4 bytes type, 4 bytes format, image data
                                 if len(message) > 8:
-                                    msg_type = struct.unpack(">I", message[:4])[0]
+                                    msg_type = struct.unpack(
+                                        ">I", message[:4])[0]
 
                                     if msg_type == 1:  # Preview
                                         image_data = message[8:]
@@ -134,7 +135,8 @@ async def monitor_comfy_events():
                                             }
                                         )
                             except Exception as e:
-                                logger.error(f"Error processing binary message: {e}")
+                                logger.error(
+                                    f"Error processing binary message: {e}")
                 finally:
                     poller_task.cancel()
 
@@ -151,79 +153,79 @@ async def poll_stuck_generations():
 
     client = AsyncComfyClient()
 
+    def get_pending_generations_sync():
+        engine = get_engine()
+        with Session(engine) as session:
+            statement = select(Generation).where(
+                Generation.status.in_(["queued", "processing"])
+            )
+            generations = session.exec(statement).all()
+            return [(g.id, g.prompt_id) for g in generations]
+
     while True:
         try:
             await asyncio.sleep(10)  # Check every 10 seconds
 
-            engine = get_engine()
-            with Session(engine) as session:
-                # Find pending/processing generations
-                statement = select(Generation).where(
-                    Generation.status.in_(["queued", "processing"])
-                )
-                generations = session.exec(statement).all()
+            # Offload blocking query
+            pending = await asyncio.to_thread(get_pending_generations_sync)
 
-                if not generations:
+            if not pending:
+                continue
+
+            # Check history for each
+            for gen_id, prompt_id in pending:
+                if not prompt_id:
                     continue
 
-                # Check history for each
-                for gen in generations:
-                    if not gen.prompt_id:
-                        continue
+                try:
+                    history = await client.get_history(prompt_id)
+                    if prompt_id in history:
+                        # It finished!
+                        logger.info(
+                            f"Found completed generation {gen_id} (prompt {prompt_id}) via polling"
+                        )
 
-                    try:
-                        history = await client.get_history(gen.prompt_id)
-                        if gen.prompt_id in history:
-                            # It finished!
-                            logger.info(
-                                f"Found completed generation {gen.id} (prompt {gen.prompt_id}) via polling"
-                            )
+                        # Simulate executed event
+                        output_data = history[prompt_id].get("outputs", {})
+
+                        flat_images = []
+                        flat_embeddr_ids = []
+
+                        for node_id, node_output in output_data.items():
+                            if "images" in node_output:
+                                flat_images.extend(node_output["images"])
+                            if "embeddr_ids" in node_output:
+                                flat_embeddr_ids.extend(
+                                    node_output["embeddr_ids"])
+
+                        simulated_output = {
+                            "images": flat_images,
+                            "embeddr_ids": flat_embeddr_ids,
+                        }
+
+                        # Create session for update
+                        engine = get_engine()
+                        with Session(engine) as session:
                             service = GenerationService(session)
-
-                            # Simulate executed event
-                            output_data = history[gen.prompt_id].get("outputs", {})
-                            # The history format is slightly different from WS event
-                            # WS event: { "output": { "images": ... } }
-                            # History API: { "outputs": { "node_id": { "images": ... } } }
-
-                            # We need to flatten the history outputs to match what _complete_generation expects
-                            # or update _complete_generation to handle both.
-                            # Let's flatten it here to match WS 'output' structure roughly
-
-                            flat_images = []
-                            flat_embeddr_ids = []
-
-                            for node_id, node_output in output_data.items():
-                                if "images" in node_output:
-                                    flat_images.extend(node_output["images"])
-                                if "embeddr_ids" in node_output:
-                                    flat_embeddr_ids.extend(node_output["embeddr_ids"])
-
-                            simulated_output = {
-                                "images": flat_images,
-                                "embeddr_ids": flat_embeddr_ids,
-                            }
-
                             await service._complete_generation(
-                                gen.prompt_id, simulated_output
+                                prompt_id, simulated_output
                             )
 
-                            # Also broadcast to frontend so it updates
-                            await manager.broadcast(
-                                {
-                                    "source": "comfyui",
-                                    "type": "executed",
-                                    "data": {
-                                        "prompt_id": gen.prompt_id,
-                                        "output": simulated_output,
-                                    },
-                                }
-                            )
+                        # Also broadcast to frontend so it updates
+                        await manager.broadcast(
+                            {
+                                "source": "comfyui",
+                                "type": "executed",
+                                "data": {
+                                    "prompt_id": prompt_id,
+                                    "output": simulated_output,
+                                },
+                            }
+                        )
 
-                    except Exception:
-                        # 404 means not found in history (maybe still running, or cleared)
-                        # If it's been running for too long, maybe mark failed?
-                        pass
+                except Exception:
+                    # 404 means not found in history (maybe still running, or cleared)
+                    pass
 
         except Exception as e:
             logger.error(f"Error in poll_stuck_generations: {e}")
