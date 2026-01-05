@@ -48,8 +48,8 @@ class WorkflowManager:
                     is_conversion = node_type == "SaveImage"
                     node["type"] = "embeddr.SaveToFolder"
 
-                    # Schema: caption, parent_ids, library, collection, tags, save_backup
-                    defaults = ["", "", "Default", "None", "", False]
+                    # Schema: caption, parent_ids, library, collection, tags, allow_duplicates, save_backup
+                    defaults = ["", "", "Default", "None", "", False, False]
 
                     if is_conversion:
                         # Reset to defaults
@@ -60,7 +60,14 @@ class WorkflowManager:
                         if not isinstance(current, list):
                             current = []
                         if len(current) < len(defaults):
-                            current.extend(defaults[len(current) :])
+                            current.extend(defaults[len(current):])
+
+                        # Fix invalid values for library/collection
+                        if len(current) > 2 and (current[2] == "" or current[2] is None):
+                            current[2] = "Default"
+                        if len(current) > 3 and (current[3] == "" or current[3] is None):
+                            current[3] = "None"
+
                         node["widgets_values"] = current
 
                     # Rename input 'images' to 'image'
@@ -110,9 +117,9 @@ class WorkflowManager:
                     inputs.pop("filename_prefix")
 
                 # Ensure defaults for all widgets
-                if "library" not in inputs:
+                if "library" not in inputs or not inputs["library"]:
                     inputs["library"] = "Default"
-                if "collection" not in inputs:
+                if "collection" not in inputs or not inputs["collection"]:
                     inputs["collection"] = "None"
                 if "caption" not in inputs:
                     inputs["caption"] = ""
@@ -130,7 +137,8 @@ class WorkflowManager:
         Read all JSON files from the workflows directory and update the database.
         """
         if not self.workflows_dir.exists():
-            logger.warning(f"Workflows directory {self.workflows_dir} does not exist.")
+            logger.warning(
+                f"Workflows directory {self.workflows_dir} does not exist.")
             return
 
         logger.info(f"Syncing workflows from {self.workflows_dir}")
@@ -200,7 +208,8 @@ class WorkflowManager:
         all_workflows = self.session.exec(select(Workflow)).all()
         for wf in all_workflows:
             if wf.name not in seen_names:
-                logger.info(f"Removing workflow '{wf.name}' as it is missing from disk")
+                logger.info(
+                    f"Removing workflow '{wf.name}' as it is missing from disk")
                 self.session.delete(wf)
 
         self.session.commit()
