@@ -13,7 +13,8 @@ from embeddr.services.comfy import ComfyClient, AsyncComfyClient
 def list_workflows() -> str:
     """List all available ComfyUI workflows."""
     with get_db_session() as session:
-        workflows = session.exec(select(Workflow).where(Workflow.is_active)).all()
+        workflows = session.exec(
+            select(Workflow).where(Workflow.is_active)).all()
         if not workflows:
             return "No workflows found."
 
@@ -56,7 +57,8 @@ def get_workflow_details(workflow_id: int) -> str:
             for node_id, inputs in exposed.items():
                 for input_name, info in inputs.items():
                     desc = info.get("description", "No description")
-                    details.append(f"  - Node {node_id}, Input '{input_name}': {desc}")
+                    details.append(
+                        f"  - Node {node_id}, Input '{input_name}': {desc}")
 
         return "\n".join(details)
 
@@ -119,7 +121,8 @@ async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) ->
                     fname = img.get("filename")
                     results.append(f"Generated image: {fname}")
             if "text" in output_data:
-                results.append(f"Node {node_id} output text: {output_data['text']}")
+                results.append(
+                    f"Node {node_id} output text: {output_data['text']}")
 
             # Check for custom outputs
             if "embeddr_ids" in output_data:
@@ -130,7 +133,8 @@ async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) ->
                 else:
                     results.append(f"Embeddr Image ID: {ids}")
             elif "embeddr_id" in output_data:
-                results.append(f"Embeddr Image ID: {output_data['embeddr_id']}")
+                results.append(
+                    f"Embeddr Image ID: {output_data['embeddr_id']}")
 
         if not results:
             return "Workflow completed successfully, but no explicit image outputs were found in history."
