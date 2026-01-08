@@ -1,3 +1,4 @@
+import httpx
 import json
 import os
 import shutil
@@ -39,7 +40,8 @@ def get_video_metadata(path: Path):
             "-show_streams",
             str(path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
         video_stream = next(
             (s for s in data["streams"] if s["codec_type"] == "video"), None
@@ -95,6 +97,78 @@ def extract_video_frame(video_path: Path, output_path: Path, timestamp: float = 
     except Exception as e:
         print(f"Error extracting frame: {e}")
         return False
+
+
+def trim_video_remote(video_url: str, output_path: Path, start: float, duration: float):
+    # Try efficient remote trimming.
+    # Using re-encode (fast preset) to ensure frame accuracy for precise cuts.
+    # Using -ss before -i allows ffmpeg to seek using HTTP Range header if supported.
+    try:
+        cmd = [
+            "ffmpeg",
+            "-ss", str(start),
+            "-i", video_url,
+            "-t", str(duration),
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-c:a", "aac",
+            "-y",
+            str(output_path),
+        ]
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        return True
+    except Exception as e:
+        print(f"Error trimming remote video: {e}")
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"STDOUT: {e.stdout}")
+            print(f"STDERR: {e.stderr}")
+        return False
+
+
+def trim_video(video_path: Path, output_path: Path, start: float, duration: float):
+    try:
+        cmd = [
+            "ffmpeg",
+            "-ss",
+            str(start),
+            "-i",
+            str(video_path),
+            "-t",
+            str(duration),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-y",
+            str(output_path),
+        ]
+        # Run with explicit stdout/stderr piping
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error trimming video (exit code {e.returncode}):")
+        print(f"STDOUT: {e.stdout}")
+        print(f"STDERR: {e.stderr}")
+        raise RuntimeError(
+            f"FFmpeg failed with exit code {e.returncode}\nStderr: {e.stderr[-1000:]}")
+    except Exception as e:
+        print(f"Error trimming video: {e}")
+        raise
 
 
 router = APIRouter()
@@ -176,12 +250,16 @@ async def check_image(
 
 @router.post("/upload", response_model=ImageDetailResponse)
 async def upload_image(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    url: str = Form(None),
     prompt: str = Form(None),
     parent_ids: str = Form(None),
     library_id: int = Form(None),
+    # ... other args ...
     tags: str = Form(None),
     force: bool = Form(False),
+    trim_start: float = Form(None),
+    trim_duration: float = Form(None),
     session: Session = Depends(get_session),
 ):
     # Find library
@@ -204,21 +282,90 @@ async def upload_image(
             session.refresh(library)
 
     # Determine if video
-    is_video = file.content_type and file.content_type.startswith("video/")
-    ext = Path(file.filename).suffix
-    if not ext:
-        ext = ".mp4" if is_video else ".png"
+    is_video = False
+    ext = ".png"
+
+    if file:
+        is_video = file.content_type and file.content_type.startswith("video/")
+        ext = Path(file.filename).suffix
+        if not ext:
+            ext = ".mp4" if is_video else ".png"
+    elif url:
+        is_video = any(url.lower().endswith(v)
+                       for v in [".mp4", ".mov", ".avi", ".mkv"]) or "/stream" in url
+        if is_video:
+            ext = ".mp4"
+        else:
+            ext = Path(url.split("?")[0]).suffix or ".png"
 
     # Save file temporarily
     temp_filename = f"temp_{uuid.uuid4()}{ext}"
     temp_path = Path(settings.DATA_DIR) / "temp" / temp_filename
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Track if we already handled the content (e.g. via remote trim)
+    content_ready = False
+
+    if file:
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        content_ready = True
+    elif url:
+        # Optimization: If video and trimming, try remote trim first to avoid full download
+        trimmed_remotely = False
+        if is_video and trim_start is not None and trim_duration is not None:
+            if trim_video_remote(url, temp_path, trim_start, trim_duration):
+                trimmed_remotely = True
+                content_ready = True
+                # Clear trim params so we don't re-trim later
+                trim_start = None
+                trim_duration = None
+            else:
+                print("Remote trim failed, falling back to download")
+
+        if not trimmed_remotely:
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("GET", url, follow_redirects=True, timeout=120.0) as resp:
+                        resp.raise_for_status()
+                        ct = resp.headers.get("content-type", "")
+                        if ct.startswith("video/"):
+                            is_video = True
+                            if ext == ".png":
+                                ext = ".mp4"
+
+                        with open(temp_path, "wb") as buffer:
+                            async for chunk in resp.aiter_bytes():
+                                buffer.write(chunk)
+                content_ready = True
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to download from URL: {e}")
+    else:
+        raise HTTPException(
+            status_code=400, detail="Either file or url must be provided")
+
+    # Perform trimming if requested (and not already done)
+    if is_video and trim_start is not None and trim_duration is not None:
+        trimmed_filename = f"trimmed_{uuid.uuid4()}{ext}"
+        trimmed_path = Path(settings.DATA_DIR) / "temp" / trimmed_filename
+        try:
+            trim_video(temp_path, trimmed_path, trim_start, trim_duration)
+            if temp_path.exists():
+                os.remove(temp_path)
+            temp_path = trimmed_path
+        except Exception as e:
+            print(f"Failed to trim video: {e}")
+            if temp_path.exists():
+                os.remove(temp_path)
+            if trimmed_path.exists():
+                os.remove(trimmed_path)
+            raise HTTPException(
+                status_code=400, detail=f"Failed to trim video. Please check if the file is valid. Error: {str(e)}")
 
     width = height = 0
-    mime_type = file.content_type
+    mime_type = file.content_type if file else (
+        "video/mp4" if is_video else "image/png")
     phash = None
     duration = fps = frame_count = None
     media_type = "video" if is_video else "image"
@@ -381,7 +528,8 @@ async def upload_image(
             for pid in p_ids:
                 try:
                     pid_int = int(pid)
-                    lineage = ImageLineage(parent_id=pid_int, child_id=local_image.id)
+                    lineage = ImageLineage(
+                        parent_id=pid_int, child_id=local_image.id)
                     session.add(lineage)
                 except (ValueError, TypeError):
                     continue
@@ -451,7 +599,8 @@ async def search_by_image(
     if not ids:
         return {"total": 0, "items": [], "skip": skip, "limit": limit}
 
-    images = session.exec(select(LocalImage).where(LocalImage.id.in_(ids))).all()
+    images = session.exec(select(LocalImage).where(
+        LocalImage.id.in_(ids))).all()
     image_map = {img.id: img for img in images}
 
     ordered_images = []
@@ -476,7 +625,8 @@ async def search_by_image(
 
 @router.get("/tags", response_model=List[dict])
 def get_tags(session: Session = Depends(get_session)):
-    images = session.exec(select(LocalImage.tags).where(LocalImage.tags != None)).all()
+    images = session.exec(select(LocalImage.tags).where(
+        LocalImage.tags != None)).all()
     tag_counts = {}
     for tag_str in images:
         if not tag_str:
@@ -570,7 +720,8 @@ def list_images(
 
             images = session.exec(
                 query.options(
-                    selectinload(LocalImage.parents), selectinload(LocalImage.library)
+                    selectinload(LocalImage.parents), selectinload(
+                        LocalImage.library)
                 )
             ).all()
             image_map = {img.id: img for img in images}
@@ -605,7 +756,8 @@ def list_images(
     # Filter by is_archived
     if filter_archived is not None:
         query = query.where(LocalImage.is_archived == filter_archived)
-        count_query = count_query.where(LocalImage.is_archived == filter_archived)
+        count_query = count_query.where(
+            LocalImage.is_archived == filter_archived)
 
     if media_type:
         query = query.where(LocalImage.media_type == media_type)
@@ -613,7 +765,8 @@ def list_images(
 
     if library_id:
         query = query.where(LocalImage.library_path_id == library_id)
-        count_query = count_query.where(LocalImage.library_path_id == library_id)
+        count_query = count_query.where(
+            LocalImage.library_path_id == library_id)
 
     if collection_id:
         query = query.join(CollectionItem).where(
@@ -724,7 +877,8 @@ def get_image_file(image_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Image not found")
 
     if not os.path.exists(image.path):
-        raise HTTPException(status_code=404, detail="Image file not found on disk")
+        raise HTTPException(
+            status_code=404, detail="Image file not found on disk")
 
     return FileResponse(image.path)
 

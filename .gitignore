@@ -10,7 +10,14 @@ wheels/
 .venv
 *venv
 
-data*
-
 # Local API frontend build
 src/embeddr/web/*
+
+*_cache/
+
+# Private ignore
+test_*/
+data*/
+examples/
+workspace_clean/
+workspace_*/

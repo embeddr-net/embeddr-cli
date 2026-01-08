@@ -1,3 +1,5 @@
+from embeddr_core.models import collection, library, lineage
+from embeddr.models import dataset, generation, workflow
 from embeddr.core.config import settings
 from logging.config import fileConfig
 import os
@@ -11,7 +13,8 @@ from alembic import context
 
 # Add the src directory to the path so we can import the app
 sys.path.insert(
-    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    0, os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", ".."))
 )
 
 # Import all models here so SQLModel.metadata is populated

@@ -16,8 +16,26 @@ from embeddr.core.logging_utils import get_logs
 from embeddr.core.config_manager import config_manager, AppConfig
 from embeddr.core.config import settings
 from embeddr.db.session import get_engine
+from embeddr.services.socket_manager import manager
+from pydantic import BaseModel
 
 router = APIRouter()
+
+
+class DebugMessageRequest(BaseModel):
+    client_id: str
+    message: Dict[str, Any]
+
+
+@router.get("/debug/clients")
+def get_connected_clients():
+    return {"clients": manager.get_connected_clients()}
+
+
+@router.post("/debug/message")
+async def send_debug_message(req: DebugMessageRequest):
+    await manager.send_to_client(req.client_id, req.message)
+    return {"status": "sent"}
 
 
 def get_session():

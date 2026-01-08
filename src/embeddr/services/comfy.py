@@ -36,6 +36,16 @@ class ComfyClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_queue(self) -> Dict[str, Any]:
+        resp = requests.get(f"{self.url}/queue")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_system_stats(self) -> Dict[str, Any]:
+        resp = requests.get(f"{self.url}/system_stats")
+        resp.raise_for_status()
+        return resp.json()
+
     def wait_for_completion(
         self, prompt_id: str, timeout: int = 300
     ) -> Optional[Dict[str, Any]]:
@@ -101,6 +111,11 @@ class AsyncComfyClient:
 
     async def get_history(self, prompt_id: str) -> Dict[str, Any]:
         resp = await self.client.get(f"/history/{prompt_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_queue(self) -> Dict[str, Any]:
+        resp = await self.client.get("/queue")
         resp.raise_for_status()
         return resp.json()
 

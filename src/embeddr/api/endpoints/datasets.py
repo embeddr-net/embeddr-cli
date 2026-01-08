@@ -13,6 +13,7 @@ import json
 from embeddr.core.config import get_data_dir
 from embeddr.services.captioning import generate_caption
 from embeddr.db.session import get_engine
+from embeddr.services.socket_manager import manager
 
 router = APIRouter()
 
@@ -21,7 +22,7 @@ class DatasetCreate(BaseModel):
     name: str
     description: Optional[str] = None
     type: DatasetType = DatasetType.REGULAR
-    collection_id: int
+    collection_id: Optional[int] = None
 
 
 class DatasetUpdate(BaseModel):
@@ -35,7 +36,7 @@ class DatasetRead(BaseModel):
     name: str
     description: Optional[str]
     type: DatasetType
-    collection_id: int
+    collection_id: Optional[int]
     created_at: datetime
     updated_at: datetime
     item_count: int
@@ -44,6 +45,7 @@ class DatasetRead(BaseModel):
 
 class DatasetItemRead(BaseModel):
     id: int
+    dataset_id: int
     original_image_id: int
     processed_image_path: Optional[str]
     pair_image_path: Optional[str]
@@ -54,15 +56,71 @@ class DatasetItemRead(BaseModel):
 class DatasetItemUpdate(BaseModel):
     processed_image_path: Optional[str] = None
     pair_image_path: Optional[str] = None
+    pair_image_id: Optional[int] = None
     caption: Optional[str] = None
+
+
+class DatasetAddItems(BaseModel):
+    image_ids: List[int]
+
+
+@router.post("/{dataset_id}/items", response_model=List[DatasetItem])
+async def add_dataset_items(
+    dataset_id: int, items_in: DatasetAddItems, session: Session = Depends(get_session)
+):
+    dataset = session.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    added_items = []
+    for image_id in items_in.image_ids:
+        # Check if image exists
+        image = session.get(LocalImage, image_id)
+        if not image:
+            continue
+
+        # Check if already in dataset
+        existing = session.exec(
+            select(DatasetItem).where(
+                DatasetItem.dataset_id == dataset_id,
+                DatasetItem.original_image_id == image_id,
+            )
+        ).first()
+        if existing:
+            continue
+
+        ds_item = DatasetItem(
+            dataset_id=dataset_id,
+            original_image_id=image_id,
+            caption="",
+        )
+        session.add(ds_item)
+        added_items.append(ds_item)
+
+    session.commit()
+    for item in added_items:
+        session.refresh(item)
+
+    if added_items:
+        await manager.broadcast_event(
+            event_type="dataset:items_added",
+            data={
+                "dataset_id": dataset_id,
+                "count": len(added_items),
+            },
+            source="embeddr"
+        )
+
+    return added_items
 
 
 @router.post("", response_model=Dataset)
 def create_dataset(dataset_in: DatasetCreate, session: Session = Depends(get_session)):
-    # Verify collection exists
-    collection = session.get(Collection, dataset_in.collection_id)
-    if not collection:
-        raise HTTPException(status_code=404, detail="Collection not found")
+    # Verify collection exists if provided
+    if dataset_in.collection_id:
+        collection = session.get(Collection, dataset_in.collection_id)
+        if not collection:
+            raise HTTPException(status_code=404, detail="Collection not found")
 
     dataset = Dataset(
         name=dataset_in.name,
@@ -74,22 +132,23 @@ def create_dataset(dataset_in: DatasetCreate, session: Session = Depends(get_ses
     session.commit()
     session.refresh(dataset)
 
-    # Populate items from collection
-    collection_items = session.exec(
-        select(CollectionItem).where(
-            CollectionItem.collection_id == dataset_in.collection_id
-        )
-    ).all()
+    # Populate items from collection if provided
+    if dataset_in.collection_id:
+        collection_items = session.exec(
+            select(CollectionItem).where(
+                CollectionItem.collection_id == dataset_in.collection_id
+            )
+        ).all()
 
-    for item in collection_items:
-        ds_item = DatasetItem(
-            dataset_id=dataset.id,
-            original_image_id=item.image_id,
-            caption="",  # Initialize empty caption
-        )
-        session.add(ds_item)
+        for item in collection_items:
+            ds_item = DatasetItem(
+                dataset_id=dataset.id,
+                original_image_id=item.image_id,
+                caption="",  # Initialize empty caption
+            )
+            session.add(ds_item)
 
-    session.commit()
+        session.commit()
     return dataset
 
 
@@ -169,6 +228,7 @@ def get_dataset_items(dataset_id: int, session: Session = Depends(get_session)):
             result.append(
                 DatasetItemRead(
                     id=item.id,
+                    dataset_id=item.dataset_id,
                     original_image_id=item.original_image_id,
                     processed_image_path=item.processed_image_path,
                     pair_image_path=item.pair_image_path,
@@ -180,7 +240,7 @@ def get_dataset_items(dataset_id: int, session: Session = Depends(get_session)):
 
 
 @router.patch("/{dataset_id}/items/{item_id}", response_model=DatasetItemRead)
-def update_dataset_item(
+async def update_dataset_item(
     dataset_id: int,
     item_id: int,
     item_in: DatasetItemUpdate,
@@ -190,26 +250,66 @@ def update_dataset_item(
     if not item or item.dataset_id != dataset_id:
         raise HTTPException(status_code=404, detail="Dataset item not found")
 
-    if item_in.processed_image_path is not None:
-        item.processed_image_path = item_in.processed_image_path
-    if item_in.pair_image_path is not None:
-        item.pair_image_path = item_in.pair_image_path
-    if item_in.caption is not None:
-        item.caption = item_in.caption
+    update_data = item_in.model_dump(exclude_unset=True)
+
+    if "processed_image_path" in update_data:
+        item.processed_image_path = update_data["processed_image_path"]
+    if "pair_image_path" in update_data:
+        item.pair_image_path = update_data["pair_image_path"]
+    if "caption" in update_data:
+        item.caption = update_data["caption"]
+
+    if item_in.pair_image_id is not None:
+        pair_img = session.get(LocalImage, item_in.pair_image_id)
+        if pair_img:
+            item.pair_image_path = pair_img.path
 
     session.add(item)
     session.commit()
     session.refresh(item)
 
     img = session.get(LocalImage, item.original_image_id)
-    return DatasetItemRead(
+    response_item = DatasetItemRead(
         id=item.id,
+        dataset_id=item.dataset_id,
         original_image_id=item.original_image_id,
         processed_image_path=item.processed_image_path,
         pair_image_path=item.pair_image_path,
         caption=item.caption,
         original_path=img.path if img else "",
     )
+
+    await manager.broadcast(
+        {
+            "type": "dataset:item_updated",
+            "data": response_item.model_dump(),
+        }
+    )
+
+    return response_item
+
+
+@router.delete("/{dataset_id}/items/{item_id}")
+async def delete_dataset_item(
+    dataset_id: int,
+    item_id: int,
+    session: Session = Depends(get_session),
+):
+    item = session.get(DatasetItem, item_id)
+    if not item or item.dataset_id != dataset_id:
+        raise HTTPException(status_code=404, detail="Dataset item not found")
+
+    session.delete(item)
+    session.commit()
+
+    await manager.broadcast(
+        {
+            "type": "dataset:item_deleted",
+            "data": {"id": item_id, "dataset_id": dataset_id},
+        }
+    )
+
+    return {"ok": True}
 
 
 @router.post("/{dataset_id}/export")
@@ -264,7 +364,7 @@ def export_dataset(dataset_id: int, session: Session = Depends(get_session)):
     }
 
 
-def run_auto_caption(dataset_id: int):
+async def run_auto_caption(dataset_id: int):
     # Create a new session
     engine = get_engine()
     with Session(engine) as session:
@@ -283,7 +383,8 @@ def run_auto_caption(dataset_id: int):
 
                 if mode == "query":
                     # Support both 'query' (old) and 'prompt' (new) keys
-                    kwargs["prompt"] = config.get("prompt") or config.get("query")
+                    kwargs["prompt"] = config.get(
+                        "prompt") or config.get("query")
 
                 if "length" in config:
                     kwargs["length"] = config.get("length")
@@ -309,6 +410,16 @@ def run_auto_caption(dataset_id: int):
                         item.caption = caption
                         session.add(item)
                         session.commit()
+
+                        await manager.broadcast_event(
+                            event_type="dataset:item_updated",
+                            data={
+                                "id": item.id,
+                                "dataset_id": dataset_id,
+                                "caption": caption
+                            },
+                            source="embeddr"
+                        )
                     except Exception as e:
                         print(f"Failed to caption item {item.id}: {e}")
 

@@ -1,12 +1,14 @@
 import base64
 import copy
 import os
+import asyncio
 from typing import Dict, Any, Optional
 from sqlmodel import select
 from embeddr.mcp.instance import mcp
 from embeddr.mcp.utils import get_db_session
 from embeddr.models.workflow import Workflow
 from embeddr.services.comfy import ComfyClient, AsyncComfyClient
+from embeddr.services.generation_service import GenerationService
 
 
 @mcp.tool()
@@ -86,85 +88,90 @@ async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) ->
                 Use `get_workflow_details` to see which inputs are exposed and their Node IDs.
     """
     with get_db_session() as session:
+        service = GenerationService(session)
         workflow = session.get(Workflow, workflow_id)
         if not workflow:
             return f"Workflow with ID {workflow_id} not found"
 
-        # 1. Prepare the workflow data (graph)
-        graph = copy.deepcopy(workflow.data)
+        # Inject 'mcp' tag to SaveToFolder nodes
+        if workflow.data:
+            for node_id, node in workflow.data.items():
+                class_type = node.get("class_type") or node.get("type")
+                if class_type in ["embeddr.SaveToFolder", "SaveImage"]:
+                    if node_id not in inputs:
+                        inputs[node_id] = {}
 
-        # 2. Patch the graph with inputs
-        patched_count = 0
-        for node_id, node_inputs in inputs.items():
-            if node_id not in graph:
-                continue
+                    # Get existing tags from inputs or node defaults
+                    current_tags = inputs[node_id].get("tags")
+                    if current_tags is None:
+                        current_tags = node.get("inputs", {}).get("tags", "")
 
-            for input_name, value in node_inputs.items():
-                if "inputs" in graph[node_id]:
-                    graph[node_id]["inputs"][input_name] = value
-                    patched_count += 1
+                    # Append mcp tag
+                    new_tags = f"{current_tags}, mcp" if current_tags else "mcp"
+                    inputs[node_id]["tags"] = new_tags
 
-        # Fix defaults for Embeddr nodes
-        for node_id, node in graph.items():
-            class_type = node.get("class_type") or node.get("type")
-            if class_type == "embeddr.SaveToFolder":
-                node_inputs = node.get("inputs", {})
-                if "library" not in node_inputs or not node_inputs["library"]:
-                    node_inputs["library"] = "Default"
-                if "collection" not in node_inputs or not node_inputs["collection"]:
-                    node_inputs["collection"] = "None"
-                if "caption" not in node_inputs:
-                    node_inputs["caption"] = ""
-                # Ensure inputs dict exists
-                node["inputs"] = node_inputs
-
-        # 3. Send to ComfyUI
-        client = AsyncComfyClient()
         try:
-            if not await client.is_available():
-                return f"Error: ComfyUI backend is not available at {client.url}"
+            # 1. Create Generation Record
+            gen = await service.create_generation(workflow_id, inputs)
 
+            # 2. Submit to ComfyUI
+            gen = await service.submit_generation(gen.id)
+
+            if gen.status == "failed":
+                return f"Generation failed: {gen.error_message}"
+
+            prompt_id = gen.prompt_id
+            if not prompt_id:
+                return "Error: No prompt ID returned from submission"
+
+            # 3. Wait for result
+            client = AsyncComfyClient()
             try:
-                prompt_id = await client.queue_prompt(graph)
-            except Exception as e:
-                return f"Error queuing workflow: {str(e)}"
+                # Wait up to 300 seconds
+                history = await client.wait_for_completion(prompt_id, timeout=300)
 
-            # 4. Wait for result
-            history = await client.wait_for_completion(prompt_id, timeout=120)
-            if not history:
-                return f"Workflow queued (ID: {prompt_id}), but timed out waiting for completion."
-        finally:
-            await client.close()
+                if not history:
+                    return f"Workflow queued (ID: {prompt_id}), but timed out waiting for completion."
+            finally:
+                # Ensure we close the client if it has a close method (AsyncComfyClient usually uses httpx which should be closed)
+                if hasattr(client, "close"):
+                    await client.close()
 
-        # 5. Parse result
-        outputs = history.get("outputs", {})
-        results = []
+            # 4. Parse outputs
+            outputs = history.get("outputs", {})
+            results = ["Generation Complete!"]
 
-        for node_id, output_data in outputs.items():
-            if "images" in output_data:
-                for img in output_data["images"]:
-                    fname = img.get("filename")
-                    results.append(f"Generated image: {fname}")
-            if "text" in output_data:
-                results.append(
-                    f"Node {node_id} output text: {output_data['text']}")
+            for node_id, output_data in outputs.items():
+                if "images" in output_data:
+                    for img in output_data["images"]:
+                        fname = img.get("filename")
+                        subfolder = img.get("subfolder", "")
+                        img_type = img.get("type", "output")
+                        results.append(
+                            f"Generated image: {fname} (Subfolder: {subfolder}, Type: {img_type})")
 
-            # Check for custom outputs
-            if "embeddr_ids" in output_data:
-                ids = output_data["embeddr_ids"]
-                if isinstance(ids, list):
-                    for uid in ids:
-                        results.append(f"Embeddr Image ID: {uid}")
-                else:
-                    results.append(f"Embeddr Image ID: {ids}")
-            elif "embeddr_id" in output_data:
-                results.append(
-                    f"Embeddr Image ID: {output_data['embeddr_id']}")
+                if "text" in output_data:
+                    results.append(
+                        f"Node {node_id} output text: {output_data['text']}")
 
-        if not results:
-            return "Workflow completed successfully, but no explicit image outputs were found in history."
+                if "embeddr_ids" in output_data:
+                    ids = output_data["embeddr_ids"]
+                    if isinstance(ids, list):
+                        for uid in ids:
+                            results.append(f"Embeddr Image ID: {uid}")
+                    else:
+                        results.append(f"Embeddr Image ID: {ids}")
+                elif "embeddr_id" in output_data:
+                    results.append(
+                        f"Embeddr Image ID: {output_data['embeddr_id']}")
 
-        return "\n".join(results)
+            if len(results) == 1:
+                return "Workflow completed successfully, but no explicit image outputs were found in history."
+
+            return "\n".join(results)
+
+        except Exception as e:
+            return f"Error during generation: {str(e)}"
 
 
 # @mcp.tool()

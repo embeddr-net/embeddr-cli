@@ -19,7 +19,7 @@ class GenerationService:
         self.comfy_client = AsyncComfyClient()
 
     async def create_generation(
-        self, workflow_id: int, inputs: Dict[str, Any]
+        self, workflow_id: int, inputs: Dict[str, Any], id: str = None
     ) -> Generation:
         """
         Creates a new generation record in the database.
@@ -29,7 +29,7 @@ class GenerationService:
         if not workflow:
             raise ValueError(f"Workflow {workflow_id} not found")
 
-        generation_id = str(uuid.uuid4())
+        generation_id = id if id else str(uuid.uuid4())
         generation = Generation(
             id=generation_id,
             workflow_id=workflow_id,
@@ -89,16 +89,10 @@ class GenerationService:
             # Broadcast generation_submitted event
             from embeddr.services.socket_manager import manager
 
-            await manager.broadcast(
-                {
-                    "source": "embeddr",
-                    "type": "generation_submitted",
-                    "data": {
-                        "id": generation.id,
-                        "prompt_id": prompt_id,
-                        "status": "queued",
-                    },
-                }
+            await manager.broadcast_event(
+                event_type="generation_submitted",
+                data=generation.model_dump(mode="json"),
+                source="embeddr"
             )
 
             return generation

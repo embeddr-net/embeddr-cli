@@ -8,6 +8,9 @@ from embeddr.commands import config, serve, db
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
 
+# Import get_engine to clear its cache when settings change
+from embeddr.db.session import get_engine
+
 app = typer.Typer()
 serve.register(app)
 
@@ -18,18 +21,21 @@ app.add_typer(db.app, name="db")
 @app.command()
 def init(
     name: str = typer.Option(None, help="Project name"),
-    path: Path = typer.Option(Path.cwd(), help="Path to initialize project in"),
+    path: Path = typer.Option(
+        Path.cwd(), help="Path to initialize project in"),
 ):
     """Initialize a new Embeddr project in the current directory."""
     from embeddr.core.project import CONFIG_FILENAME, create_default_config
 
     if (path / CONFIG_FILENAME).exists():
-        typer.secho(f"Project already initialized at {path}", fg=typer.colors.YELLOW)
+        typer.secho(
+            f"Project already initialized at {path}", fg=typer.colors.YELLOW)
         return
 
     project_name = name or path.name
     create_default_config(path, project_name)
-    typer.secho(f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
     typer.echo(f"Created {CONFIG_FILENAME}")
 
 
@@ -45,13 +51,18 @@ def callback(
 ):
     # 1. Explicit override always wins
     if data_dir:
+        print(f"DEBUG: Setting EMBEDDR_DATA_DIR to {data_dir}")
         os.environ["EMBEDDR_DATA_DIR"] = data_dir
         refresh_settings()
+        get_engine.cache_clear()
         return
 
     # 2. Env var already set (shell, systemd, etc.)
     if os.environ.get("EMBEDDR_DATA_DIR"):
+        print(
+            f"DEBUG: EMBEDDR_DATA_DIR already set to {os.environ.get('EMBEDDR_DATA_DIR')}")
         refresh_settings()
+        get_engine.cache_clear()
         return
 
     # 3. Check for existing project (embeddr.toml)
@@ -64,7 +75,8 @@ def callback(
             if "host" in config["server"]:
                 os.environ.setdefault("EMBEDDR_HOST", config["server"]["host"])
             if "port" in config["server"]:
-                os.environ.setdefault("EMBEDDR_PORT", str(config["server"]["port"]))
+                os.environ.setdefault(
+                    "EMBEDDR_PORT", str(config["server"]["port"]))
 
         # Determine data directory
         if "paths" in config and "data_dir" in config["paths"]:
@@ -77,6 +89,7 @@ def callback(
             os.environ["EMBEDDR_DATA_DIR"] = str(default_project_data)
 
         refresh_settings()
+        get_engine.cache_clear()
         return
 
     # 4. Default OS location
@@ -85,6 +98,7 @@ def callback(
     if default.exists():
         os.environ["EMBEDDR_DATA_DIR"] = str(default)
         refresh_settings()
+        get_engine.cache_clear()
         return
 
     # 5. First-run: prompt
@@ -97,6 +111,7 @@ def callback(
             default.mkdir(parents=True, exist_ok=True)
             os.environ["EMBEDDR_DATA_DIR"] = str(default)
             refresh_settings()
+            get_engine.cache_clear()
             return
 
         typer.secho(

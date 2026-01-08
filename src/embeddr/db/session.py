@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 @lru_cache()
 def get_engine():
+    print(f"DEBUG: get_engine called. DB URL: {settings.DATABASE_URL}")
     connect_args = (
         {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
     )
@@ -50,7 +51,8 @@ def run_migrations():
 
     # Check if we need to stamp
     if "alembic_version" not in tables and "collection" in tables:
-        logger.info("Existing database detected. Stamping with initial migration.")
+        logger.info(
+            "Existing database detected. Stamping with initial migration.")
         command.stamp(alembic_cfg, "head")
         return
 

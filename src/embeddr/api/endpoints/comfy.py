@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from embeddr.services.comfy import ComfyClient
 from typing import Optional
@@ -19,7 +19,8 @@ def upload_image_from_path(req: UploadFromPathRequest):
     Upload an image from a local file path to ComfyUI's input directory.
     """
     if not os.path.exists(req.path):
-        raise HTTPException(status_code=404, detail=f"File not found at {req.path}")
+        raise HTTPException(
+            status_code=404, detail=f"File not found at {req.path}")
 
     try:
         with open(req.path, "rb") as f:
@@ -29,9 +30,11 @@ def upload_image_from_path(req: UploadFromPathRequest):
 
         client = ComfyClient()
         if not client.is_available():
-            raise HTTPException(status_code=503, detail="ComfyUI is not available")
+            raise HTTPException(
+                status_code=503, detail="ComfyUI is not available")
 
-        result = client.upload_image(image_bytes, final_filename, req.overwrite)
+        result = client.upload_image(
+            image_bytes, final_filename, req.overwrite)
         return result
     except HTTPException:
         raise
@@ -78,3 +81,160 @@ async def get_object_info():
         raise HTTPException(status_code=503, detail="ComfyUI is not available")
 
     return await client.get_object_info()
+
+
+@router.get("/loras")
+async def get_loras(page: int = Query(1, ge=1), limit: int = Query(60, ge=1)):
+    """
+    Get list of available LoRAs from ComfyUI.
+    """
+    from embeddr.services.comfy import AsyncComfyClient
+
+    client = AsyncComfyClient()
+    if not await client.is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+
+    info = await client.get_object_info()
+
+    # Try to find LoraLoader node
+    lora_node = info.get("LoraLoader")
+    if not lora_node:
+        # Fallback to other common nodes if LoraLoader is missing (unlikely)
+        lora_node = info.get("LoraLoaderModelOnly")
+
+    loras = []
+    if lora_node:
+        try:
+            # Input format: {"required": {"lora_name": [["file1", "file2"], ...]}}
+            loras = lora_node["input"]["required"]["lora_name"][0]
+        except (KeyError, IndexError):
+            pass
+
+    total = len(loras)
+    start = (page - 1) * limit
+    end = start + limit
+    items = loras[start:end]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit
+    }
+
+
+@router.get("/checkpoints")
+async def get_checkpoints(page: int = Query(1, ge=1), limit: int = Query(60, ge=1)):
+    """
+    Get list of available Checkpoints from ComfyUI.
+    """
+    from embeddr.services.comfy import AsyncComfyClient
+
+    client = AsyncComfyClient()
+    if not await client.is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+
+    info = await client.get_object_info()
+
+    ckpt_node = info.get("CheckpointLoaderSimple")
+    if not ckpt_node:
+        ckpt_node = info.get("CheckpointLoader")
+
+    ckpts = []
+    if ckpt_node:
+        try:
+            ckpts = ckpt_node["input"]["required"]["ckpt_name"][0]
+        except (KeyError, IndexError):
+            pass
+
+    total = len(ckpts)
+    start = (page - 1) * limit
+    end = start + limit
+    items = ckpts[start:end]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit
+    }
+
+
+@router.get("/embeddings")
+async def get_embeddings(page: int = Query(1, ge=1), limit: int = Query(60, ge=1)):
+    """
+    Get list of available Embeddings from ComfyUI.
+    """
+    from embeddr.services.comfy import AsyncComfyClient
+
+    client = AsyncComfyClient()
+    if not await client.is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+
+    # ComfyUI has a specific endpoint for embeddings usually, but let's check object_info first
+    # Actually, embeddings are often just files in the embeddings folder,
+    # but they are not always listed in a node input like LoRAs.
+    # However, ComfyUI has a /embeddings endpoint.
+
+    embeddings = []
+    try:
+        resp = await client.client.get("/embeddings")
+        if resp.status_code == 200:
+            embeddings = resp.json()
+    except Exception:
+        pass
+
+    total = len(embeddings)
+    start = (page - 1) * limit
+    end = start + limit
+    items = embeddings[start:end]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit
+    }
+
+
+@router.get("/samplers")
+async def get_samplers():
+    """
+    Get list of available Samplers from ComfyUI.
+    """
+    from embeddr.services.comfy import AsyncComfyClient
+
+    client = AsyncComfyClient()
+    if not await client.is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+
+    info = await client.get_object_info()
+
+    sampler_node = info.get("KSampler")
+
+    if sampler_node:
+        try:
+            samplers = sampler_node["input"]["required"]["sampler_name"][0]
+            schedulers = sampler_node["input"]["required"]["scheduler"][0]
+            return {"samplers": samplers, "schedulers": schedulers}
+        except (KeyError, IndexError):
+            pass
+
+    return {"samplers": [], "schedulers": []}
+
+
+@router.get("/queue")
+async def get_queue():
+    """
+    Get current queue status from ComfyUI.
+    """
+    from embeddr.services.comfy import AsyncComfyClient
+
+    client = AsyncComfyClient()
+    if not await client.is_available():
+        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+
+    return await client.get_queue()

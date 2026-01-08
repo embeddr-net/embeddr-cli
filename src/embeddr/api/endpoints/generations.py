@@ -10,6 +10,7 @@ router = APIRouter()
 
 
 class GenerationCreate(BaseModel):
+    id: Optional[str] = None
     workflow_id: int
     inputs: Dict[str, Any]
 
@@ -34,7 +35,7 @@ async def create_generation(
     service = GenerationService(session)
     try:
         # 1. Create Record
-        generation = await service.create_generation(req.workflow_id, req.inputs)
+        generation = await service.create_generation(req.workflow_id, req.inputs, req.id)
         print(f"[API] Generation created: {generation.id}")
 
         # 2. Submit to ComfyUI (in background or await? await is safer for immediate feedback on queueing)

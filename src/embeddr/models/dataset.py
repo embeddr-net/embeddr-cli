@@ -15,7 +15,7 @@ class Dataset(SQLModel, table=True):
     name: str = Field(index=True)
     description: Optional[str] = None
     type: DatasetType = Field(default=DatasetType.REGULAR)
-    collection_id: int = Field(index=True)
+    collection_id: Optional[int] = Field(default=None, index=True)
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
