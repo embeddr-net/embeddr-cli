@@ -24,6 +24,7 @@ dependencies = [
   "alembic>=1.13.1",
   "toml>=0.10.2",
   "imagehash>=4.3.1",
+  "textual>=7.0.1",
 ]
 
 [project.urls]
@@ -45,6 +46,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 embeddr = ["web/**/*", "db/alembic.ini", "db/alembic/**/*"]
+
+[tool.uv.sources]
+embeddr-core = { path = "../embeddr-core", editable = true }
 
 [build-system]
 requires = ["setuptools>=61.0"]
