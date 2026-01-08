@@ -4,7 +4,8 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve, db
+from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, fixtures
+
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
 
@@ -16,6 +17,11 @@ serve.register(app)
 
 app.add_typer(config.app, name="config")
 app.add_typer(db.app, name="db")
+app.add_typer(init_v2.app, name="init-v2")
+app.add_typer(process.app, name="process")
+app.add_typer(inspect.app, name="inspect")
+app.add_typer(tui.app, name="tui")
+app.add_typer(fixtures.app, name="fixtures")
 
 
 @app.command()
