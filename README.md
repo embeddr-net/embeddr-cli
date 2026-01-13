@@ -3,7 +3,7 @@
 <img height="120" src="https://embeddr.net/embeddr_logo_transparent.png">
 
 <h1>Embeddr CLI</h1>
-Your AI Image Lab for Search, Workflows, and Creative Control.
+Embeddr is an orchestration layer that turns files, media, and data into structured, searchable artifacts using pluggable engines — all controlled via APIs, MCP, or UI, and stored locally on your machine.
 </div>
 
 ![web preview](.github/assets/webui_3.png)
