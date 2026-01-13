@@ -226,15 +226,15 @@ async def get_samplers():
     return {"samplers": [], "schedulers": []}
 
 
-@router.get("/queue")
-async def get_queue():
-    """
-    Get current queue status from ComfyUI.
-    """
-    from embeddr.services.comfy import AsyncComfyClient
+# @router.get("/queue")
+# async def get_queue():
+#     """
+#     Get current queue status from ComfyUI.
+#     """
+#     from embeddr.services.comfy import AsyncComfyClient
 
-    client = AsyncComfyClient()
-    if not await client.is_available():
-        raise HTTPException(status_code=503, detail="ComfyUI is not available")
+#     client = AsyncComfyClient()
+#     if not await client.is_available():
+#         raise HTTPException(status_code=503, detail="ComfyUI is not available")
 
-    return await client.get_queue()
+#     return await client.get_queue()

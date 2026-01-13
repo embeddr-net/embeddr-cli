@@ -12,12 +12,14 @@ import imagehash
 from embeddr_core.models.collection import CollectionItem
 from embeddr_core.models.library import LibraryPath, LocalImage
 from embeddr_core.models.lineage import ImageLineage
+from embeddr_core.models.artifact import Artifact
 from embeddr_core.services.embedding import (
     get_image_embedding,
     get_loaded_model_name,
     get_text_embedding,
 )
 from embeddr_core.services.vector_store import get_vector_store
+from embeddr.core.plugin_loader import _EVENT_BUS
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
@@ -219,9 +221,10 @@ async def check_image(
 
         # Calculate PHash
         with Image.open(temp_path) as img:
-            phash = str(imagehash.phash(img))
+            h_obj = imagehash.phash(img)
+            phash = str(h_obj)
 
-        # Check for duplicates
+        # 1. Check Legacy Locals
         existing = session.exec(
             select(LocalImage).where(LocalImage.phash == phash)
         ).first()
@@ -231,10 +234,33 @@ async def check_image(
                 "is_duplicate": True,
                 "phash": phash,
                 "existing_image": {
-                    "id": existing.id,
+                    "id": str(existing.id),  # Normalize ID to string
                     "path": existing.path,
                     "filename": existing.filename,
                     "phash": existing.phash,
+                    "type": "legacy"
+                },
+            }
+
+        # 2. Check Modern Artifacts
+        # Using generic JSON approach (sqlite compatible)
+        # Function: json_extract(column, '$.key')
+        stmt = select(Artifact).where(
+            func.json_extract(Artifact.metadata_json,
+                              '$.analysis.phash') == phash
+        )
+        existing_art = session.exec(stmt).first()
+
+        if existing_art:
+            return {
+                "is_duplicate": True,
+                "phash": phash,
+                "existing_image": {
+                    "id": str(existing_art.id),
+                    "path": existing_art.uri,
+                    "filename": existing_art.metadata_json.get("filename", "unknown"),
+                    "phash": phash,
+                    "type": "artifact"
                 },
             }
 
@@ -462,6 +488,64 @@ async def upload_image(
     session.add(local_image)
     session.commit()
     session.refresh(local_image)
+
+    # --- Artifact System Integration ---
+    try:
+        # Create Artifact
+        art_type = "video" if is_video else "image"
+
+        new_art = Artifact(
+            type_name=art_type,
+            base_type_name="artifact",
+            uri=local_image.path,
+            metadata_json={
+                "filename": local_image.filename,
+                "width": local_image.width,
+                "height": local_image.height,
+                "mime_type": local_image.mime_type,
+                "duration": local_image.duration,
+                "fps": local_image.fps,
+                "tags": local_image.tags,
+                "prompt": local_image.prompt,
+                "legacy_id": local_image.id,
+                "analysis": {
+                    "phash": local_image.phash
+                } if local_image.phash else {}
+            }
+        )
+        session.add(new_art)
+
+        # Handle Relations
+        if parent_ids:
+            from embeddr_core.models.artifact_relation import ArtifactRelation
+            for pid in parent_ids.split(','):
+                pid = pid.strip()
+                if pid:
+                    try:
+                        rel = ArtifactRelation(
+                            source_id=new_art.id,
+                            target_id=uuid.UUID(pid),
+                            relation_type="contained_in",
+                            source_namespace="upload"
+                        )
+                        session.add(rel)
+                    except ValueError:
+                        print(f"Skipping invalid parent UUID: {pid}")
+
+        session.commit()
+        session.refresh(new_art)
+
+        # Trigger Plugins
+        if _EVENT_BUS:
+            _EVENT_BUS.emit("artifact.created", {
+                "id": str(new_art.id),
+                "uri": str(new_art.uri),
+                "mime_type": local_image.mime_type or "application/octet-stream"
+            })
+
+    except Exception as e:
+        print(f"Error creating artifact from upload: {e}")
+        # Capture error but allow legacy flow to complete
 
     # Generate embedding (using loaded model or default)
     try:
@@ -880,7 +964,7 @@ def get_image_file(image_id: int, session: Session = Depends(get_session)):
         raise HTTPException(
             status_code=404, detail="Image file not found on disk")
 
-    return FileResponse(image.path)
+    return FileResponse(image.path, headers={"Vary": "Origin"})
 
 
 @router.get("/{image_id}/thumbnail")
@@ -893,7 +977,7 @@ def get_image_thumbnail(image_id: int, session: Session = Depends(get_session)):
     if not library:
         # Fallback to original if library not found (shouldn't happen)
         if os.path.exists(image.path):
-            return FileResponse(image.path)
+            return FileResponse(image.path, headers={"Vary": "Origin"})
         raise HTTPException(status_code=404, detail="Image file not found")
 
     try:
@@ -901,19 +985,19 @@ def get_image_thumbnail(image_id: int, session: Session = Depends(get_session)):
         thumb_path = Path(settings.THUMBNAILS_DIR) / str(library.id) / rel_path
 
         if thumb_path.exists():
-            return FileResponse(thumb_path)
+            return FileResponse(thumb_path, headers={"Vary": "Origin"})
 
         # Check for .jpg version (for videos or if extension changed)
         thumb_path_jpg = thumb_path.with_suffix(".jpg")
         if thumb_path_jpg.exists():
-            return FileResponse(thumb_path_jpg)
+            return FileResponse(thumb_path_jpg, headers={"Vary": "Origin"})
 
     except ValueError:
         pass
 
     # Fallback to original
     if os.path.exists(image.path):
-        return FileResponse(image.path)
+        return FileResponse(image.path, headers={"Vary": "Origin"})
 
     raise HTTPException(status_code=404, detail="Image file not found")
 

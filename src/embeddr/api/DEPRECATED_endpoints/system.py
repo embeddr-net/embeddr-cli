@@ -11,6 +11,7 @@ from embeddr_core.services.embedding import (
     unload_model,
 )
 from embeddr_core.models.library import LocalImage, LibraryPath
+from embeddr_core.services.model_registry import model_registry, ModelInfo
 
 from embeddr.core.logging_utils import get_logs
 from embeddr.core.config_manager import config_manager, AppConfig
@@ -108,41 +109,88 @@ async def get_system_logs(
     return get_logs(limit, include_filter=filter)
 
 
-@router.get("/models", response_model=List[dict])
-def get_available_models():
-    """
-    Get list of available CLIP models with their status.
-    """
-    loaded_model = get_loaded_model_name()
-
-    models = [
+def _register_legacy_clip_models():
+    legacy_models = [
         {"id": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", "name": "ViT-BigG-14"},
         {"id": "laion/CLIP-ViT-g-14-laion2B-s34B-b88K", "name": "ViT-G-14"},
         {"id": "openai/clip-vit-base-patch32", "name": "ViT-Base-32"},
         {"id": "openai/clip-vit-base-patch16", "name": "ViT-Base-16"},
         {"id": "openai/clip-vit-large-patch14", "name": "ViT-Large-14"},
     ]
+    for m in legacy_models:
+        # Check if already registered to avoid duplicates if called multiple times
+        if not model_registry.get_model(m["id"]):
+            # Create closure for loader
+            def _loader(mid=m["id"]):
+                load_model(mid)
 
-    for m in models:
-        m["loaded"] = m["id"] == loaded_model
+            model_registry.register_model(
+                ModelInfo(
+                    id=m["id"],
+                    name=m["name"],
+                    provider="core-clip",
+                    category="embedding",
+                    description="Legacy CLIP model"
+                ),
+                loader=_loader,
+                unloader=unload_model
+            )
+
+
+@router.get("/models", response_model=List[dict])
+def get_available_models():
+    """
+    Get list of available models with their status.
+    """
+    # Ensure legacy models are registered
+    _register_legacy_clip_models()
+
+    loaded_model_id = get_loaded_model_name()
+
+    # Refresh loaded status for core-clip provider models
+    # Plugins are responsible for updating their own status in the registry
+
+    models = []
+    for m in model_registry.list_models():
+        m_dict = m.dict()
+        if m.provider == "core-clip":
+            m_dict["loaded"] = (m.id == loaded_model_id)
+        models.append(m_dict)
 
     return models
 
 
 @router.post("/models/unload")
-def unload_current_model():
+async def unload_current_model():
     """
     Unload the currently loaded model to free up memory.
     """
+    # TODO: Handle unloading specific models or all
+    # For now, unload core model
     unload_model()
+
+    # Also unload any registry models marked as loaded
+    for m in model_registry.list_models():
+        if m.loaded:
+            await model_registry.unload_model(m.id)
+
     return {"status": "success", "message": "Model unloaded"}
 
 
 @router.post("/models/{model_id:path}/load")
-def load_specific_model(model_id: str):
+async def load_specific_model(model_id: str):
     """
     Load a specific model.
     """
+    # 1. Check registry
+    if model_registry.get_model(model_id):
+        try:
+            await model_registry.load_model(model_id)
+            return {"status": "success", "message": f"Model {model_id} loaded"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 2. Fallback to legacy direct load (if ID passed matches something known by embedding.py but not registry? unlikely if we registered them)
     try:
         load_model(model_id)
         return {"status": "success", "message": f"Model {model_id} loaded"}

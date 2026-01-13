@@ -7,7 +7,7 @@ from embeddr.core.config import settings
 
 
 class GeneralConfig(BaseModel):
-    model: str = "openai/clip-vit-base-patch32"
+    model: str = "Qwen/Qwen3-VL-Embedding-2B"
     batch_size: int = 32
     theme: str = "system"
 

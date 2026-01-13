@@ -213,3 +213,61 @@ def show(artifact_id: str):
                 c_node.add(f"Child ID: {c.child_id}")
 
         console.print(tree)
+
+
+@app.command()
+def sample_json(
+    limit: int = typer.Option(5, help="Number of items to sample")
+):
+    """
+    Dump a JSON sample of the DB (Artifacts + Relations + Annotations).
+    Useful for showing DB structure to other agents.
+    """
+    import json
+    import uuid
+    from datetime import datetime
+
+    def json_serial(obj):
+        """JSON serializer for objects not serializable by default json code"""
+        if isinstance(obj, (datetime)):
+            return obj.isoformat()
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        return str(obj)
+
+    engine = get_engine()
+    with Session(engine) as session:
+        # Get Sample Artifacts (stratified by type)
+        types = session.exec(select(Artifact.type_name).distinct()).all()
+        artifacts = []
+        for t in types:
+            artifacts.extend(session.exec(select(Artifact).where(
+                Artifact.type_name == t).limit(limit)).all())
+
+        output_data = []
+        for art in artifacts:
+            # Fetch Relations
+            rels_out = session.exec(select(ArtifactRelation).where(
+                ArtifactRelation.source_id == art.id)).all()
+            rels_in = session.exec(select(ArtifactRelation).where(
+                ArtifactRelation.target_id == art.id)).all()
+
+            # Fetch Annotations
+            anns = session.exec(select(ArtifactAnnotation).where(
+                ArtifactAnnotation.artifact_id == art.id)).all()
+
+            # Fetch Embeddings
+            embs = session.exec(select(ArtifactEmbedding).where(
+                ArtifactEmbedding.artifact_id == art.id)).all()
+
+            art_dict = art.model_dump()
+            art_dict['relations_outgoing'] = [r.model_dump() for r in rels_out]
+            art_dict['relations_incoming'] = [r.model_dump() for r in rels_in]
+            art_dict['annotations'] = [a.model_dump() for a in anns]
+            # Exclude heavy vector data
+            art_dict['embeddings'] = [{k: v for k, v in e.model_dump().items() if k != 'vector_json'}
+                                      for e in embs]
+
+            output_data.append(art_dict)
+
+        print(json.dumps(output_data, default=json_serial, indent=2))

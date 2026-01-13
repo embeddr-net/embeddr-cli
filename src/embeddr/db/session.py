@@ -19,11 +19,44 @@ logger = logging.getLogger(__name__)
 
 @lru_cache()
 def get_engine():
-    print(f"DEBUG: get_engine called. DB URL: {settings.DATABASE_URL}")
-    connect_args = (
-        {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+    connect_args = {}
+    if "sqlite" in settings.DATABASE_URL:
+        # Increase timeout to avoid locking issues during migrations or heavy writes (default is 5)
+        connect_args = {"check_same_thread": False, "timeout": 30}
+
+    # Enable connection pooling for SQLite to avoid constant file open/close overhead
+    # But limit pool size to avoid "Too many open files" or locking issues with WAL
+    from sqlalchemy.pool import QueuePool
+    from sqlalchemy import event
+
+    engine = create_engine(
+        settings.DATABASE_URL,
+        connect_args=connect_args,
+        poolclass=QueuePool,
+        pool_size=10,        # Allow 10 cached connections
+        max_overflow=20      # Allow bursting up to 30 total
     )
-    return create_engine(settings.DATABASE_URL, connect_args=connect_args)
+
+    if "sqlite" in settings.DATABASE_URL:
+        @event.listens_for(engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+
+    return engine
+
+
+def get_engine_isolated():
+    """
+    Returns a new engine instance for isolated operations (like background workers).
+    This avoids sharing the connection pool with the main API loop if desired,
+    though simpler logic effectively uses get_engine() often.
+    For SQLite with WAL, sharing the engine (and pool) is actually preferred.
+    So we align this to return get_engine().
+    """
+    return get_engine()
 
 
 def backup_database():

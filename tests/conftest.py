@@ -29,7 +29,7 @@ def client_fixture(engine):
 
     # Override dependencies
     from embeddr.db.session import get_session as db_get_session
-    from embeddr.api.endpoints.system import get_session as system_get_session
+    from embeddr.api.DEPRECATED_endpoints.system import get_session as system_get_session
 
     def get_session_override():
         with Session(engine) as session:

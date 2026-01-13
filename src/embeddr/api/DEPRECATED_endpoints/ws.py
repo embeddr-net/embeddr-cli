@@ -29,20 +29,32 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+            except RuntimeError as e:
+                # Catch "WebSocket is not connected" error which happens if client disconnects abruptly
+                if "WebSocket is not connected" in str(e):
+                    logger.debug(
+                        f"Client {client_id} disconnected abruptly (RuntimeError)")
+                    break
+                raise e
+            except WebSocketDisconnect:
+                logger.debug(f"Client {client_id} disconnected")
+                break
+
             try:
                 message = json.loads(data)
                 if message.get("type") == "request_status":
                     # 1. Get Queue Status
                     queue_status = {"remaining": 0}
-                    try:
-                        # Run blocking call in thread to avoid blocking event loop
-                        queue = await asyncio.to_thread(comfy_client.get_queue)
-                        remaining = len(queue.get("queue_running", [])) + \
-                            len(queue.get("queue_pending", []))
-                        queue_status["remaining"] = remaining
-                    except Exception as e:
-                        logger.error(f"Failed to get queue status: {e}")
+                    # try:
+                    # Run blocking call in thread to avoid blocking event loop
+                    # queue = await asyncio.to_thread(comfy_client.get_queue)
+                    # remaining = len(queue.get("queue_running", [])) + \
+                    #     len(queue.get("queue_pending", []))
+                    # queue_status["remaining"] = remaining
+                    # except Exception as e:
+                    #     logger.error(f"Failed to get queue status: {e}")
 
                     # 2. Get Running Generations from DB
                     running_generations = []

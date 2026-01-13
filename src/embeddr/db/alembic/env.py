@@ -1,4 +1,4 @@
-from embeddr_core.models import collection, library, lineage
+from embeddr_core.models import collection, library, lineage, automation, artifact_type
 from embeddr.models import dataset, generation, workflow
 from embeddr.core.config import settings
 from logging.config import fileConfig

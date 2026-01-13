@@ -4,10 +4,11 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, fixtures
+from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system
 
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
+from embeddr.core.plugin_loader import load_python_plugins, initialize_all_plugins, startup_all_plugins
 
 # Import get_engine to clear its cache when settings change
 from embeddr.db.session import get_engine
@@ -17,11 +18,50 @@ serve.register(app)
 
 app.add_typer(config.app, name="config")
 app.add_typer(db.app, name="db")
+app.add_typer(plugins.app, name="plugins")
 app.add_typer(init_v2.app, name="init-v2")
 app.add_typer(process.app, name="process")
 app.add_typer(inspect.app, name="inspect")
 app.add_typer(tui.app, name="tui")
-app.add_typer(fixtures.app, name="fixtures")
+app.add_typer(system.app, name="system")
+# app.add_typer(fixtures.app, name="fixtures") # Moved to Plugin
+
+# Load CLI Plugins
+# Skip loading if we are just running the server (it loads them itself)
+# Robust check for serve command anywhere in args
+is_serve = "serve" in sys.argv
+
+if not is_serve:
+    # 1. Dev Path
+    dev_plugins = Path(__file__).parents[3] / "embeddr-plugins" / "plugins"
+    if dev_plugins.exists():
+        load_python_plugins(dev_plugins, cli_app=app)
+
+    # 2. User Path
+    user_plugins = get_data_dir() / "plugins"
+    if user_plugins.exists():
+        load_python_plugins(user_plugins, cli_app=app)
+
+    # 3. Environment Variable (Check both singular and plural)
+    env_plugin_dir = os.environ.get(
+        "EMBEDDR_PLUGIN_DIR") or os.environ.get("EMBEDDR_PLUGINS_DIR")
+    if env_plugin_dir:
+        path = Path(env_plugin_dir)
+        if path.exists():
+            load_python_plugins(path, cli_app=app)
+
+    # Initialize all discovered plugins
+    initialize_all_plugins()
+    startup_all_plugins()
+
+    # START AUTOMATION MANAGER (Headless Mode)
+    # When running CLI commands, we might trigger artifact creation
+    # so we should have the manager running if events fire.
+    try:
+        from embeddr.services.automation_manager import automation_manager
+        automation_manager.start()
+    except Exception as e:
+        print(f"Failed to start AutomationManager: {e}")
 
 
 @app.command()

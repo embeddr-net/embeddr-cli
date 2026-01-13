@@ -25,7 +25,8 @@ def setup_log_capture():
 
     deque_handler = DequeHandler()
     deque_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
 
     root_logger.addHandler(deque_handler)
@@ -41,6 +42,7 @@ def setup_logging():
     # Explicitly allow INFO for our app
     logging.getLogger("embeddr").setLevel(logging.INFO)
     logging.getLogger("embeddr_core").setLevel(logging.INFO)
+    logging.getLogger("embeddr_plugins").setLevel(logging.INFO)
 
     # Silence noisy loggers in terminal
     logging.getLogger("docket").setLevel(logging.WARNING)
