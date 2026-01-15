@@ -372,6 +372,7 @@ def create_app(
     from embeddr.api.v2 import config as config_v2
     from embeddr.api.v2 import maintenance as maintenance_v2
     # from embeddr.api.v2 import projections as projections_v2 # Moved to Plugin
+    from embeddr.api.v2 import actions as actions_v2
     app.include_router(artifacts_v2.router,
                        prefix="/api/v2/artifacts", tags=["artifacts"])
     app.include_router(plugins_v2.router,
@@ -388,6 +389,8 @@ def create_app(
                        prefix="/api/v2/config", tags=["config"])
     app.include_router(maintenance_v2.router,
                        prefix="/api/v2/maintenance", tags=["maintenance"])
+    app.include_router(actions_v2.router,
+                       prefix="/api/v2/actions", tags=["actions"])
     # app.include_router(projections_v2.router,
     #                    prefix="/api/v2/projections", tags=["projections"])
 
@@ -413,24 +416,24 @@ def create_app(
         cli_root = Path(__file__).resolve().parents[3]
         repo_root = cli_root.parent
 
-        # 2a. Dist Plugins (Compiled Frontend) - High Priority
-        dist_plugins_src = repo_root / "embeddr-plugins" / "dist-plugins"
-        if dist_plugins_src.exists():
-            if not any(existing == dist_plugins_src for existing in plugin_paths):
-                logger.debug(f"Found dist plugins at {dist_plugins_src}")
-                plugin_paths.append(dist_plugins_src)
+        # # 2a. Dist Plugins (Compiled Frontend) - High Priority
+        # dist_plugins_src = repo_root / "embeddr-plugins" / "dist-plugins"
+        # if dist_plugins_src.exists():
+        #     if not any(existing == dist_plugins_src for existing in plugin_paths):
+        #         logger.debug(f"Found dist plugins at {dist_plugins_src}")
+        #         plugin_paths.append(dist_plugins_src)
 
         # 2b. Source Plugins
-        dev_plugins_src = repo_root / "embeddr-plugins" / "plugins"
+        # dev_plugins_src = repo_root / "embeddr-plugins" / "plugins"
 
-        if dev_plugins_src.exists():
-            # Only add if not already added by env vars (to avoid shadowing/duplication issues if user pointed to it)
-            if not any(existing == dev_plugins_src for existing in plugin_paths):
-                logger.debug(f"Found dev plugins at {dev_plugins_src}")
-                plugin_paths.append(dev_plugins_src)
+        # if dev_plugins_src.exists():
+        #     # Only add if not already added by env vars (to avoid shadowing/duplication issues if user pointed to it)
+        #     if not any(existing == dev_plugins_src for existing in plugin_paths):
+        #         logger.debug(f"Found dev plugins at {dev_plugins_src}")
+        #         plugin_paths.append(dev_plugins_src)
 
         # 3. Local "plugins" folder
-        plugin_paths.append(Path.cwd() / "plugins")
+        # plugin_paths.append(Path.cwd() / "plugins")
 
         # Phase 1: Load all plugins (Python Logic + API)
         for p_path in plugin_paths:

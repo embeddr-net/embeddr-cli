@@ -118,7 +118,7 @@ def add_relation(
     return {"status": "created", "id": f"{new_rel.source_id}:{new_rel.target_id}"}
 
 
-@router.post("/", response_model=Artifact)
+@router.post("", response_model=Artifact)
 async def create_artifact(
     art_in: ArtifactCreate,
     session: Session = Depends(get_session)
@@ -213,28 +213,35 @@ def update_artifact(
 
 @router.get("/search", response_model=PaginatedArtifacts)
 def search_artifacts(
-    q: str = Query(..., min_length=1),
+    q: Optional[str] = Query(None),
     limit: int = 20,
     offset: int = 0,
     type_name: Optional[str] = None,
+    type_prefix: Optional[str] = None,
     session: Session = Depends(get_session)
 ):
     """Search artifacts by URI or metadata."""
-    query_str = f"%{q}%"
 
-    # Search URI and metadata_json (casted to string)
-    # This is a naive text search but works for most JSON metadata cases (finding filenames, labels, prompt text)
-    filter_condition = or_(
-        col(Artifact.uri).contains(q),
-        cast(Artifact.metadata_json, String).contains(q)
-    )
+    query = select(Artifact)
+    count_query = select(func.count(Artifact.id))
 
-    query = select(Artifact).where(filter_condition)
-    count_query = select(func.count(Artifact.id)).where(filter_condition)
+    # Text Search Filter
+    if q and len(q) > 0:
+        filter_condition = or_(
+            col(Artifact.uri).contains(q),
+            cast(Artifact.metadata_json, String).contains(q)
+        )
+        query = query.where(filter_condition)
+        count_query = count_query.where(filter_condition)
 
     if type_name:
         query = query.where(Artifact.type_name == type_name)
         count_query = count_query.where(Artifact.type_name == type_name)
+
+    if type_prefix:
+        query = query.where(Artifact.type_name.startswith(type_prefix))
+        count_query = count_query.where(
+            Artifact.type_name.startswith(type_prefix))
 
     total = session.exec(count_query).one()
 

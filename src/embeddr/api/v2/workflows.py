@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from embeddr.db.session import get_session
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.workflow import WorkflowArtifactMetadata, WorkflowPort, WorkflowImplementation
-from embeddr.services.comfy_parser import parse_comfy_graph
 from embeddr.services.comfy import AsyncComfyClient
 from embeddr.services.executors.native import native_executor
 from embeddr.services.template_registry import get_template, list_templates
@@ -39,8 +38,9 @@ async def list_workflows(
     """
     List workflow artifacts.
     """
+    # Updated to use new Namespace
     query = select(Artifact).where(Artifact.type_name ==
-                                   "workflow").limit(limit).offset(offset)
+                                   "action:comfy.workflow").limit(limit).offset(offset)
     artifacts = session.exec(query).all()
     return artifacts
 
@@ -59,23 +59,37 @@ async def create_workflow(
     graph = payload.get("graph")
     template = payload.get("template")
 
+    # Direct payload passed?
+    payload_data = payload.get("payload")
+
     if graph:
-        # Import ComfyUI
-        metadata_obj = parse_comfy_graph(graph)
+        # Import ComfyUI - DEPRECATED via this endpoint
+        # User should use Plugin API to parse, or provide full metadata.
+        # Assuming payload['graph'] IS the metadata if passed here?
+        # For now, we raise easy error directing to new flow
+        raise HTTPException(
+            status_code=400,
+            detail="Direct ComfyUI graph import is deprecated. Use the ComfyUI Plugin API to parse/import workflows."
+        )
     elif template:
         # Load from defaults
         metadata_obj = get_template(template)
-    else:
-        # Empty Core Transform
+        # Convert model dump to dict
+        payload_data = metadata_obj.model_dump()
+    elif not payload_data:
+        # Empty Core Transform or just shell
         metadata_obj = get_template("empty")
+        payload_data = {"workflow": metadata_obj.model_dump()}
 
     # Create Artifact
     artifact = Artifact(
-        type_name="workflow",
+        type_name="action:comfy.workflow",
         metadata_json={
             "name": name,
             "description": description,
-            "workflow": metadata_obj.model_dump()
+            # Merge payload data. If it has 'workflow' key (legacy), fine.
+            # Ideally store as "payload": {...} if it's the raw graph
+            **payload_data
         }
     )
 
@@ -92,14 +106,14 @@ async def duplicate_workflow(
 ):
     """Duplicates an existing workflow."""
     original = session.get(Artifact, id)
-    if not original or original.type_name != "workflow":
+    if not original or original.type_name != "action:comfy.workflow":
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     new_meta = copy.deepcopy(original.metadata_json)
     new_meta["name"] = f"{new_meta.get('name')} (Copy)"
 
     new_artifact = Artifact(
-        type_name="workflow",
+        type_name="action:comfy.workflow",
         metadata_json=new_meta
     )
     # TODO: Add relation 'variant_of' -> original.id
@@ -152,7 +166,7 @@ async def compose_workflows(
     )
 
     new_artifact = Artifact(
-        type_name="workflow",
+        type_name="action:comfy.workflow",
         metadata_json={
             "name": name,
             "workflow": meta.model_dump()
@@ -169,7 +183,7 @@ async def compose_workflows(
 async def get_workflow(id: UUID, session: Session = Depends(get_session)):
     artifact = session.get(Artifact, id)
     # Check type or base type
-    if not artifact or artifact.type_name != "workflow":
+    if not artifact or artifact.type_name != "action:comfy.workflow":
         raise HTTPException(
             status_code=404, detail="Workflow artifact not found")
     return artifact
@@ -178,7 +192,7 @@ async def get_workflow(id: UUID, session: Session = Depends(get_session)):
 @router.put("/{id}")
 async def update_workflow(
     id: UUID,
-    metadata: WorkflowArtifactMetadata,
+    metadata: Dict[str, Any] = Body(...),
     session: Session = Depends(get_session)
 ):
     """
@@ -186,12 +200,21 @@ async def update_workflow(
     Does NOT execute it.
     """
     artifact = session.get(Artifact, id)
-    if not artifact or artifact.type_name != "workflow":
+    if not artifact or artifact.type_name != "action:comfy.workflow":
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     # Update the workflow spec part of metadata
     current_meta = artifact.metadata_json
-    current_meta["workflow"] = metadata.model_dump()
+
+    # Handle top-level fields (V2 style or general)
+    # matching the frontend sending the full metadata_json object
+    for field in ["name", "description", "interface", "payload", "graph"]:
+        if field in metadata:
+            current_meta[field] = metadata[field]
+
+    # Handle Legacy 'workflow' object if present
+    if "workflow" in metadata:
+        current_meta["workflow"] = metadata["workflow"]
 
     # Explicitly mark as modified for SQLAlchemy
     from sqlalchemy.orm.attributes import flag_modified
@@ -211,7 +234,7 @@ async def update_workflow(
 def delete_workflow(workflow_id: UUID, session: Session = Depends(get_session)):
     """Delete a workflow."""
     artifact = session.get(Artifact, workflow_id)
-    if not artifact or artifact.type_name != "workflow":
+    if not artifact or artifact.type_name != "action:comfy.workflow":
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     # TODO: Port Disk Sync to V2
@@ -243,38 +266,47 @@ async def run_workflow(
     Currently defaults to ComfyUI execution, but eventually this should be plugin-aware.
     """
     artifact = session.get(Artifact, workflow_id)
-    if not artifact or artifact.type_name != "workflow":
-        raise HTTPException(status_code=404, detail="Workflow not found")
+    # Relax check to allow all "action:" types, and legacy "workflow"
+    if not artifact or (not artifact.type_name.startswith("action:") and artifact.type_name != "workflow"):
+        raise HTTPException(
+            status_code=404, detail="Workflow/Action not found")
 
     # 1. Prepare the workflow data (graph)
     # Extract from metadata: metadata -> workflow -> implementation -> payload
     try:
         workflow_meta = artifact.metadata_json.get("workflow", {})
+        # Support new direct payload path
+        payload = artifact.metadata_json.get("payload")
 
         # Dispatch based on implementation type
-        impl_type = workflow_meta.get("implementation", {}).get("type")
-        if impl_type == "core-transform":
-            # Native Execution (requires outputs dir config or temp)
-            from embeddr.core.config import get_settings
-            s = get_settings()  # ensure we have settings, though we likely need data dir
-            output_dir = "/tmp/embeddr_outputs"  # Fallback
-            if hasattr(s, 'data_dir'):
-                output_dir = str(s.data_dir / "outputs")
-            os.makedirs(output_dir, exist_ok=True)
+        if payload:
+            graph = copy.deepcopy(payload)
 
-            # Reconstruct model from dict for type safety if needed, or pass dict
-            wm_obj = WorkflowArtifactMetadata(**workflow_meta)
-            outputs = await native_executor.execute(wm_obj, req.inputs, output_dir, session=session)
+        else:
+            impl_type = workflow_meta.get("implementation", {}).get("type")
+            if impl_type == "core-transform":
+                # Native Execution (requires outputs dir config or temp)
+                from embeddr.core.config import get_settings
+                s = get_settings()  # ensure we have settings, though we likely need data dir
+                output_dir = "/tmp/embeddr_outputs"  # Fallback
+                if hasattr(s, 'data_dir'):
+                    output_dir = str(s.data_dir / "outputs")
+                os.makedirs(output_dir, exist_ok=True)
 
-            # Wrap response to match API contract roughly
-            return {
-                "status": "completed",
-                "outputs": outputs,
-                "prompt_id": str(UUID(int=0))  # dummy ID for sync execution
-            }
+                # Reconstruct model from dict for type safety if needed, or pass dict
+                wm_obj = WorkflowArtifactMetadata(**workflow_meta)
+                outputs = await native_executor.execute(wm_obj, req.inputs, output_dir, session=session)
 
-        implementation = workflow_meta.get("implementation", {})
-        graph = copy.deepcopy(implementation.get("payload", {}))
+                # Wrap response to match API contract roughly
+                return {
+                    "status": "completed",
+                    "outputs": outputs,
+                    # dummy ID for sync execution
+                    "prompt_id": str(UUID(int=0))
+                }
+
+            implementation = workflow_meta.get("implementation", {})
+            graph = copy.deepcopy(implementation.get("payload", {}))
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Invalid workflow structure: {e}")
@@ -293,12 +325,56 @@ async def run_workflow(
             status_code=503, detail="ComfyUI is not available")
 
     # 2. Patch the graph with inputs
-    for node_id, node_inputs in req.inputs.items():
-        if node_id in graph:
-            if "inputs" not in graph[node_id]:
-                graph[node_id]["inputs"] = {}
-            for k, v in node_inputs.items():
-                graph[node_id]["inputs"][k] = v
+    # Handle flat inputs via interface mapping
+    interface = artifact.metadata_json.get(
+        "interface") or artifact.metadata_json.get("graph", {}).get("interface", {})
+    exposed_inputs = interface.get("exposed_inputs", [])
+
+    for key, value in req.inputs.items():
+        # Check if direct node override (legacy/advanced)
+        # Assuming Node ID keys are usually distinct from label keys?
+        # A dictionary value almost certainly means node Override.
+        if isinstance(value, dict) and key in graph:
+            if "inputs" not in graph[key]:
+                graph[key]["inputs"] = {}
+            for k, v in value.items():
+                graph[key]["inputs"][k] = v
+            continue
+
+        # Try to resolve key from interface
+        target_input = None
+        # 1. Exact Label Match
+        for inp in exposed_inputs:
+            if inp.get("label") == key:
+                target_input = inp
+                break
+
+        # 1b. Fuzzy/Strip Match
+        if not target_input:
+            for inp in exposed_inputs:
+                lbl = inp.get("label")
+                if lbl and str(lbl).strip() == str(key).strip():
+                    target_input = inp
+                    break
+
+        # 2. Node_Port Match
+        if not target_input:
+            for inp in exposed_inputs:
+                if f"{inp.get('node')}_{inp.get('port')}" == key:
+                    target_input = inp
+                    break
+
+        # Apply if found
+        if target_input:
+            node_id = str(target_input.get("node"))
+            port_name = target_input.get("port")
+            if node_id in graph:
+                if "inputs" not in graph[node_id]:
+                    graph[node_id]["inputs"] = {}
+                graph[node_id]["inputs"][port_name] = value
+            # Case where graph has int keys (unlikely but possible if manually constructed)
+            elif int(node_id) in graph:
+                pass  # Cannot handle easily without normalizing graph keys, assuming strings
 
     # Fix defaults for Embeddr nodes
     for node_id, node in graph.items():

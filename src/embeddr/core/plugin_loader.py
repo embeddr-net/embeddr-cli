@@ -57,6 +57,7 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
             "intents": [i.value for i in p.intents],
             "actions": [a.model_dump() for a in p.actions],
             "frontend_components": [c.model_dump() for c in getattr(p, 'frontend_components', [])],
+            "frontend_actions": [a.model_dump() for a in getattr(p, "frontend_actions", [])],
         }
 
         # Only add URL if the plugin actually has a dist (frontend build)

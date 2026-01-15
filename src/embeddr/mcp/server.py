@@ -2,8 +2,8 @@
 from embeddr.mcp.instance import mcp
 import embeddr.mcp.tools.library
 import embeddr.mcp.tools.collections
-import embeddr.mcp.tools.search
-import embeddr.mcp.tools.workflows
+# import embeddr.mcp.tools.search
+# import embeddr.mcp.tools.workflows
 from embeddr_core.plugin_interface import PluginIntent
 from embeddr.core.plugin_loader import get_plugins_by_intent
 import logging
