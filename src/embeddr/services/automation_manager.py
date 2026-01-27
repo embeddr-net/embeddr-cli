@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.config import AutoAnalysisConfig
 from embeddr_core.models.analysis_capability import AnalysisCapability
+from embeddr_core.services.config_service import resolve_plugin_config
 from embeddr.core.plugin_loader import get_plugins_by_intent, _EVENT_BUS
 from embeddr_core.plugin_interface import PluginIntent, EmbeddrEvent
 from embeddr.services.analysis_dispatcher import AnalysisDispatcher
@@ -54,6 +55,9 @@ class AutomationManager:
     def start(self):
         if self.is_running:
             return
+        logger.warning(
+            "AutomationManager V1 is deprecated. Use automation_manager_v2 instead."
+        )
         logger.info(
             f"AutomationManager: Starting up with {self.concurrency} workers...")
 
@@ -142,10 +146,25 @@ class AutomationManager:
 
         # Add to buffer
         if cap_id not in self.buffers:
+            batch_wait_s = 2.0
+            if plugin.name == "embeddr-embeddings":
+                try:
+                    with Session(self.engine) as session:
+                        cfg = resolve_plugin_config(
+                            session=session,
+                            plugin_name="embeddr-embeddings",
+                            scope="global",
+                            scope_id=None,
+                            config_id="embeddr-embeddings.config",
+                        ) or {}
+                    batch_wait_s = float(cfg.get("auto_batch_wait_s") or 5.0)
+                except Exception:
+                    batch_wait_s = 5.0
             self.buffers[cap_id] = {
                 "plugin": plugin,
                 "capability": capability,
-                "items": []
+                "items": [],
+                "batch_wait_s": batch_wait_s,
             }
 
         buffer = self.buffers[cap_id]
@@ -170,7 +189,9 @@ class AutomationManager:
             return  # Timer already running
 
         async def delayed_flush():
-            await asyncio.sleep(2.0)  # Wait up to 2 seconds to fill the batch
+            buffer = self.buffers.get(cap_id) or {}
+            delay = float(buffer.get("batch_wait_s") or 2.0)
+            await asyncio.sleep(delay)
             try:
                 await self._flush_buffer(cap_id)
             except Exception as e:
@@ -329,6 +350,14 @@ class AutomationManager:
                     f"AutomationManager: Artifact {artifact_id} not found in DB during processing.")
                 return
 
+            metadata = artifact.metadata_json or {}
+            external = metadata.get("external") if isinstance(
+                metadata, dict) else None
+            is_stash_import = bool(
+                isinstance(external, dict) and external.get(
+                    "source") == "stash"
+            )
+
             # 1. Identify applicable plugins
             plugins = get_plugins_by_intent(PluginIntent.AUTO_ANALYSIS)
             if not plugins:
@@ -338,6 +367,8 @@ class AutomationManager:
 
             for plugin in plugins:
                 for capability in plugin.analysis_capabilities:
+                    if is_stash_import and plugin.name == "embeddr-thumbnailer":
+                        continue
                     # Check Trigger
                     if capability.trigger_event != "artifact.created":
                         continue

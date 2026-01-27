@@ -1,4 +1,1 @@
-from fastmcp import FastMCP
-
-# Initialize FastMCP server
-mcp = FastMCP("Embeddr")
+"""Deprecated: FastMCP is now owned by the transport plugin."""

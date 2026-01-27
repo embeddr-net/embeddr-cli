@@ -1,4 +1,5 @@
 import logging
+import os
 from collections import deque
 
 log_capture_deque = deque(maxlen=1000)
@@ -34,19 +35,23 @@ def setup_log_capture():
     access_logger.addHandler(deque_handler)
 
 
-def setup_logging():
-    # Setup logging
-    # Set root to WARNING to suppress third-party INFO logs
-    logging.basicConfig(level=logging.WARNING)
+def setup_logging(verbose: bool | None = None):
+    if verbose is None:
+        verbose = os.environ.get("EMBEDDR_VERBOSE", "false").lower() == "true"
 
-    # Explicitly allow INFO for our app
-    logging.getLogger("embeddr").setLevel(logging.INFO)
-    logging.getLogger("embeddr_core").setLevel(logging.INFO)
-    logging.getLogger("embeddr_plugins").setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
 
-    # Silence noisy loggers in terminal
+    logging.getLogger("embeddr.local").setLevel(logging.INFO)
+    logging.getLogger("embeddr").setLevel(
+        logging.INFO if verbose else logging.WARNING)
+    logging.getLogger("embeddr_core").setLevel(
+        logging.INFO if verbose else logging.WARNING)
+    logging.getLogger("embeddr_plugins").setLevel(
+        logging.INFO if verbose else logging.WARNING)
+
     logging.getLogger("docket").setLevel(logging.WARNING)
-    logging.getLogger("mcp").setLevel(logging.WARNING)
+    logging.getLogger("mcp").setLevel(
+        logging.WARNING if not verbose else logging.INFO)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
     setup_log_capture()

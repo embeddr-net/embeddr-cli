@@ -3,15 +3,82 @@ import logging
 import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlmodel import Session, select
+from sqlalchemy import func
 
 from embeddr.services.socket_manager import manager
-from embeddr.services.comfy import ComfyClient
 from embeddr.db.session import get_engine
-from embeddr.models.generation import Generation
+from embeddr_core.models.artifact_execution import ArtifactExecution
+from embeddr_core.models.automation import Automation
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-comfy_client = ComfyClient()
+
+
+async def _build_status_payload() -> dict:
+    queue_status = {"remaining": 0}
+    running_executions = []
+
+    try:
+        def get_running_executions_sync():
+            engine = get_engine()
+            with Session(engine) as session:
+                statement = select(ArtifactExecution).where(
+                    ArtifactExecution.status.in_([
+                        "queued",
+                        "running",
+                        "pending",
+                        "processing",
+                    ])
+                )
+                results = session.exec(statement).all()
+                return [
+                    g.model_dump() if hasattr(g, "model_dump") else g.dict()
+                    for g in results
+                ]
+
+        running_executions = await asyncio.to_thread(get_running_executions_sync)
+        for g in running_executions:
+            if g.get("created_at"):
+                g["created_at"] = g["created_at"].isoformat()
+            if g.get("updated_at"):
+                g["updated_at"] = g["updated_at"].isoformat()
+    except Exception as e:
+        logger.error(f"Failed to get running executions: {e}")
+
+    automation_status = {"total": 0, "active": 0}
+    try:
+        def get_automation_status_sync():
+            engine = get_engine()
+            with Session(engine) as session:
+                total = session.exec(
+                    select(func.count()).select_from(Automation)
+                ).one()
+                active = session.exec(
+                    select(func.count()).select_from(Automation).where(
+                        Automation.is_active == True
+                    )
+                ).one()
+                return {"total": total, "active": active}
+
+        automation_status = await asyncio.to_thread(get_automation_status_sync)
+    except Exception as e:
+        logger.error(f"Failed to get automation status: {e}")
+
+    return {
+        "queue_status": queue_status,
+        "running_generations": [],
+        "running_executions": running_executions,
+        "automation_status": automation_status,
+    }
+
+
+async def broadcast_status() -> None:
+    payload = await _build_status_payload()
+    await manager.broadcast({
+        "type": "status_response",
+        "source": "embeddr",
+        "data": payload,
+    })
 
 
 @router.websocket("/ws")
@@ -32,7 +99,6 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 data = await websocket.receive_text()
             except RuntimeError as e:
-                # Catch "WebSocket is not connected" error which happens if client disconnects abruptly
                 if "WebSocket is not connected" in str(e):
                     logger.debug(
                         f"Client {client_id} disconnected abruptly (RuntimeError)")
@@ -45,58 +111,18 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 message = json.loads(data)
                 if message.get("type") == "request_status":
-                    # 1. Get Queue Status
-                    queue_status = {"remaining": 0}
-                    # try:
-                    # Run blocking call in thread to avoid blocking event loop
-                    # queue = await asyncio.to_thread(comfy_client.get_queue)
-                    # remaining = len(queue.get("queue_running", [])) + \
-                    #     len(queue.get("queue_pending", []))
-                    # queue_status["remaining"] = remaining
-                    # except Exception as e:
-                    #     logger.error(f"Failed to get queue status: {e}")
-
-                    # 2. Get Running Generations from DB
-                    running_generations = []
-                    try:
-                        def get_running_generations_sync():
-                            engine = get_engine()
-                            with Session(engine) as session:
-                                statement = select(Generation).where(
-                                    Generation.status.in_(["pending", "processing"]))
-                                results = session.exec(statement).all()
-                                # Convert to dicts using model_dump if available (Pydantic v2) or dict (v1)
-                                return [
-                                    g.model_dump() if hasattr(g, "model_dump") else g.dict()
-                                    for g in results
-                                ]
-
-                        running_generations = await asyncio.to_thread(get_running_generations_sync)
-
-                        # Handle datetime serialization if needed (usually fastapi handles it, but we are sending raw json)
-                        # We need to convert datetime objects to strings
-                        for g in running_generations:
-                            if g.get("created_at"):
-                                g["created_at"] = g["created_at"].isoformat()
-                            if g.get("updated_at"):
-                                g["updated_at"] = g["updated_at"].isoformat()
-                    except Exception as e:
-                        logger.error(f"Failed to get running generations: {e}")
-
-                    response = {
-                        "type": "status_response",
-                        "source": "embeddr",
-                        "data": {
-                            "queue_status": queue_status,
-                            "running_generations": running_generations
-                        }
-                    }
-                    await manager.send_personal_message(response, websocket)
-
+                    payload = await _build_status_payload()
+                    await manager.send_personal_message(
+                        {
+                            "type": "status_response",
+                            "source": "embeddr",
+                            "data": payload,
+                        },
+                        websocket,
+                    )
             except json.JSONDecodeError:
                 pass
             except Exception as e:
                 logger.error(f"Error processing websocket message: {e}")
-
-    except WebSocketDisconnect:
+    finally:
         manager.disconnect(websocket)

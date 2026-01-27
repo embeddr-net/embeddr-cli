@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from enum import Enum
 from sqlmodel import Field, SQLModel, Relationship
@@ -17,8 +17,12 @@ class Dataset(SQLModel, table=True):
     type: DatasetType = Field(default=DatasetType.REGULAR)
     collection_id: Optional[int] = Field(default=None, index=True)
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
     # JSON string: { "model": "...", "mode": "...", "query": "..." }
     captioning_config: Optional[str] = Field(default=None)

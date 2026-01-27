@@ -1,7 +1,7 @@
 import json
 import logging
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
@@ -182,7 +182,7 @@ class WorkflowManager:
                     existing.data = workflow_data
                     existing.meta = meta
                     existing.description = description
-                    existing.updated_at = datetime.utcnow()
+                    existing.updated_at = datetime.now(timezone.utc)
                     self.session.add(existing)
                     logger.info(f"Updated workflow: {name}")
                 else:

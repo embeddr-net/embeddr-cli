@@ -1,12 +1,14 @@
+from embeddr.lotus.core_caps import register_core_lotus_capabilities
+# from embeddr.mcp.tools.core import register_core_tools
 from embeddr_core.plugin_interface import EmbeddrEvent
-from embeddr.mcp.server import mcp, register_plugin_tools
 from embeddr.db.session import create_db_and_tables
 import logging
 import os
 import sys
 import warnings
 import asyncio
-from contextlib import asynccontextmanager
+from typing import Optional
+from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 
 import typer
@@ -27,7 +29,10 @@ from embeddr.core.plugin_loader import (
     startup_all_plugins,
 )
 from embeddr.core.execution_spine import ExecutionSpine
-from embeddr.services.socket_manager import monitor_comfy_events, manager
+from embeddr.services.socket_manager import manager
+from embeddr_core.services.config_service import resolve_plugin_config
+from embeddr.db.session import get_engine
+from sqlmodel import Session
 
 # Import and load local FS scanner plugin manually for now until dynamic loading is robust
 # This ensures it's available on startup
@@ -54,7 +59,6 @@ except ImportError:
 
 
 logger = logging.getLogger("embeddr.local")
-setup_logging()
 # logger.info("Embeddr Local is starting up...") # Moved to startup event to avoid double logging on reload
 
 
@@ -74,13 +78,24 @@ FRONTEND_DIR = Path(os.environ.get(
 # mcp_app = mcp.http_app(transport="http", path="/messages")
 
 
+def _log_section(title: str) -> None:
+    typer.secho(f"\n== {title} ==", fg=typer.colors.CYAN)
+
+
+def _format_transport_link(display_host: str, port: str, link: str) -> str:
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    return f"http://{display_host}:{port}{link}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Retrieve config from env (set by serve command)
     host = os.environ.get("EMBEDDR_HOST", "127.0.0.1")
     port = os.environ.get("EMBEDDR_PORT", "8003")
-    mcp_enabled = os.environ.get(
-        "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    mcp_transport = os.environ.get(
+        "EMBEDDR_MCP_TRANSPORT", "disabled").lower()
+    mcp_enabled = mcp_transport != "disabled"
     docs_enabled = os.environ.get(
         "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
 
@@ -115,14 +130,10 @@ async def lifespan(app: FastAPI):
         except RuntimeError:
             pass
 
-    _EVENT_BUS.subscribe("*", broadcast_to_frontend)
+    # NOTE: Currently disabled to reduce noise, we subscribe to specific events below
+    # _EVENT_BUS.subscribe("*", broadcast_to_frontend)
 
-    # Register MCP tools from plugins
-    if mcp_enabled:
-        try:
-            register_plugin_tools()
-        except Exception as e:
-            logger.error(f"Failed to register plugin MCP tools: {e}")
+    # MCP tool registration is handled by transport plugins
 
     try:
         from embeddr_core.services.scanner_registry import scanner_registry
@@ -139,45 +150,81 @@ async def lifespan(app: FastAPI):
 
     def bridge_event_to_ws(event):
         try:
+            raw_event_type = str(event.event_type or "")
+            if raw_event_type.startswith("ui:") or raw_event_type.startswith("ui."):
+                logger.info("[UI EVENT] %s payload=%s",
+                            event.event_type, event.payload)
+            event_type = raw_event_type
+            payload = event.payload
+
+            if event.source == "comfyui":
+                if event_type.startswith("comfy."):
+                    event_type = event_type.split("comfy.", 1)[1]
+                if event_type == "artifact.preview":
+                    event_type = "preview"
+                    if isinstance(payload, dict) and payload.get("data"):
+                        payload = payload.get("data")
             # We wrap the broadcast in a task on the main loop
             asyncio.run_coroutine_threadsafe(
+                # manager.broadcast_event(
+                #     # Maps to "plugin:event_type" in frontend
+                #     f"plugin:{event.event_type}",
+                #     event.model_dump()
+                # ),
                 manager.broadcast_event(
                     # Maps to "plugin:event_type" in frontend
-                    f"plugin:{event.event_type}",
-                    event.model_dump()
+                    event_type,
+                    payload,
+                    source=event.source
                 ),
                 loop
             )
+
+            if raw_event_type.startswith("execution."):
+                from embeddr.api.DEPRECATED_endpoints import ws as ws_endpoint
+
+                asyncio.run_coroutine_threadsafe(
+                    ws_endpoint.broadcast_status(),
+                    loop,
+                )
         except Exception as e:
             logger.error(f"Bridge Error: {e}")
 
     # Subscribe to relevant events
     # (In V3 we will add wildcard subscription)
-    _EVENT_BUS.subscribe("embeddings.generated", bridge_event_to_ws)
-    _EVENT_BUS.subscribe("artifact.created", bridge_event_to_ws)
-    _EVENT_BUS.subscribe("scan.started", bridge_event_to_ws)
-    _EVENT_BUS.subscribe("scan.completed", bridge_event_to_ws)
-    _EVENT_BUS.subscribe("scan.failed", bridge_event_to_ws)
+    _EVENT_BUS.subscribe("*", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("embeddings.generated", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("artifact.created", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("scan.started", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("scan.completed", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("scan.failed", bridge_event_to_ws)
+
+    # # LOTUS
+    # # _EVENT_BUS.subscribe("ui:toast", bridge_event_to_ws)
+    # # _EVENT_BUS.subscribe("ui:navigate", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("ui:open_artifact", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("ui:open_gallery", bridge_event_to_ws)
+
+    # _EVENT_BUS.subscribe("execution.started", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("execution.completed", bridge_event_to_ws)
+    # _EVENT_BUS.subscribe("execution.failed", bridge_event_to_ws)
 
     # Start ComfyUI WebSocket monitor
     # REMOVED: Managed by embeddr-comfyui plugin
     # asyncio.create_task(monitor_comfy_events())
 
-    # Start Automation Manager (V1 - Legacy/Core Analysis)
-    # this handles the Auto-Analysis plugins (embedding, captioning etc)
-    # automation_manager.py logic needs to be robust against stress.
-    try:
-        from embeddr.services.automation_manager import automation_manager
-        from embeddr.services.ingestion_service import ingestion_service
+    # Legacy AutomationManager (V1) disabled by default.
+    # Enable only for migration/debug with EMBEDDR_ENABLE_AUTOMATION_V1=true
+    if os.environ.get("EMBEDDR_ENABLE_AUTOMATION_V1", "false").lower() == "true":
+        try:
+            from embeddr.services.automation_manager import automation_manager
+            from embeddr.services.ingestion_service import ingestion_service
 
-        # Start Ingestion Service (Bounded Queue)
-        await ingestion_service.start()
-
-        # Ensure V1 also uses a dedicated connection if possible, or assume we fix it in the file.
-        automation_manager.start()
-        logger.info("AutomationManager (V1) & IngestionService started.")
-    except Exception as e:
-        logger.error(f"Failed to start Automation/Ingestion services: {e}")
+            await ingestion_service.start()
+            automation_manager.start()
+            logger.info("AutomationManager (V1) & IngestionService started.")
+        except Exception as e:
+            logger.error(f"Failed to start Automation/Ingestion services: {e}")
 
     # Display Loaded Plugins Summary
     from embeddr_core.plugin_interface import PluginIntent
@@ -185,7 +232,7 @@ async def lifespan(app: FastAPI):
     if loaded_plugins:
         typer.echo("\n   🧩 Loaded Plugins:")
         typer.echo("   " + "-" * 45)
-        for plugin in loaded_plugins:
+        for plugin in sorted(loaded_plugins, key=lambda p: p.name):
             try:
                 badges = []
                 # Check capabilities
@@ -211,23 +258,145 @@ async def lifespan(app: FastAPI):
                     f"   ⚠️  Load Error in {plugin.name}: {pe}", fg=typer.colors.RED)
                 logger.error(f"Error summarising plugin {plugin.name}: {pe}")
 
+    try:
+        from sqlalchemy.engine.url import make_url
+        from embeddr.core.config import settings
+        from embeddr.db.adapters import get_adapter
+        from embeddr.db.session import get_engine
+        from embeddr.services.blob_registry import (
+            list_providers,
+            list_resolvers,
+            list_provider_resolvers,
+            get_default_provider_name,
+            get_default_resolver_name,
+        )
+
+        providers = list_providers()
+        resolvers = list_resolvers()
+        provider_resolvers = list_provider_resolvers()
+        default_provider = get_default_provider_name()
+        default_resolver = get_default_resolver_name()
+
+        provider_override = os.environ.get("EMBEDDR_DB_PROVIDER")
+        adapter = get_adapter(settings.DATABASE_URL,
+                              provider=provider_override)
+        engine = get_engine()
+        try:
+            engine_url = engine.url
+        except Exception:
+            engine_url = make_url(settings.DATABASE_URL)
+
+        if engine_url.drivername == "sqlite":
+            store_label = f"sqlite ({engine_url.database})"
+        else:
+            try:
+                store_label = engine_url.render_as_string(hide_password=True)
+            except Exception:
+                store_label = settings.DATABASE_URL
+
+        typer.secho("\n   🧠 Core Capabilities (routed by Lotus):",
+                    fg=typer.colors.CYAN)
+        typer.echo("   " + "-" * 45)
+        if providers:
+            available_providers = ", ".join(sorted(providers.keys()))
+            typer.secho("   • artifacts.upload", fg=typer.colors.YELLOW)
+            typer.echo(
+                f"     - provider: {default_provider} (available: {available_providers})")
+        else:
+            typer.secho("   • artifacts.upload: none",
+                        fg=typer.colors.BRIGHT_BLACK)
+
+        typer.secho("   • artifacts.get", fg=typer.colors.YELLOW)
+        if provider_override:
+            typer.echo(
+                f"     - store: {adapter.name} ({store_label}) [provider={provider_override}]")
+        else:
+            typer.echo(f"     - store: {adapter.name} ({store_label})")
+
+        if resolvers:
+            available_resolvers = ", ".join(sorted(resolvers.keys()))
+            typer.secho("   • artifacts.resolve", fg=typer.colors.YELLOW)
+            typer.echo(
+                f"     - resolver: {default_resolver} (available: {available_resolvers})")
+        else:
+            typer.secho("   • artifacts.resolve: none",
+                        fg=typer.colors.BRIGHT_BLACK)
+
+        if providers or resolvers:
+            typer.secho("\n   🧱 Blob Capabilities:", fg=typer.colors.CYAN)
+            typer.echo("   " + "-" * 45)
+
+            if providers:
+                typer.secho("   • providers", fg=typer.colors.YELLOW)
+                for name in sorted(providers.keys()):
+                    suffix = " (default)" if name == default_provider else ""
+                    resolver_name = provider_resolvers.get(name)
+                    resolver_hint = f" -> {resolver_name}" if resolver_name else ""
+                    typer.echo(f"     - {name}{suffix}{resolver_hint}")
+            else:
+                typer.secho("   • providers: none",
+                            fg=typer.colors.BRIGHT_BLACK)
+
+            if resolvers:
+                typer.secho("   • resolvers", fg=typer.colors.YELLOW)
+                for name in sorted(resolvers.keys()):
+                    typer.echo(f"     - {name}")
+            else:
+                typer.secho("   • resolvers: none",
+                            fg=typer.colors.BRIGHT_BLACK)
+    except Exception as e:
+        logger.warning("Failed to render storage capability summary: %s", e)
+
     typer.secho("\n✨ Embeddr Local API has started!",
                 fg=typer.colors.GREEN, bold=True)
     typer.echo("   " + "-" * 45)
+
+    typer.secho("   👤 User Endpoints:", fg=typer.colors.CYAN)
     typer.secho(
         f"   👉 Web UI:    http://{display_host}:{port}", fg=typer.colors.CYAN)
-
-    if mcp_enabled:
-        typer.secho(
-            f"   🔌 MCP SSE:   http://{display_host}:{port}/mcp/messages",
-            fg=typer.colors.YELLOW,
-        )
-
     if docs_enabled:
         typer.secho(
             f"   📚 API Docs:  http://{display_host}:{port}/api/docs",
             fg=typer.colors.MAGENTA,
         )
+
+    typer.secho("   ⚙️  System Endpoints:", fg=typer.colors.CYAN)
+    typer.secho(
+        f"   • System Info:  http://{display_host}:{port}/api/v2/system/info",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+    typer.secho(
+        f"   • Route List:   http://{display_host}:{port}/api/v2/system/routes",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+
+    transports = [p for p in loaded_plugins if p.name.startswith(
+        "embeddr-transport-")]
+    typer.secho("   🔌 Transports:", fg=typer.colors.CYAN)
+    if not transports:
+        typer.secho("   • None", fg=typer.colors.BRIGHT_BLACK)
+    else:
+        for plugin in transports:
+            info = None
+            if hasattr(plugin, "get_transport_info"):
+                try:
+                    info = plugin.get_transport_info()
+                except Exception:
+                    info = None
+            if not info and hasattr(plugin, "transport_info"):
+                info = getattr(plugin, "transport_info")
+
+            title = (info or {}).get("title") or plugin.name
+            links = (info or {}).get("links") or []
+
+            typer.secho(f"   • {title}", fg=typer.colors.YELLOW)
+            for link in links:
+                label = link.get("label") or "Link"
+                path = link.get("path") or ""
+                if path:
+                    url = _format_transport_link(display_host, str(port), path)
+                    typer.secho(f"     - {label}: {url}",
+                                fg=typer.colors.BRIGHT_BLACK)
 
     show_official_docs = True
     if show_official_docs:
@@ -254,11 +423,21 @@ async def lifespan(app: FastAPI):
     _EVENT_BUS.subscribe("artifact.updated", automation_manager.handle_event)
     _EVENT_BUS.subscribe("relation.added", automation_manager.handle_event)
 
-    # Manage MCP lifespan if enabled
-    if hasattr(app.state, "mcp_app") and app.state.mcp_app:
-        async with app.state.mcp_app.router.lifespan_context(app.state.mcp_app):
-            yield
-    else:
+    # Transport lifespans (e.g., FastMCP)
+    async with AsyncExitStack() as stack:
+        for plugin in get_all_plugin_instances():
+            if hasattr(plugin, "get_transport_lifespan"):
+                try:
+                    ctx = plugin.get_transport_lifespan()
+                    if ctx is not None:
+                        await stack.enter_async_context(ctx)
+                except Exception as e:
+                    logger.error(
+                        "Failed to enter transport lifespan for %s: %s",
+                        plugin.name,
+                        e,
+                    )
+
         yield
 
     # Cleanup resources
@@ -292,6 +471,7 @@ def dev_origins() -> list[str]:
     logger.info("Loading development CORS origins...")
     return [
         "http://localhost:3000",  # React Dev Server
+        "http://localhost:4173",  # SDK Dev UI
     ]
 
 
@@ -301,20 +481,29 @@ def dynamic_origins() -> list[str]:
     return [f"http://{host}:{port}"]
 
 
-def comfy_origins() -> list[str]:
-    logger.info("Loading ComfyUI CORS origins...")
+def aitoolkit_origins() -> list[str]:
+    logger.info("Loading AI Toolkit CORS origins...")
     return [
-        "http://localhost:8188",  # ComfyUI default
-        "http://127.0.0.1:8188",  # ComfyUI default
+        "http://localhost:3001",  # AI Toolkit default
     ]
+
+
+def _register_endpoints(app: FastAPI, router, prefix: str, tags: list[str]):
+    logger.info(f"Registering router: {prefix} with tags: {tags}")
+    app.include_router(router, prefix=prefix, tags=tags)
 
 
 def create_app(
     enable_mcp: bool = False,
     enable_docs: bool = False,
-    enable_comfy: bool = False,
-    no_plugins: bool = False
+    no_plugins: bool = False,
+    mcp_transport: str = "disabled",
 ) -> FastAPI:
+    _log_section("Config")
+    typer.secho(
+        f"MCP: {enable_mcp} (transport={mcp_transport}) | Docs: {enable_docs}",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
     app = FastAPI(
         title="Embeddr Local",
         lifespan=lifespan,
@@ -323,12 +512,11 @@ def create_app(
         openapi_url="/api/openapi.json" if enable_docs else None,
     )
 
+    _log_section("CORS")
     port = os.environ.get("EMBEDDR_PORT", "8003")
     allowed_origins: set[str] = set(default_local_origins(port))
     allowed_origins |= set(parse_env_origins())
     allowed_origins |= set(dynamic_origins())
-    if enable_comfy:
-        allowed_origins |= set(comfy_origins())
     if os.environ.get("EMBEDDR_ALLOW_DEV_ORIGINS", "false").lower() == "true":
         allowed_origins |= set(dev_origins())
 
@@ -345,16 +533,7 @@ def create_app(
     for origin in allowed_origins:
         typer.echo(f"   - {origin}")
 
-    # Store MCP app in state if enabled
-    if enable_mcp:
-        mcp_app = mcp.http_app(transport="streamable-http", path="/messages")
-        app.state.mcp_app = mcp_app
-        # Mount MCP Server
-        # This exposes the MCP server over HTTP (Streamable) at /mcp/messages
-        app.mount("/mcp", mcp_app)
-    else:
-        app.state.mcp_app = None
-
+    _log_section("API Routes")
     # Include API Routes
     app.include_router(routes.router, prefix="/api/v1")
 
@@ -373,30 +552,48 @@ def create_app(
     from embeddr.api.v2 import maintenance as maintenance_v2
     # from embeddr.api.v2 import projections as projections_v2 # Moved to Plugin
     from embeddr.api.v2 import actions as actions_v2
-    app.include_router(artifacts_v2.router,
-                       prefix="/api/v2/artifacts", tags=["artifacts"])
-    app.include_router(plugins_v2.router,
-                       prefix="/api/v2/plugins", tags=["plugins"])
-    app.include_router(system_v2.router,
-                       prefix="/api/v2/system", tags=["system"])
-    app.include_router(collections_v2.router,
-                       prefix="/api/v2/collections", tags=["collections"])
-    app.include_router(executions_v2.router,
-                       prefix="/api/v2/executions", tags=["executions"])
-    app.include_router(workflows_v2.router,
-                       prefix="/api/v2/workflows", tags=["workflows"])
-    app.include_router(config_v2.router,
-                       prefix="/api/v2/config", tags=["config"])
-    app.include_router(maintenance_v2.router,
-                       prefix="/api/v2/maintenance", tags=["maintenance"])
-    app.include_router(actions_v2.router,
-                       prefix="/api/v2/actions", tags=["actions"])
+    from embeddr.api.v2 import lotus as lotus_v2
+    from embeddr.api.v2 import lotus_invoke_routes
+    from embeddr.api.v2 import config_api as lotus_config
+    from embeddr.api.v2 import resources as resources_v2
+
+    _register_endpoints(app, artifacts_v2.router,
+                        prefix="/api/v2/artifacts", tags=["artifacts"])
+    _register_endpoints(app, plugins_v2.router,
+                        prefix="/api/v2/plugins", tags=["plugins"])
+    _register_endpoints(app, system_v2.router,
+                        prefix="/api/v2/system", tags=["system"])
+    _register_endpoints(app, collections_v2.router,
+                        prefix="/api/v2/collections", tags=["collections"])
+    _register_endpoints(app, executions_v2.router,
+                        prefix="/api/v2/executions", tags=["executions"])
+    _register_endpoints(app, workflows_v2.router,
+                        prefix="/api/v2/workflows", tags=["workflows"])
+    _register_endpoints(app, config_v2.router,
+                        prefix="/api/v2/config", tags=["config"])
+    _register_endpoints(app, maintenance_v2.router,
+                        prefix="/api/v2/maintenance", tags=["maintenance"])
+    _register_endpoints(app, actions_v2.router,
+                        prefix="/api/v2/actions", tags=["actions"])
+    _register_endpoints(app, resources_v2.router,
+                        prefix="/api/v2/resources", tags=["resources"])
+
+    _register_endpoints(app, lotus_v2.router,
+                        prefix="/api/v2/lotus", tags=["lotus"])
+    _register_endpoints(app, lotus_config.router, tags=["lotus", "config"],
+                        prefix="/api/v2/lotus"
+                        )
+    _register_endpoints(app, lotus_invoke_routes.router,
+                        prefix="/api/v2/lotus", tags=["lotus"])
     # app.include_router(projections_v2.router,
     #                    prefix="/api/v2/projections", tags=["projections"])
 
     # Serve Plugins Directory
+    _log_section("Plugins")
     if not no_plugins:
         plugin_paths = []
+        allow_dev_plugins = os.environ.get(
+            "EMBEDDR_ALLOW_DEV_PLUGINS", "false").lower() == "true"
 
 # 1. Environment / CLI Plugin Dir (Highest Priority)
         # This allows users to override dev plugins with their own or dist-plugins
@@ -412,30 +609,33 @@ def create_app(
                 plugin_paths.append(p)
 
         # 2. Dev Workspace "embeddr-plugins" (Relative to this file)
-        # We are in embeddr-cli/src/embeddr/commands/serve.py -> parents[3] is embeddr-cli
-        cli_root = Path(__file__).resolve().parents[3]
-        repo_root = cli_root.parent
+        # Only load when explicitly enabled.
+        if allow_dev_plugins:
+            # We are in embeddr-cli/src/embeddr/commands/serve.py -> parents[3] is embeddr-cli
+            cli_root = Path(__file__).resolve().parents[3]
+            repo_root = cli_root.parent
 
-        # # 2a. Dist Plugins (Compiled Frontend) - High Priority
-        # dist_plugins_src = repo_root / "embeddr-plugins" / "dist-plugins"
-        # if dist_plugins_src.exists():
-        #     if not any(existing == dist_plugins_src for existing in plugin_paths):
-        #         logger.debug(f"Found dist plugins at {dist_plugins_src}")
-        #         plugin_paths.append(dist_plugins_src)
+            # 2a. Dist Plugins (Compiled Frontend) - High Priority
+            dist_plugins_src = repo_root / "embeddr-plugins" / "plugins-dist"
+            if dist_plugins_src.exists():
+                if not any(existing == dist_plugins_src for existing in plugin_paths):
+                    logger.debug(f"Found dist plugins at {dist_plugins_src}")
+                    plugin_paths.append(dist_plugins_src)
 
-        # 2b. Source Plugins
-        # dev_plugins_src = repo_root / "embeddr-plugins" / "plugins"
+            # 2b. Source Plugins
+            dev_plugins_src = repo_root / "embeddr-plugins" / "plugins"
 
-        # if dev_plugins_src.exists():
-        #     # Only add if not already added by env vars (to avoid shadowing/duplication issues if user pointed to it)
-        #     if not any(existing == dev_plugins_src for existing in plugin_paths):
-        #         logger.debug(f"Found dev plugins at {dev_plugins_src}")
-        #         plugin_paths.append(dev_plugins_src)
+            if dev_plugins_src.exists():
+                # Only add if not already added by env vars (to avoid shadowing/duplication issues if user pointed to it)
+                if not any(existing == dev_plugins_src for existing in plugin_paths):
+                    logger.debug(f"Found dev plugins at {dev_plugins_src}")
+                    plugin_paths.append(dev_plugins_src)
 
         # 3. Local "plugins" folder
         # plugin_paths.append(Path.cwd() / "plugins")
 
         # Phase 1: Load all plugins (Python Logic + API)
+        register_core_lotus_capabilities()
         for p_path in plugin_paths:
             if p_path.exists():
                 logger.debug(f"Loading plugins from {p_path}...")
@@ -460,6 +660,30 @@ def create_app(
 
         # Initialize all discovered plugins
         initialize_all_plugins()
+
+        # Phase 3: Register transport routes (if provided)
+        _log_section("Transports")
+        for plugin in loaded_plugins:
+            if hasattr(plugin, "register_transport"):
+                try:
+                    plugin.register_transport(app)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to register transport for %s: %s",
+                        plugin.name,
+                        exc,
+                    )
+
+        if enable_mcp and mcp_transport == "plugin":
+            if not any(p.name == "embeddr-transport-mcp" for p in loaded_plugins):
+                raise RuntimeError(
+                    "MCP transport plugin not installed. Install embeddr-transport-mcp "
+                    "or use --mcp-transport embedded."
+                )
+            typer.secho(
+                "MCP transport: plugin (embeddr-transport-mcp)",
+                fg=typer.colors.GREEN,
+            )
     else:
         typer.secho("🚫 Plugins disabled by flag.", fg=typer.colors.YELLOW)
         logger.info("Plugins disabled by EMBEDDR_NO_PLUGINS")
@@ -510,9 +734,14 @@ def register(app: typer.Typer):
         dev_origins: bool = typer.Option(
             False, help="Enable development CORS origins."
         ),
-        mcp: bool = typer.Option(False, help="Enable MCP server."),
-        comfy: bool = typer.Option(False, help="Enable ComfyUI integration."),
+        mcp: bool = typer.Option(False, help="Enable MCP transport plugin."),
+        mcp_transport: Optional[str] = typer.Option(
+            None,
+            help="MCP transport: plugin | disabled",
+        ),
         docs: bool = typer.Option(False, help="Enable API docs."),
+        verbose: bool = typer.Option(
+            False, help="Enable verbose startup logs."),
         no_plugins: bool = typer.Option(
             False, help="Disable all plugin loading."),
         plugins_dir: str = typer.Option(
@@ -524,8 +753,43 @@ def register(app: typer.Typer):
         # Set environment variables for the app to use in lifespan
         os.environ["EMBEDDR_HOST"] = host
         os.environ["EMBEDDR_PORT"] = str(port)
-        os.environ["EMBEDDR_ENABLE_MCP"] = str(mcp).lower()
-        os.environ["EMBEDDR_ENABLE_COMFY"] = str(comfy).lower()
+        if mcp_transport is None:
+            if mcp:
+                mcp_transport = "plugin"
+            else:
+                try:
+                    with Session(get_engine()) as session:
+                        cfg = resolve_plugin_config(
+                            session=session,
+                            plugin_name="embeddr-core",
+                            config_id="embeddr-core.mcp.transport",
+                            scope="global",
+                            scope_id=None,
+                        )
+                    enabled = bool(cfg.get("enabled", True))
+                    transport = str(cfg.get("transport", "embedded")).lower()
+                    if not enabled:
+                        mcp_transport = "disabled"
+                    elif transport in {"embedded", "plugin", "disabled"}:
+                        mcp_transport = transport
+                    else:
+                        mcp_transport = "embedded"
+                except Exception:
+                    mcp_transport = "disabled"
+
+        if mcp_transport == "embedded":
+            typer.secho(
+                "Embedded MCP transport is deprecated; using plugin transport instead.",
+                fg=typer.colors.YELLOW,
+            )
+            mcp_transport = "plugin"
+
+        os.environ["EMBEDDR_VERBOSE"] = str(verbose).lower()
+        setup_logging(verbose=verbose)
+
+        os.environ["EMBEDDR_ENABLE_MCP"] = str(
+            mcp_transport != "disabled").lower()
+        os.environ["EMBEDDR_MCP_TRANSPORT"] = mcp_transport
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
         os.environ["EMBEDDR_NO_PLUGINS"] = str(no_plugins).lower()
@@ -577,6 +841,8 @@ def register(app: typer.Typer):
             plugins_path.mkdir(parents=True, exist_ok=True)
             os.environ["EMBEDDR_PLUGINS_DIR"] = str(plugins_path)
 
+        log_level = "info" if verbose else "warning"
+
         if reload:
             # When reloading, we can't pass the app instance directly
             # We need to pass the import string.
@@ -589,35 +855,38 @@ def register(app: typer.Typer):
                 port=port,
                 reload=reload,
                 factory=True,
-                log_level="warning",
+                log_level=log_level,
+                ws="websockets-sansio",
             )
         else:
             uvicorn.run(
                 create_app(
                     enable_mcp=mcp,
                     enable_docs=docs,
-                    enable_comfy=comfy,
-                    no_plugins=no_plugins
+                    no_plugins=no_plugins,
+                    mcp_transport=mcp_transport,
                 ),
                 host=host,
                 port=port,
-                log_level="warning",
+                log_level=log_level,
+                ws="websockets-sansio",
             )
 
 
 def create_app_factory() -> FastAPI:
     """Factory function for uvicorn reload mode"""
+    setup_logging()
     enable_mcp = os.environ.get(
         "EMBEDDR_ENABLE_MCP", "false").lower() == "true"
+    mcp_transport = os.environ.get(
+        "EMBEDDR_MCP_TRANSPORT", "disabled").lower()
     enable_docs = os.environ.get(
         "EMBEDDR_ENABLE_DOCS", "false").lower() == "true"
-    enable_comfy = os.environ.get(
-        "EMBEDDR_ENABLE_COMFY", "false").lower() == "true"
     no_plugins = os.environ.get(
         "EMBEDDR_NO_PLUGINS", "false").lower() == "true"
     return create_app(
         enable_mcp=enable_mcp,
+        mcp_transport=mcp_transport,
         enable_docs=enable_docs,
-        enable_comfy=enable_comfy,
         no_plugins=no_plugins
     )

@@ -1,18 +1,30 @@
 import asyncio
 import logging
 import traceback
-from datetime import datetime
-from typing import Dict, Any, Optional, Callable
+from datetime import UTC, datetime
+from typing import Dict, Any, Optional, Callable, List
 from uuid import UUID
+import time
 
 from sqlmodel import Session, select, col
 from embeddr.db.session import get_engine, get_engine_isolated
 from embeddr_core.models.artifact_execution import ArtifactExecution
+from embeddr_core.models.artifact_execution_event import ArtifactExecutionEvent
 from embeddr_core.execution import JobContext
 from embeddr.core.event_bus import _EVENT_BUS
 from embeddr_core.plugin_interface import EmbeddrEvent
 
 logger = logging.getLogger("embeddr.spine")
+
+
+def _redact_inputs(value: Dict[str, Any] | None) -> Dict[str, Any]:
+    redacted: Dict[str, Any] = {}
+    for k, v in (value or {}).items():
+        if str(k).lower() in {"api_key", "apikey", "apiKey", "token", "authorization"}:
+            redacted[k] = "***"
+        else:
+            redacted[k] = v
+    return redacted
 
 
 class DBJobContext:
@@ -40,6 +52,11 @@ class DBJobContext:
             if message:
                 self.execution.message = message
             self.session.add(self.execution)
+            self._record_event(
+                event_type="execution.updated",
+                message=message or "",
+                payload={"progress": val},
+            )
             self.session.commit()
 
             # Broadcast update
@@ -59,10 +76,36 @@ class DBJobContext:
 
     def log(self, message: str, level: str = "info") -> None:
         logger.info(f"[JOB {self.execution_id}] {message}")
+        try:
+            self._record_event(
+                event_type="execution.log",
+                level=level,
+                message=message,
+            )
+            self.session.commit()
+        except Exception:
+            logger.debug("Failed to record execution log", exc_info=True)
 
     def is_cancelled(self) -> bool:
         self.session.refresh(self.execution)
         return self.execution.status == "canceled"
+
+    def _record_event(
+        self,
+        *,
+        event_type: str,
+        message: str = "",
+        level: str = "info",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        event = ArtifactExecutionEvent(
+            execution_id=self.execution_id,
+            event_type=event_type,
+            level=level,
+            message=message,
+            payload=payload,
+        )
+        self.session.add(event)
 
 
 class ExecutionSpine:
@@ -71,6 +114,7 @@ class ExecutionSpine:
     """
     _handlers: Dict[str, Callable] = {}
     _running: bool = False
+    _pipelines: Dict[str, List[Dict[str, Any]]] = {}
 
     # Resource Semaphores (Concurrency Limits)
     # Default limits, should be configurable
@@ -80,6 +124,131 @@ class ExecutionSpine:
         "gpu": asyncio.Semaphore(1),
         "network": asyncio.Semaphore(8)
     }
+
+    @classmethod
+    def register_pipeline_step(cls,
+                               pipeline_name: str,
+                               job_type: str,
+                               priority: int = 0,
+                               plugin_name: str = "core",
+                               resource_class: str = "cpu",
+                               inputs_transformer: Optional[Callable] = None):
+        """
+        Register a step for a specific pipeline (e.g. 'artifact.ingest').
+        Plugins can use this to hook into workflows.
+        """
+        if pipeline_name not in cls._pipelines:
+            cls._pipelines[pipeline_name] = []
+
+        cls._pipelines[pipeline_name].append({
+            "job_type": job_type,
+            "priority": priority,
+            "plugin_name": plugin_name,
+            "resource_class": resource_class,
+            "inputs_transformer": inputs_transformer
+        })
+        # Sort by priority desc
+        cls._pipelines[pipeline_name].sort(
+            key=lambda x: x["priority"], reverse=True)
+        logger.info(
+            f"Registered pipeline step '{job_type}' for '{pipeline_name}' (P{priority})")
+
+    @classmethod
+    def get_pipeline_steps(cls, pipeline_name: str) -> List[Dict[str, Any]]:
+        return cls._pipelines.get(pipeline_name, [])
+
+    @classmethod
+    def run_subtask_sync(cls,
+                         context: JobContext,
+                         job_type: str,
+                         inputs: Dict[str, Any],
+                         plugin_name: str = "core",
+                         resource_class: str = "cpu",
+                         priority: int = 0,
+                         trigger: str = "subtask",
+                         primary_artifact_id: Optional[UUID] = None):
+        """
+        Helper for plugins to run a single subtask and wait for it, 
+        without handling raw DB sessions or polling loops.
+        """
+        # We need to map JobContext back to a concrete session...
+        # But wait, JobContext might not expose the session if it's the interface.
+        # DBJobContext does.
+
+        # If we can't get the session easily, we use a new one or try to infer.
+        # But wait, submitting a job creates a new transaction if we don't pass session.
+        # We want to use the session if possible to prevent locks if inside a transaction.
+
+        session = getattr(context, "session", None)
+        execution_id = context.execution_id
+
+        job = cls.submit_job(
+            job_type=job_type,
+            inputs=inputs,
+            plugin_name=plugin_name,
+            resource_class=resource_class,
+            priority=priority,
+            parent_execution_id=execution_id,
+            trigger=trigger,
+            primary_artifact_id=primary_artifact_id,
+            session=session
+        )
+
+        return cls.wait_for_job(job.id)
+
+    @staticmethod
+    def wait_for_job(job_id: UUID, timeout: float = 300.0, check_interval: float = 0.5) -> ArtifactExecution:
+        """
+        Blocks until the job is completed/failed/canceled.
+        """
+        start_time = time.time()
+        # Use isolated engine to avoid transaction visibility issues
+        engine = get_engine_isolated()
+
+        while True:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Job {job_id} timed out after {timeout}s")
+
+            with Session(engine) as session:
+                job = session.get(ArtifactExecution, job_id)
+                if not job:
+                    # Should unlikely happen unless deleted
+                    time.sleep(check_interval)
+                    continue
+
+                if job.status in ["completed", "failed", "canceled"]:
+                    return job
+
+            time.sleep(check_interval)
+
+    @staticmethod
+    async def wait_for_job_async(job_id: UUID, timeout: float = 300.0, check_interval: float = 0.5) -> ArtifactExecution:
+        """
+        Async version which waits until the job is completed/failed/canceled.
+        """
+        start_time = time.time()
+        # Use isolated engine to avoid transaction visibility issues
+        engine = get_engine_isolated()
+
+        while True:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Job {job_id} timed out after {timeout}s")
+
+            # Blocking call in thread pool to keep loop free
+            def _check():
+                with Session(engine) as session:
+                    return session.get(ArtifactExecution, job_id)
+
+            job = await asyncio.to_thread(_check)
+
+            if not job:
+                await asyncio.sleep(check_interval)
+                continue
+
+            if job.status in ["completed", "failed", "canceled"]:
+                return job
+
+            await asyncio.sleep(check_interval)
 
     @classmethod
     def register_handler(cls, job_type: str, handler: Callable):
@@ -94,38 +263,130 @@ class ExecutionSpine:
                    plugin_name: str = "core",
                    resource_class: str = "cpu",
                    priority: int = 0,
-                   trigger: str = "user") -> ArtifactExecution:
+                   parent_execution_id: Optional[UUID] = None,
+                   trigger: str = "user",
+                   primary_artifact_id: Optional[UUID] = None,
+                   session: Optional[Session] = None) -> ArtifactExecution:
         """
         Public API to queue work.
         """
-        engine = get_engine()
-        with Session(engine) as session:
-            job = ArtifactExecution(
-                type=job_type,
-                plugin_name=plugin_name,
-                inputs=inputs,
-                resource_class=resource_class,
-                priority=priority,
-                trigger=trigger,
-                status="pending"
+        if session:
+            # Use existing session
+            return cls._create_job_in_session(
+                session, job_type, inputs, plugin_name, resource_class,
+                priority, parent_execution_id, trigger, primary_artifact_id
             )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            logger.info(f"Job submitted: {job.id} ({job_type})")
+        else:
+            # Create new session
+            engine = get_engine()
+            with Session(engine) as session:
+                return cls._create_job_in_session(
+                    session, job_type, inputs, plugin_name, resource_class,
+                    priority, parent_execution_id, trigger, primary_artifact_id
+                )
 
-            _EVENT_BUS.publish(EmbeddrEvent(
-                event_type="execution.created",
-                source="spine",
-                payload={
-                    "id": str(job.id),
-                    "type": job.type,
-                    "status": "pending",
-                    "plugin_name": job.plugin_name,
-                    "created_at": job.created_at.isoformat()
-                }
-            ))
-            return job
+    @staticmethod
+    def _create_job_in_session(
+        session: Session,
+        job_type: str,
+        inputs: Dict[str, Any],
+        plugin_name: str,
+        resource_class: str,
+        priority: int,
+        parent_execution_id: Optional[UUID],
+        trigger: str,
+        primary_artifact_id: Optional[UUID]
+    ) -> ArtifactExecution:
+
+        job = ArtifactExecution(
+            type=job_type,
+            plugin_name=plugin_name,
+            inputs=inputs,
+            resource_class=resource_class,
+            priority=priority,
+            parent_execution_id=parent_execution_id,
+            trigger=trigger,
+            primary_artifact_id=primary_artifact_id,
+            status="pending"
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        logger.warning(
+            "Job submitted: id=%s type=%s plugin=%s resource=%s priority=%s trigger=%s parent=%s inputs=%s",
+            job.id,
+            job.type,
+            job.plugin_name,
+            job.resource_class,
+            job.priority,
+            job.trigger,
+            str(job.parent_execution_id) if job.parent_execution_id else None,
+            _redact_inputs(job.inputs),
+        )
+
+        # Events need their own session usually if we want them to survive rollback?
+        # But here we want atomicity.
+        # However, _record_event usually makes a new session to be safe.
+        # But let's just use the bus here.
+
+        # We manually emit the event here because we might be in a transaction
+        # If we are in a transaction, the job isn't visible to others yet.
+        # But the event bus is in-memory.
+
+        # We can't really INSERT the event into DB if the main session is locked/busy?
+        # Actually if we reuse the session, we can insert the event too.
+
+        event = ArtifactExecutionEvent(
+            execution_id=job.id,
+            event_type="execution.created",
+            message="queued",
+            payload={
+                "type": job.type,
+                "plugin_name": job.plugin_name,
+                "status": job.status,
+            },
+        )
+        session.add(event)
+        session.commit()
+
+        _EVENT_BUS.publish(EmbeddrEvent(
+            event_type="execution.created",
+            source="spine",
+            payload={
+                "id": str(job.id),
+                "type": job.type,
+                "status": "pending",
+                "plugin_name": job.plugin_name,
+                "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                "created_at": job.created_at.isoformat()
+            }
+        ))
+
+        return job
+
+    @staticmethod
+    def _record_event(
+        *,
+        execution_id: UUID,
+        event_type: str,
+        message: str = "",
+        level: str = "info",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            engine = get_engine_isolated()
+            with Session(engine) as session:
+                event = ArtifactExecutionEvent(
+                    execution_id=execution_id,
+                    event_type=event_type,
+                    level=level,
+                    message=message,
+                    payload=payload,
+                )
+                session.add(event)
+                session.commit()
+        except Exception:
+            logger.debug("Failed to record execution event", exc_info=True)
 
     async def start_worker(self):
         """Starts the main worker loop."""
@@ -168,7 +429,7 @@ class ExecutionSpine:
                 for job in stale_jobs:
                     job.status = "failed"
                     job.error = "System restart detected - Job interrupted"
-                    job.finished_at = datetime.utcnow()
+                    job.finished_at = datetime.now(UTC)
                     session.add(job)
 
                     # Notify UI
@@ -224,9 +485,19 @@ class ExecutionSpine:
             if not job:
                 return
 
+            logger.warning(
+                "Dispatching job: id=%s type=%s plugin=%s resource=%s priority=%s parent=%s",
+                job.id,
+                job.type,
+                job.plugin_name,
+                job.resource_class,
+                job.priority,
+                str(job.parent_execution_id) if job.parent_execution_id else None,
+            )
+
             # Optimistic locking attempt
             job.status = "running"
-            job.started_at = datetime.utcnow()
+            job.started_at = datetime.now(UTC)
             session.add(job)
             try:
                 session.commit()
@@ -241,8 +512,21 @@ class ExecutionSpine:
             _EVENT_BUS.publish(EmbeddrEvent(
                 event_type="execution.started",
                 source="spine",
-                payload={"id": str(job_id), "status": "running"}
+                payload={
+                    "id": str(job_id),
+                    "status": "running",
+                    "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                }
             ))
+            self._record_event(
+                execution_id=job_id,
+                event_type="execution.started",
+                message="started",
+                payload={
+                    "status": "running",
+                    "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                },
+            )
             # 2. Acquire resource and launch task
             await semaphore.acquire()
             asyncio.create_task(self._run_job_wrapper(job_id, resource_class))
@@ -270,8 +554,14 @@ class ExecutionSpine:
                     f"No handler for job type '{job.type}' (Job {job_id})")
                 job.status = "failed"
                 job.error = f"No handler registered for {job.type}"
-                job.finished_at = datetime.utcnow()
+                job.finished_at = datetime.now(UTC)
                 session.add(job)
+                session.add(ArtifactExecutionEvent(
+                    execution_id=job_id,
+                    event_type="execution.failed",
+                    level="error",
+                    message=job.error,
+                ))
                 session.commit()
                 return
 
@@ -279,35 +569,78 @@ class ExecutionSpine:
             ctx = DBJobContext(session, job)
 
             try:
+                logger.warning(
+                    "Job starting: id=%s type=%s plugin=%s inputs=%s",
+                    job.id,
+                    job.type,
+                    job.plugin_name,
+                    _redact_inputs(job.inputs),
+                )
                 # Run the handler (support async or sync)
                 if asyncio.iscoroutinefunction(handler):
                     outputs = await handler(ctx)
                 else:
                     outputs = await asyncio.to_thread(handler, ctx)
 
+                logger.warning(
+                    "Job completed: id=%s type=%s plugin=%s outputs=%s",
+                    job.id,
+                    job.type,
+                    job.plugin_name,
+                    list(outputs.keys()) if isinstance(
+                        outputs, dict) else type(outputs).__name__,
+                )
+
                 # Success
                 job.status = "completed"
                 job.outputs = outputs
-                job.finished_at = datetime.utcnow()
+                job.finished_at = datetime.now(UTC)
                 job.progress = 100
+                session.add(job)
+                session.commit()
 
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.completed",
                     source="spine",
-                    payload={"id": str(job_id), "status": "completed"}
+                    payload={
+                        "id": str(job_id),
+                        "status": "completed",
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                    }
+                ))
+                session.add(ArtifactExecutionEvent(
+                    execution_id=job_id,
+                    event_type="execution.completed",
+                    message="completed",
+                    payload={
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                    },
                 ))
 
             except Exception as e:
                 logger.error(f"Job {job_id} failed: {traceback.format_exc()}")
                 job.status = "failed"
                 job.error = str(e)
-                job.finished_at = datetime.utcnow()
+                job.finished_at = datetime.now(UTC)
 
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.failed",
                     source="spine",
-                    payload={"id": str(job_id),
-                             "status": "failed", "error": str(e)}
+                    payload={
+                        "id": str(job_id),
+                        "status": "failed",
+                        "error": str(e),
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                    }
+                ))
+                session.add(ArtifactExecutionEvent(
+                    execution_id=job_id,
+                    event_type="execution.failed",
+                    level="error",
+                    message=str(e),
+                    payload={
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                    },
                 ))
 
             session.add(job)

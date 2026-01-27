@@ -4,14 +4,15 @@ import os
 import asyncio
 from typing import Dict, Any, Optional
 from sqlmodel import select
-from embeddr.mcp.instance import mcp
 from embeddr.mcp.utils import get_db_session
 from embeddr.models.workflow import Workflow
 from embeddr.services.comfy import ComfyClient, AsyncComfyClient
 from embeddr.services.generation_service import GenerationService
 
+# NOTE: Legacy core MCP workflow tools are deprecated.
+# ComfyUI MCP tools are now provided by the embeddr-comfyui plugin.
 
-@mcp.tool()
+
 def list_workflows() -> str:
     """List all available ComfyUI workflows."""
     with get_db_session() as session:
@@ -28,7 +29,6 @@ def list_workflows() -> str:
         return "\n".join(result)
 
 
-@mcp.tool()
 def get_workflow_details(workflow_id: int) -> str:
     """Get details of a specific workflow, including exposed inputs."""
     with get_db_session() as session:
@@ -76,7 +76,6 @@ def get_workflow_details(workflow_id: int) -> str:
         return "\n".join(details)
 
 
-@mcp.tool()
 async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) -> str:
     """
     Generate an image using a saved ComfyUI workflow.
@@ -208,7 +207,6 @@ async def generate_image(workflow_id: int, inputs: Dict[str, Dict[str, Any]]) ->
 #     return f"ComfyUI URL set to {url} in .env file."
 
 
-@mcp.tool()
 def upload_image_to_comfy(
     image_base64: str, filename: str, overwrite: bool = False
 ) -> str:
@@ -239,7 +237,6 @@ def upload_image_to_comfy(
         return f"Error uploading image to ComfyUI: {str(e)}"
 
 
-@mcp.tool()
 def upload_image_from_path(
     file_path: str, filename: Optional[str] = None, overwrite: bool = False
 ) -> str:

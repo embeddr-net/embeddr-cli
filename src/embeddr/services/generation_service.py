@@ -2,7 +2,7 @@ import uuid
 import logging
 import copy
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any
 
 from sqlmodel import Session, select
@@ -36,7 +36,7 @@ class GenerationService:
             status="pending",
             prompt=workflow.name,  # Default prompt name
             inputs=inputs,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
         self.session.add(generation)

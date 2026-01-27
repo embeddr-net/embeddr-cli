@@ -1,20 +1,5 @@
 from fastapi import APIRouter
 
-from embeddr.api.DEPRECATED_endpoints import (
-    # captioning,
-    # collections, # Legacy
-    comfy,
-    # datasets,
-    images,
-    # jobs,
-    # system,
-    # workflows,
-    # workspace,
-    # ws,
-    # generations,
-    plugins,
-)
-
 from embeddr.api.v2.collections import router as collections_router_v2
 from embeddr.api.v2.config import router as config_router_v2
 

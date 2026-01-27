@@ -1,10 +1,12 @@
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import Session, select, desc
-from embeddr.db.session import get_session
+from embeddr.db.session import get_session, get_engine
 from embeddr_core.models.artifact_execution import ArtifactExecution
+from embeddr_core.models.artifact_execution_event import ArtifactExecutionEvent
 from embeddr.core.plugin_loader import get_plugin_instance, get_loaded_plugins
 from embeddr.core.execution_spine import ExecutionSpine
 from pydantic import BaseModel
@@ -92,6 +94,10 @@ async def create_execution(
 def list_executions(
     plugin_name: Optional[str] = None,
     status: Optional[str] = None,
+    type: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    q: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     session: Session = Depends(get_session)
@@ -102,6 +108,27 @@ def list_executions(
         query = query.where(ArtifactExecution.plugin_name == plugin_name)
     if status:
         query = query.where(ArtifactExecution.status == status)
+    if type:
+        query = query.where(ArtifactExecution.type == type)
+    if created_after:
+        try:
+            dt = datetime.fromisoformat(created_after)
+            query = query.where(ArtifactExecution.created_at >= dt)
+        except Exception:
+            raise HTTPException(400, "Invalid created_after datetime")
+    if created_before:
+        try:
+            dt = datetime.fromisoformat(created_before)
+            query = query.where(ArtifactExecution.created_at <= dt)
+        except Exception:
+            raise HTTPException(400, "Invalid created_before datetime")
+    if q:
+        like = f"%{q}%"
+        query = query.where(
+            (ArtifactExecution.type.ilike(like))
+            | (ArtifactExecution.plugin_name.ilike(like))
+            | (ArtifactExecution.message.ilike(like))
+        )
 
     query = query.limit(limit).offset(offset)
     return session.exec(query).all()
@@ -113,3 +140,52 @@ def get_execution(execution_id: UUID, session: Session = Depends(get_session)):
     if not ex:
         raise HTTPException(404, "Execution not found")
     return ex
+
+
+@router.get("/{execution_id}/events", response_model=List[ArtifactExecutionEvent])
+def list_execution_events(
+    execution_id: UUID,
+    limit: int = 200,
+    offset: int = 0,
+    session: Session = Depends(get_session),
+):
+    query = (select(ArtifactExecutionEvent)
+             .where(ArtifactExecutionEvent.execution_id == execution_id)
+             .order_by(ArtifactExecutionEvent.created_at.asc())
+             .limit(limit)
+             .offset(offset))
+    return session.exec(query).all()
+
+
+async def _fetch_execution(execution_id: UUID) -> Optional[ArtifactExecution]:
+    def _load() -> Optional[ArtifactExecution]:
+        with Session(get_engine()) as session:
+            return session.get(ArtifactExecution, execution_id)
+
+    return await asyncio.to_thread(_load)
+
+
+@router.get("/{execution_id}/wait", response_model=ArtifactExecution)
+async def wait_execution(
+    execution_id: UUID,
+    timeout_s: float = 30.0,
+    poll_interval_s: float = 0.5,
+):
+    """
+    Long-poll until an execution finishes or timeout is reached.
+    Returns the latest execution state.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_s)
+
+    while True:
+        ex = await _fetch_execution(execution_id)
+        if not ex:
+            raise HTTPException(404, "Execution not found")
+
+        if ex.status in {"completed", "failed", "canceled"}:
+            return ex
+
+        if asyncio.get_running_loop().time() >= deadline:
+            return ex
+
+        await asyncio.sleep(max(0.05, poll_interval_s))

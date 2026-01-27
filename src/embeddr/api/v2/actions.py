@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Optional
 from uuid import UUID, uuid4
-from datetime import datetime
+from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlmodel import Session, select
 from embeddr.db.session import get_session
@@ -57,7 +57,7 @@ async def execute_plugin_action(
         priority=10,
         progress=0,
         inputs=inputs,
-        created_at=datetime.utcnow()
+        created_at=datetime.now(UTC)
     )
     session.add(execution)
     session.commit()
@@ -72,7 +72,7 @@ async def execute_plugin_action(
                     return
 
                 bg_exec.status = "running"
-                bg_exec.started_at = datetime.utcnow()
+                bg_exec.started_at = datetime.now(UTC)
                 bg_sess.add(bg_exec)
                 bg_sess.commit()
 
@@ -90,7 +90,7 @@ async def execute_plugin_action(
                     result = plugin.execute(action_name, execution_id, inputs)
 
                     bg_exec.status = "completed"
-                    bg_exec.finished_at = datetime.utcnow()
+                    bg_exec.finished_at = datetime.now(UTC)
                     bg_exec.outputs = result
                     bg_exec.progress = 100
                     bg_sess.add(bg_exec)
@@ -99,7 +99,7 @@ async def execute_plugin_action(
                 except Exception as e:
                     bg_exec.status = "failed"
                     bg_exec.error = str(e)
-                    bg_exec.finished_at = datetime.utcnow()
+                    bg_exec.finished_at = datetime.now(UTC)
                     bg_sess.add(bg_exec)
                     bg_sess.commit()
 
@@ -155,7 +155,7 @@ async def run_action(
             progress=0,
             primary_artifact_id=artifact.id,
             inputs=inputs,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(UTC)
         )
         session.add(execution)
         session.commit()

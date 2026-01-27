@@ -1,5 +1,5 @@
 import typer
-from typing import Optional
+from typing import Optional, List
 from sqlmodel import Session, select, func, col
 from rich.console import Console
 from rich.table import Table
@@ -7,17 +7,15 @@ from rich.panel import Panel
 from rich.tree import Tree
 
 from embeddr.db.session import get_engine
-from embeddr_core.models import (
-    Artifact,
-    ArtifactType,
-    ArtifactEmbedding,
-    ArtifactAnnotation,
-    ArtifactRelation,
-    ArtifactLineage,
-    PluginRegistry,
-    Tag,
-    Collection
-)
+from embeddr_core.models.artifact import Artifact
+from embeddr_core.models.artifact_type import ArtifactType
+from embeddr_core.models.artifact_embedding import ArtifactEmbedding
+from embeddr_core.models.artifact_feature import ArtifactFeatureRef
+from embeddr_core.models.artifact_annotation import ArtifactAnnotation
+from embeddr_core.models.artifact_relation import ArtifactRelation
+from embeddr_core.models.artifact_lineage import ArtifactLineage
+from embeddr_core.models.plugin_registry import PluginRegistry
+from embeddr_core.models.tag import Tag
 
 app = typer.Typer(help="Inspect the database state, artifacts, and metadata.")
 console = Console()
@@ -31,31 +29,39 @@ def stats():
     engine = get_engine()
     with Session(engine) as session:
         # Counts
-        artifact_count = session.exec(select(func.count(Artifact.id))).one()
+        artifact_count = session.exec(
+            select(func.count()).select_from(Artifact)).one()
         embedding_count = session.exec(
-            select(func.count(ArtifactEmbedding.id))).one()
+            select(func.count()).select_from(ArtifactEmbedding)).one()
+        feature_count = session.exec(
+            select(func.count()).select_from(ArtifactFeatureRef)).one()
         annotation_count = session.exec(
-            select(func.count(ArtifactAnnotation.id))).one()
+            select(func.count()).select_from(ArtifactAnnotation)).one()
         relation_count = session.exec(
-            select(func.count(ArtifactRelation.source_id))).one()
+            select(func.count()).select_from(ArtifactRelation)).one()
         lineage_count = session.exec(
-            select(func.count(ArtifactLineage.child_id))).one()
+            select(func.count()).select_from(ArtifactLineage)).one()
         plugin_count = session.exec(
-            select(func.count(PluginRegistry.name))).one()
-        tag_count = session.exec(select(func.count(Tag.id))).one()
+            select(func.count()).select_from(PluginRegistry)).one()
+        tag_count = session.exec(
+            select(func.count()).select_from(Tag)).one()
         collection_count = session.exec(
-            select(func.count(Collection.id))).one()
+            select(func.count())
+            .select_from(Artifact)
+            .where(Artifact.base_type_name == "collection")
+        ).one()
 
         # Artifacts by Type
         artifacts_by_type = session.exec(
-            select(Artifact.type_name, func.count(Artifact.id))
+            select(Artifact.type_name, func.count())
+            .select_from(Artifact)
             .group_by(Artifact.type_name)
         ).all()
 
         # Embeddings by Model
         embeddings_by_model = session.exec(
-            select(ArtifactEmbedding.model_name,
-                   func.count(ArtifactEmbedding.id))
+            select(ArtifactEmbedding.model_name, func.count())
+            .select_from(ArtifactEmbedding)
             .group_by(ArtifactEmbedding.model_name)
         ).all()
 
@@ -68,6 +74,7 @@ def stats():
 
     table.add_row("Artifacts", str(artifact_count))
     table.add_row("Embeddings", str(embedding_count))
+    table.add_row("Feature Refs", str(feature_count))
     table.add_row("Annotations", str(annotation_count))
     table.add_row("Relations", str(relation_count))
     table.add_row("Lineage Edges", str(lineage_count))
@@ -158,6 +165,11 @@ def show(artifact_id: str):
                 ArtifactEmbedding.artifact_id == art.id)
         ).all()
 
+        features = session.exec(
+            select(ArtifactFeatureRef).where(
+                ArtifactFeatureRef.artifact_id == art.id)
+        ).all()
+
         annotations = session.exec(
             select(ArtifactAnnotation).where(
                 ArtifactAnnotation.artifact_id == art.id)
@@ -194,6 +206,12 @@ def show(artifact_id: str):
         for e in embeddings:
             emb_node.add(
                 f"[green]{e.model_name}[/green] (dim: {e.vector_dim}, space: {e.space})")
+
+        # Feature refs
+        feat_node = tree.add(f"Feature Refs ({len(features)})")
+        for f in features:
+            feat_node.add(
+                f"[green]{f.feature_type}[/green] {f.name} ({f.storage_kind})")
 
         # Annotations
         ann_node = tree.add(f"Annotations ({len(annotations)})")
@@ -239,7 +257,7 @@ def sample_json(
     with Session(engine) as session:
         # Get Sample Artifacts (stratified by type)
         types = session.exec(select(Artifact.type_name).distinct()).all()
-        artifacts = []
+        artifacts: List[Artifact] = []
         for t in types:
             artifacts.extend(session.exec(select(Artifact).where(
                 Artifact.type_name == t).limit(limit)).all())

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from sqlmodel import Field, SQLModel, Column, JSON
 
@@ -13,5 +13,9 @@ class Generation(SQLModel, table=True):
     inputs: Dict[str, Any] = Field(default={}, sa_column=Column(JSON))
     outputs: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON))
     error_message: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )

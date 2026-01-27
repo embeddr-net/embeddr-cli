@@ -11,6 +11,7 @@ from embeddr.db.session import get_engine
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_relation import ArtifactRelation
 from embeddr_core.models.artifact_embedding import ArtifactEmbedding
+from embeddr_core.models.artifact_feature import ArtifactFeatureRef
 from embeddr_core.models.artifact_annotation import ArtifactAnnotation
 from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact import ArtifactPreview
@@ -236,6 +237,8 @@ def prune_artifacts(ids: List[UUID], session: Session = Depends(get_session)):
     # Delete related entities
     session.exec(delete(ArtifactEmbedding).where(
         ArtifactEmbedding.artifact_id.in_(ids)))
+    session.exec(delete(ArtifactFeatureRef).where(
+        ArtifactFeatureRef.artifact_id.in_(ids)))
     session.exec(delete(ArtifactAnnotation).where(
         ArtifactAnnotation.artifact_id.in_(ids)))
     session.exec(delete(ArtifactPreview).where(

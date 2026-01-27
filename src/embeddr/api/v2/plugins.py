@@ -1,13 +1,53 @@
 from fastapi import APIRouter, HTTPException, Body
-from embeddr.core.plugin_loader import get_loaded_plugins, get_plugin_instance
-from typing import Dict, Any
+from embeddr.core.plugin_loader import (
+    get_loaded_plugins,
+    get_plugin_instance,
+    get_all_plugin_instances,
+)
+from typing import Dict, Any, Optional
+from pathlib import Path
 
 router = APIRouter()
+
+
+_LOGO_CANDIDATES = [
+    "logo.svg",
+    "logo.png",
+    "logo.webp",
+    "logo.jpg",
+    "logo.jpeg",
+    "logo.ico",
+]
+
+
+def _resolve_logo_url(plugin_name: str, source_path: Optional[Path]) -> Optional[str]:
+    if not source_path or not source_path.exists():
+        return None
+    assets_dir = source_path / "assets"
+    if not assets_dir.exists():
+        return None
+    for filename in _LOGO_CANDIDATES:
+        candidate = assets_dir / filename
+        if candidate.exists() and candidate.is_file():
+            return f"/api/v2/plugins/{plugin_name}/static/assets/{filename}"
+    return None
 
 
 @router.get("")
 def list_plugins():
     return get_loaded_plugins()
+
+
+@router.get("/logos")
+def list_plugin_logos():
+    logos: Dict[str, Optional[str]] = {}
+    for plugin in get_all_plugin_instances():
+        source_path = getattr(plugin, "_source_path", None)
+        if isinstance(source_path, str):
+            source_path = Path(source_path)
+        logo_url = _resolve_logo_url(plugin.name, source_path)
+        logos[plugin.name] = logo_url
+    return {"logos": logos}
 
 
 @router.get("/{plugin_id}/config")

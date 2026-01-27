@@ -1,15 +1,21 @@
 from sqlalchemy.orm import aliased
+import logging
 from sqlalchemy import literal
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Request
+from fastapi.responses import FileResponse, Response, RedirectResponse, StreamingResponse
 from sqlmodel import Session, select, col, func, or_, cast, String, delete
 from embeddr.db.session import get_engine
+from sqlalchemy import text
+from json import JSONDecodeError
 from embeddr_core.models.artifact import Artifact, ArtifactPreview
+from embeddr_core.models.artifact_blob import ArtifactBlob
+from embeddr_core.models.artifact_ingest import ArtifactIngest as ArtifactIngestModel
 from embeddr_core.models.artifact_embedding import ArtifactEmbedding
+from embeddr_core.models.artifact_feature import ArtifactFeatureRef
 from embeddr_core.models.artifact_annotation import ArtifactAnnotation
 from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact_relation import ArtifactRelation
@@ -17,8 +23,149 @@ from pydantic import BaseModel
 from embeddr_core.plugin_interface import EmbeddrEvent
 from embeddr.core.plugin_loader import _EVENT_BUS
 from embeddr.services.ingestion_service import ingestion_service
+from pathlib import Path
+from embeddr.services.storage import storage_service
+from embeddr.services.blob_refs import blob_ref_from_blob, blob_ref_storage_path, BlobRef
+from embeddr.services.blob_registry import resolve_response, resolve_blob, list_providers
+from embeddr_core.services.config_service import resolve_plugin_config
+from urllib.parse import urlparse
+import requests
 
 router = APIRouter()
+logger = logging.getLogger("embeddr.api.v2.artifacts")
+
+
+def _resolve_uri_response(
+    uri: Optional[str],
+    *,
+    purpose: str,
+    artifact_id: Optional[str],
+) -> Optional[Response]:
+    if not uri:
+        return None
+
+    if uri.startswith("s3://"):
+        parsed = urlparse(uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/") if parsed.path else None
+        provider_name = _select_s3_provider(bucket)
+        blob_ref = BlobRef(
+            provider=provider_name,
+            bucket=bucket or None,
+            key=key,
+            path=uri,
+            etag=None,
+            content_type=None,
+            size=None,
+            artifact_id=artifact_id,
+        )
+        response = resolve_response(blob_ref, purpose)
+        if response is None and provider_name != "s3":
+            blob_ref.provider = "s3"
+            return resolve_response(blob_ref, purpose)
+        return response
+
+    if uri.startswith("http"):
+        return RedirectResponse(url=uri)
+
+    return None
+
+
+def _proxy_url_response(url: str) -> Response:
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+    headers = {"Vary": "Origin"}
+    content_type = resp.headers.get("content-type")
+    if resp.headers.get("content-length"):
+        headers["Content-Length"] = resp.headers.get("content-length")
+    return StreamingResponse(
+        resp.iter_content(chunk_size=1024 * 256),
+        status_code=resp.status_code,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
+def _should_proxy_redirect(request: Request, url: Optional[str]) -> bool:
+    if not url:
+        return False
+    try:
+        request_netloc = urlparse(str(request.url)).netloc
+        target_netloc = urlparse(url).netloc
+        return bool(target_netloc and request_netloc and target_netloc != request_netloc)
+    except Exception:
+        return False
+
+
+def _resolve_uri_url(
+    uri: Optional[str],
+    *,
+    purpose: str,
+    artifact_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not uri:
+        return None
+
+    if uri.startswith("s3://"):
+        parsed = urlparse(uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/") if parsed.path else None
+        provider_name = _select_s3_provider(bucket)
+        blob_ref = BlobRef(
+            provider=provider_name,
+            bucket=bucket or None,
+            key=key,
+            path=uri,
+            etag=None,
+            content_type=None,
+            size=None,
+            artifact_id=artifact_id,
+        )
+        resolved = resolve_blob(blob_ref, purpose)
+        if resolved and resolved.get("ok"):
+            return resolved
+        if provider_name != "s3":
+            blob_ref.provider = "s3"
+            resolved = resolve_blob(blob_ref, purpose)
+            if resolved and resolved.get("ok"):
+                return resolved
+
+    if uri.startswith("http"):
+        return {"ok": True, "url": uri, "headers": None, "expiresAt": None}
+
+    return None
+
+
+def _select_s3_provider(bucket: Optional[str]) -> str:
+    if not bucket:
+        return "s3"
+
+    try:
+        with Session(get_engine()) as session:
+            cfg = resolve_plugin_config(
+                session=session,
+                plugin_name="embeddr-storage-s3",
+                config_id="embeddr-storage-s3.config",
+            ) or {}
+    except Exception:
+        return "s3"
+
+    instances = cfg.get("instances")
+    if isinstance(instances, list):
+        for idx, inst in enumerate(instances):
+            if not isinstance(inst, dict):
+                continue
+            inst_bucket = inst.get("s3_bucket") or inst.get("bucket")
+            if inst_bucket != bucket:
+                continue
+            name = str(inst.get("name") or inst.get(
+                "id") or f"instance-{idx + 1}")
+            provider_name = f"s3:{name}"
+            if provider_name in list_providers():
+                return provider_name
+            return "s3"
+
+    return "s3"
 
 
 class PaginatedArtifacts(BaseModel):
@@ -56,7 +203,7 @@ class RelationIngest(BaseModel):
     metadata_json: Dict[str, Any] = {}
 
 
-class ArtifactIngest(BaseModel):
+class ArtifactIngestRequestItem(BaseModel):
     uri: str
     id: Optional[str] = None
     type_name: str = "artifact"
@@ -67,7 +214,7 @@ class ArtifactIngest(BaseModel):
 
 
 class IngestRequest(BaseModel):
-    items: List[ArtifactIngest]
+    items: List[ArtifactIngestRequestItem]
 
 
 def get_session():
@@ -88,6 +235,82 @@ async def ingest_artifacts(req: IngestRequest):
         count += 1
 
     return {"status": "accepted", "queued": count}
+
+
+@router.post("/uploads/{upload_id}")
+async def upload_artifact_bytes(
+    upload_id: UUID,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+):
+    ingest = session.get(ArtifactIngestModel, upload_id)
+    if not ingest:
+        raise HTTPException(404, "Upload not found")
+    if ingest.status != "pending":
+        raise HTTPException(409, f"Upload is {ingest.status}")
+
+    if not ingest.meta_json.get("confirmed"):
+        raise HTTPException(400, "confirmation_required")
+
+    artifact = session.get(Artifact, ingest.artifact_id)
+    if not artifact:
+        raise HTTPException(404, "Artifact not found")
+
+    filename = Path(file.filename or "upload.bin").name
+    blob_ref = storage_service.store_upload(
+        session=session,
+        artifact=artifact,
+        upload_file=file,
+        filename=filename,
+        content_type=file.content_type,
+        backend_hint=ingest.storage_backend,
+        confirmed=bool(ingest.meta_json.get("confirmed")),
+    )
+
+    storage_path = blob_ref_storage_path(blob_ref)
+    if not storage_path:
+        raise HTTPException(
+            status_code=500, detail="blob_storage_path_missing")
+
+    blob = ArtifactBlob(
+        artifact_id=artifact.id,
+        storage_backend=blob_ref.provider,
+        path=storage_path,
+        sha256=blob_ref.etag,
+        size=blob_ref.size,
+        content_type=blob_ref.content_type,
+    )
+    session.add(blob)
+
+    ingest.status = "uploaded"
+    ingest.storage_backend = blob_ref.provider
+    ingest.storage_path = storage_path
+    ingest.content_type = blob_ref.content_type
+    ingest.size = blob_ref.size
+    ingest.original_filename = filename
+    session.add(ingest)
+
+    artifact.uri = storage_path
+    session.add(artifact)
+
+    session.commit()
+    session.refresh(blob)
+
+    return {
+        "ok": True,
+        "artifact_id": str(artifact.id),
+        "upload_id": str(upload_id),
+        "blob": {
+            "id": str(blob.id),
+            "path": blob.path,
+            "size": blob.size,
+            "content_type": blob.content_type,
+            "sha256": blob.sha256,
+            "storage_backend": blob.storage_backend,
+            "public_url": None,
+        },
+        "blob_ref": blob_ref.to_dict(),
+    }
 
 
 @router.post("/{artifact_id}/relations", response_model=Dict[str, str])
@@ -287,6 +510,10 @@ def bulk_operations(
         session.exec(delete(ArtifactEmbedding).where(
             ArtifactEmbedding.artifact_id.in_(request.artifact_ids)))
 
+        # Delete feature refs
+        session.exec(delete(ArtifactFeatureRef).where(
+            ArtifactFeatureRef.artifact_id.in_(request.artifact_ids)))
+
         # Delete annotations
         session.exec(delete(ArtifactAnnotation).where(
             ArtifactAnnotation.artifact_id.in_(request.artifact_ids)))
@@ -399,12 +626,17 @@ def list_artifacts(
     sort: str = "new",
     is_archived: Optional[bool] = None,
     tags: Optional[List[str]] = Query(None),
+    ids: Optional[List[UUID]] = Query(None),
     session: Session = Depends(get_session)
 ):
     """List all artifacts with optional filtering."""
     # Count query
     count_query = select(func.count(Artifact.id))
     query = select(Artifact)
+
+    if ids:
+        query = query.where(Artifact.id.in_(ids))
+        count_query = count_query.where(Artifact.id.in_(ids))
 
     # Join for collection filtering if needed
     # Treat parent_id same as collection_id for filtering
@@ -571,10 +803,33 @@ def list_artifacts(
     )
 
 
+def _coerce_uuid(value: str, label: str) -> UUID:
+    try:
+        return UUID(str(value))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {label}")
+
+
+def _get_artifact_or_repair(session: Session, artifact_uuid: UUID) -> Optional[Artifact]:
+    try:
+        return session.get(Artifact, artifact_uuid)
+    except JSONDecodeError:
+        session.exec(
+            text(
+                "UPDATE artifact SET metadata_json = '{}' "
+                "WHERE id = :id AND (metadata_json IS NULL OR trim(metadata_json) = '')"
+            ),
+            {"id": str(artifact_uuid)},
+        )
+        session.commit()
+        return session.get(Artifact, artifact_uuid)
+
+
 @router.get("/{artifact_id}", response_model=Artifact)
-def get_artifact(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact(artifact_id: str, session: Session = Depends(get_session)):
     """Retrieve a single artifact."""
-    artifact = session.get(Artifact, artifact_id)
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+    artifact = _get_artifact_or_repair(session, artifact_uuid)
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
     return artifact
@@ -582,16 +837,34 @@ def get_artifact(artifact_id: UUID, session: Session = Depends(get_session)):
 
 @router.get("/{artifact_id}/content")
 def get_artifact_content(
-    artifact_id: UUID,
+    artifact_id: str,
+    request: Request,
+    proxy: bool = False,
     session: Session = Depends(get_session)
 ):
     """
     Stream the raw content of the artifact if it is a local file.
     Does simplistic mime-type guessing based on extension.
     """
-    artifact = session.get(Artifact, artifact_id)
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+    artifact = _get_artifact_or_repair(session, artifact_uuid)
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
+
+    prefer_proxy = proxy or os.environ.get("EMBEDDR_CONTENT_PROXY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    logger.info(
+        "artifact_content_request",
+        extra={
+            "artifact_id": str(artifact_uuid),
+            "uri": artifact.uri,
+            "type_name": artifact.type_name,
+        },
+    )
 
     # Handle internal text notes
     if artifact.type_name == "text" or (artifact.uri and artifact.uri.startswith("internal://")):
@@ -611,6 +884,72 @@ def get_artifact_content(
         raise HTTPException(
             status_code=400, detail="Artifact does not have a URI")
 
+    blob = session.exec(
+        select(ArtifactBlob)
+        .where(ArtifactBlob.artifact_id == artifact_uuid)
+        .order_by(col(ArtifactBlob.created_at).desc())
+    ).first()
+
+    if blob:
+        logger.info(
+            "artifact_content_blob",
+            extra={
+                "artifact_id": str(artifact_uuid),
+                "storage_backend": blob.storage_backend,
+                "path": blob.path,
+            },
+        )
+        response = storage_service.get_content_response(
+            session=session,
+            blob=blob,
+            artifact=artifact,
+            purpose="original",
+        )
+        if response:
+            if isinstance(response, RedirectResponse):
+                url = response.headers.get("location")
+                if url and (prefer_proxy or _should_proxy_redirect(request, url)):
+                    return _proxy_url_response(url)
+            return response
+
+    # Fallback: resolve from latest ingest record (if blob missing)
+    ingest = session.exec(
+        select(ArtifactIngestModel)
+        .where(ArtifactIngestModel.artifact_id == artifact_uuid)
+        .order_by(col(ArtifactIngestModel.created_at).desc())
+    ).first()
+    if ingest and ingest.storage_path:
+        logger.info(
+            "artifact_content_ingest",
+            extra={
+                "artifact_id": str(artifact_uuid),
+                "storage_path": ingest.storage_path,
+            },
+        )
+        response = _resolve_uri_response(
+            ingest.storage_path,
+            purpose="original",
+            artifact_id=str(artifact_uuid),
+        )
+        if response:
+            if isinstance(response, RedirectResponse):
+                url = response.headers.get("location")
+                if url and (prefer_proxy or _should_proxy_redirect(request, url)):
+                    return _proxy_url_response(url)
+            return response
+
+    uri_response = _resolve_uri_response(
+        artifact.uri,
+        purpose="original",
+        artifact_id=str(artifact_uuid),
+    )
+    if uri_response:
+        if isinstance(uri_response, RedirectResponse):
+            url = uri_response.headers.get("location")
+            if url and (prefer_proxy or _should_proxy_redirect(request, url)):
+                return _proxy_url_response(url)
+        return uri_response
+
     file_path = None
 
     # Check URI if it's a file path
@@ -625,10 +964,8 @@ def get_artifact_content(
 
     # If HTTP, we can't stream it directly unless we proxy it (not implemented)
     elif uri_path.startswith("http"):
-        # For now, valid use case if client handles it, but /content endpoint implies we serve it.
-        # If we don't have it locally, we 404 the content endpoint or redirect?
-        # Redirecting is safer.
-        from fastapi.responses import RedirectResponse
+        if prefer_proxy or _should_proxy_redirect(request, uri_path):
+            return _proxy_url_response(uri_path)
         return RedirectResponse(url=uri_path)
 
     if not file_path or not os.path.exists(file_path):
@@ -646,6 +983,146 @@ def get_artifact_content(
     )
 
 
+@router.get("/{artifact_id}/resolve")
+def resolve_artifact(
+    artifact_id: str,
+    variant: str = "original",
+    proxy: bool = False,
+    session: Session = Depends(get_session),
+):
+    """
+    Resolve an artifact to a URL for preview/original access.
+    Proxy mode for v0.1: returns internal URLs.
+    """
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+    artifact = _get_artifact_or_repair(session, artifact_uuid)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    logger.info(
+        "artifact_resolve_request",
+        extra={
+            "artifact_id": str(artifact_uuid),
+            "variant": variant,
+            "proxy": proxy,
+            "uri": artifact.uri,
+        },
+    )
+
+    prefer_proxy = proxy or os.environ.get("EMBEDDR_RESOLVE_PROXY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    if prefer_proxy:
+        blob = session.exec(
+            select(ArtifactBlob)
+            .where(ArtifactBlob.artifact_id == artifact_uuid)
+            .order_by(col(ArtifactBlob.created_at).desc())
+        ).first()
+        blob_ref = None
+        if blob:
+            blob_ref = blob_ref_from_blob(
+                blob,
+                artifact_id=str(artifact_uuid),
+            ).to_dict()
+
+        url = (
+            f"/api/v2/artifacts/{artifact_uuid}/preview"
+            if variant == "preview"
+            else f"/api/v2/artifacts/{artifact_uuid}/content"
+        )
+
+        return {
+            "ok": True,
+            "artifact_id": str(artifact_uuid),
+            "variant": variant,
+            "url": url,
+            "headers": None,
+            "expiresAt": None,
+            "blob_ref": blob_ref,
+            "proxy": True,
+        }
+
+    if variant == "preview":
+        url = f"/api/v2/artifacts/{artifact_uuid}/preview"
+    else:
+        url = f"/api/v2/artifacts/{artifact_uuid}/content"
+
+    if variant == "preview":
+        preview = session.exec(
+            select(ArtifactPreview)
+            .where(ArtifactPreview.artifact_id == artifact_uuid)
+            .where(ArtifactPreview.preview_type == "thumbnail")
+            .order_by(ArtifactPreview.created_at.desc())
+        ).first()
+
+        if preview:
+            resolved = _resolve_uri_url(
+                preview.uri,
+                purpose="preview",
+                artifact_id=str(artifact_uuid),
+            )
+            if resolved and resolved.get("ok"):
+                return {
+                    **resolved,
+                    "artifact_id": str(artifact_uuid),
+                    "variant": variant,
+                    "preview_uri": preview.uri,
+                }
+
+            return {
+                "ok": True,
+                "artifact_id": str(artifact_uuid),
+                "variant": variant,
+                "url": url,
+                "headers": None,
+                "expiresAt": None,
+                "preview_uri": preview.uri,
+            }
+
+    blob = session.exec(
+        select(ArtifactBlob)
+        .where(ArtifactBlob.artifact_id == artifact_uuid)
+        .order_by(col(ArtifactBlob.created_at).desc())
+    ).first()
+
+    blob_ref = None
+    if blob:
+        blob_ref = blob_ref_from_blob(
+            blob,
+            artifact_id=str(artifact_uuid),
+        ).to_dict()
+
+        resolved = storage_service.resolve_blob(blob, purpose=variant)
+        if resolved and resolved.get("ok"):
+            logger.info(
+                "artifact_resolve_blob",
+                extra={
+                    "artifact_id": str(artifact_uuid),
+                    "storage_backend": blob.storage_backend,
+                    "resolved_url": resolved.get("url"),
+                },
+            )
+            return {
+                **resolved,
+                "artifact_id": str(artifact_uuid),
+                "variant": variant,
+                "blob_ref": blob_ref,
+            }
+
+    return {
+        "ok": True,
+        "artifact_id": str(artifact_uuid),
+        "variant": variant,
+        "url": url,
+        "headers": None,
+        "expiresAt": None,
+        "blob_ref": blob_ref,
+    }
+
+
 @router.delete("/{artifact_id}")
 def delete_artifact(
     artifact_id: UUID,
@@ -657,6 +1134,11 @@ def delete_artifact(
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     session.delete(artifact)
+    session.exec(
+        delete(ArtifactFeatureRef).where(
+            ArtifactFeatureRef.artifact_id == artifact_id
+        )
+    )
     session.commit()
 
     if _EVENT_BUS:
@@ -674,6 +1156,14 @@ def get_artifact_embeddings(artifact_id: UUID, session: Session = Depends(get_se
     """Retrieve embeddings for an artifact."""
     query = select(ArtifactEmbedding).where(
         ArtifactEmbedding.artifact_id == artifact_id)
+    return session.exec(query).all()
+
+
+@router.get("/{artifact_id}/features", response_model=List[ArtifactFeatureRef])
+def get_artifact_features(artifact_id: UUID, session: Session = Depends(get_session)):
+    """Retrieve feature references for an artifact."""
+    query = select(ArtifactFeatureRef).where(
+        ArtifactFeatureRef.artifact_id == artifact_id)
     return session.exec(query).all()
 
 
@@ -798,22 +1288,23 @@ def get_artifact_relations(artifact_id: UUID, session: Session = Depends(get_ses
 
 @router.get("/{artifact_id}/preview")
 def get_artifact_preview(
-    artifact_id: UUID,
+    artifact_id: str,
     preview_type: str = "thumbnail",
     session: Session = Depends(get_session)
 ):
     """Retrieve an artifact preview/thumbnail."""
     # Find specific preview
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
     preview = session.exec(
         select(ArtifactPreview)
-        .where(ArtifactPreview.artifact_id == artifact_id)
+        .where(ArtifactPreview.artifact_id == artifact_uuid)
         .where(ArtifactPreview.preview_type == preview_type)
         .order_by(ArtifactPreview.created_at.desc())
     ).first()
 
     if not preview:
         # Fallback: If the artifact itself is an image, serve the original file
-        artifact = session.get(Artifact, artifact_id)
+        artifact = _get_artifact_or_repair(session, artifact_uuid)
 
         # Check if it looks like an image either by type or extension
         is_image_type = artifact and (
@@ -822,6 +1313,38 @@ def get_artifact_preview(
             (artifact.metadata_json and artifact.metadata_json.get(
                 "extension", "").lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
         )
+
+        if is_image_type:
+            blob = session.exec(
+                select(ArtifactBlob)
+                .where(ArtifactBlob.artifact_id == artifact_uuid)
+                .order_by(col(ArtifactBlob.created_at).desc())
+            ).first()
+
+            if blob:
+                response = storage_service.get_content_response(
+                    session=session,
+                    blob=blob,
+                    artifact=artifact,
+                    purpose="preview",
+                )
+                if response:
+                    return response
+
+        # Fallback: resolve from latest ingest record (if blob missing)
+        ingest = session.exec(
+            select(ArtifactIngestModel)
+            .where(ArtifactIngestModel.artifact_id == artifact_uuid)
+            .order_by(col(ArtifactIngestModel.created_at).desc())
+        ).first()
+        if ingest and ingest.storage_path:
+            response = _resolve_uri_response(
+                ingest.storage_path,
+                purpose="preview",
+                artifact_id=str(artifact_uuid),
+            )
+            if response:
+                return response
 
         if is_image_type and artifact.uri:
             # Handle file:// scheme
@@ -839,12 +1362,35 @@ def get_artifact_preview(
                     headers={"Vary": "Origin"}
                 )
 
+        # External preview fallback (e.g. stash)
+        external = (artifact.metadata_json or {}).get(
+            "external") if artifact else None
+        if isinstance(external, dict):
+            preview_url = external.get("preview_url")
+            if preview_url:
+                response = _resolve_uri_response(
+                    preview_url,
+                    purpose="preview",
+                    artifact_id=str(artifact_uuid),
+                )
+                if response:
+                    return response
+
         raise HTTPException(status_code=404, detail="Preview not found")
 
     # If URI is local path
     preview_uri = preview.uri
     if preview_uri.startswith("file://"):
         preview_uri = preview_uri[7:]
+
+    # Resolve remote/s3 preview URIs
+    preview_response = _resolve_uri_response(
+        preview.uri,
+        purpose="preview",
+        artifact_id=str(artifact_uuid),
+    )
+    if preview_response:
+        return preview_response
 
     if preview_uri.startswith("/"):
         if not os.path.isfile(preview_uri):

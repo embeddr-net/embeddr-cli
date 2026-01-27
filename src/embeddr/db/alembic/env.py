@@ -1,6 +1,6 @@
-from embeddr_core.models import collection, library, lineage, automation, artifact_type
-from embeddr.models import dataset, generation, workflow
+import embeddr_core.models
 from embeddr.core.config import settings
+from embeddr.db.adapters import get_adapter
 from logging.config import fileConfig
 import os
 import sys
@@ -35,6 +35,15 @@ config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+SQLModel.metadata.naming_convention = NAMING_CONVENTION
 target_metadata = SQLModel.metadata
 
 # other values from the config, defined by the needs of env.py,
@@ -56,11 +65,14 @@ def run_migrations_offline() -> None:
 
     """
     url = config.get_main_option("sqlalchemy.url")
+    adapter = get_adapter(settings.DATABASE_URL,
+                          os.environ.get("EMBEDDR_DB_PROVIDER"))
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        render_as_batch=adapter.render_as_batch(),
     )
 
     with context.begin_transaction():
@@ -80,11 +92,13 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
+    adapter = get_adapter(settings.DATABASE_URL,
+                          os.environ.get("EMBEDDR_DB_PROVIDER"))
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            render_as_batch=True,
+            render_as_batch=adapter.render_as_batch(),
         )
 
         with context.begin_transaction():

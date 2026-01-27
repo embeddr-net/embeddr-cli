@@ -4,9 +4,11 @@ import logging
 import uuid
 import base64
 import struct
-from typing import List, Dict, Optional
+from datetime import date, datetime
+from typing import List, Dict, Optional, Any
 from fastapi import WebSocket
 import websockets
+from starlette.websockets import WebSocketState
 from sqlmodel import Session, select
 
 from embeddr.core.config import settings
@@ -24,17 +26,59 @@ CLIENT_ID = str(uuid.uuid4())
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        self.client_meta: Dict[str, Dict[str, Optional[str]]] = {}
+
+    def _extract_client_meta(self, websocket: WebSocket) -> Dict[str, Optional[str]]:
+        try:
+            client = getattr(websocket, "client", None)
+            address = None
+            if client and getattr(client, "host", None):
+                port = getattr(client, "port", None)
+                address = f"{client.host}:{port}" if port else str(client.host)
+
+            headers = getattr(websocket, "headers", None)
+            user_agent = None
+            origin = None
+            forwarded_for = None
+            if headers:
+                user_agent = headers.get("user-agent")
+                origin = headers.get("origin")
+                forwarded_for = headers.get("x-forwarded-for")
+
+            url = getattr(websocket, "url", None)
+            path = getattr(url, "path", None)
+
+            return {
+                "address": address,
+                "user_agent": user_agent,
+                "origin": origin,
+                "forwarded_for": forwarded_for,
+                "path": path,
+            }
+        except Exception:
+            return {
+                "address": None,
+                "user_agent": None,
+                "origin": None,
+                "forwarded_for": None,
+                "path": None,
+            }
 
     class EmbeddrJSONEncoder(json.JSONEncoder):
         def default(self, obj):
             if isinstance(obj, uuid.UUID):
                 return str(obj)
+            if isinstance(obj, (datetime, date)):
+                return obj.isoformat()
             return super().default(obj)
 
     async def connect(self, websocket: WebSocket) -> str:
         await websocket.accept()
         client_id = str(uuid.uuid4())
         self.active_connections[client_id] = websocket
+        meta = self._extract_client_meta(websocket)
+        self.client_meta[client_id] = meta
+        logger.info("WS client connected %s meta=%s", client_id, meta)
 
         # Notify others (and self) about the new connection
         asyncio.create_task(self.broadcast_event(
@@ -48,6 +92,7 @@ class ConnectionManager:
         for client_id, ws in list(self.active_connections.items()):
             if ws == websocket:
                 del self.active_connections[client_id]
+                self.client_meta.pop(client_id, None)
 
                 # Notify about disconnection
                 asyncio.create_task(self.broadcast_event(
@@ -57,7 +102,7 @@ class ConnectionManager:
                 ))
                 break
 
-    async def broadcast_event(self, event_type: str, data: any, source: str = "embeddr"):
+    async def broadcast_event(self, event_type: str, data: Any, source: str = "embeddr"):
         """
         Structured broadcast that ensures messages follow the standard envelope:
         { "source": ..., "type": ..., "data": ... }
@@ -88,6 +133,12 @@ class ConnectionManager:
         # Iterate over items to get client_id for cleanup
         for client_id, connection in self.active_connections.items():
             try:
+                if getattr(connection, "client_state", None) == WebSocketState.DISCONNECTED:
+                    dead_client_ids.append(client_id)
+                    continue
+                if getattr(connection, "application_state", None) == WebSocketState.DISCONNECTED:
+                    dead_client_ids.append(client_id)
+                    continue
                 await connection.send_text(serialized_message)
             except Exception as e:
                 # If the socket is closed, we should clean it up
@@ -107,11 +158,18 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
         try:
+            if getattr(websocket, "client_state", None) == WebSocketState.DISCONNECTED:
+                return
+            if getattr(websocket, "application_state", None) == WebSocketState.DISCONNECTED:
+                return
             serialized_message = json.dumps(
                 message, cls=self.EmbeddrJSONEncoder)
             await websocket.send_text(serialized_message)
         except Exception as e:
-            logger.error(f"Error sending personal message: {e}")
+            if "Cannot call \"send\" once a close message has been sent" in str(e):
+                logger.debug("Attempted to send on closed websocket.")
+            else:
+                logger.error(f"Error sending personal message: {e}")
 
     async def send_to_client(self, client_id: str, message: dict):
         if client_id in self.active_connections:
@@ -119,6 +177,13 @@ class ConnectionManager:
 
     def get_connected_clients(self) -> List[str]:
         return list(self.active_connections.keys())
+
+    def get_connected_client_info(self) -> List[Dict[str, Optional[str]]]:
+        info: List[Dict[str, Optional[str]]] = []
+        for client_id in self.active_connections.keys():
+            meta = self.client_meta.get(client_id, {})
+            info.append({"client_id": client_id, **meta})
+        return info
 
 
 manager = ConnectionManager()

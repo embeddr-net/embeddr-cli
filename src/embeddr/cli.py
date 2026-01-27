@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system
+from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system, lotus
 
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
@@ -24,31 +24,41 @@ app.add_typer(process.app, name="process")
 app.add_typer(inspect.app, name="inspect")
 app.add_typer(tui.app, name="tui")
 app.add_typer(system.app, name="system")
+app.add_typer(lotus.app, name="lotus")
 # app.add_typer(fixtures.app, name="fixtures") # Moved to Plugin
 
-# Load CLI Plugins
-# Skip loading if we are just running the server (it loads them itself)
-# Robust check for serve command anywhere in args
-is_serve = "serve" in sys.argv
 
-if not is_serve:
-    # 1. Dev Path
-    dev_plugins = Path(__file__).parents[3] / "embeddr-plugins" / "plugins"
-    if dev_plugins.exists():
-        load_python_plugins(dev_plugins, cli_app=app)
+def _load_cli_plugins() -> None:
+    # Skip loading if we are just running the server (it loads them itself)
+    # Robust check for serve/init commands anywhere in args
+    is_serve = "serve" in sys.argv
+    is_init = "init" in sys.argv or "init-v2" in sys.argv
+    is_plugins_deps = "plugins" in sys.argv and "deps" in sys.argv
 
-    # 2. User Path
-    user_plugins = get_data_dir() / "plugins"
-    if user_plugins.exists():
-        load_python_plugins(user_plugins, cli_app=app)
+    if is_serve or is_init or is_plugins_deps:
+        return
 
-    # 3. Environment Variable (Check both singular and plural)
+    allow_dev_plugins = os.environ.get(
+        "EMBEDDR_ALLOW_DEV_PLUGINS", "false").lower() == "true"
+
+    # 1. Environment Variable (Check both singular and plural)
     env_plugin_dir = os.environ.get(
         "EMBEDDR_PLUGIN_DIR") or os.environ.get("EMBEDDR_PLUGINS_DIR")
     if env_plugin_dir:
         path = Path(env_plugin_dir)
         if path.exists():
             load_python_plugins(path, cli_app=app)
+
+    # 2. Workspace plugins (data dir)
+    user_plugins = get_data_dir() / "plugins"
+    if user_plugins.exists():
+        load_python_plugins(user_plugins, cli_app=app)
+
+    # 3. Dev Path (explicit opt-in)
+    if allow_dev_plugins:
+        dev_plugins = Path(__file__).parents[3] / "embeddr-plugins" / "plugins"
+        if dev_plugins.exists():
+            load_python_plugins(dev_plugins, cli_app=app)
 
     # Initialize all discovered plugins
     initialize_all_plugins()
@@ -58,10 +68,12 @@ if not is_serve:
     # When running CLI commands, we might trigger artifact creation
     # so we should have the manager running if events fire.
     try:
-        from embeddr.services.automation_manager import automation_manager
-        automation_manager.start()
+        from embeddr.services.automation_manager_v2 import automation_manager
+        import asyncio
+
+        asyncio.run(automation_manager.start())
     except Exception as e:
-        print(f"Failed to start AutomationManager: {e}")
+        print(f"Failed to start AutomationManager V2: {e}")
 
 
 @app.command()
@@ -71,18 +83,9 @@ def init(
         Path.cwd(), help="Path to initialize project in"),
 ):
     """Initialize a new Embeddr project in the current directory."""
-    from embeddr.core.project import CONFIG_FILENAME, create_default_config
+    from embeddr.commands.init_wizard import run_init_wizard
 
-    if (path / CONFIG_FILENAME).exists():
-        typer.secho(
-            f"Project already initialized at {path}", fg=typer.colors.YELLOW)
-        return
-
-    project_name = name or path.name
-    create_default_config(path, project_name)
-    typer.secho(
-        f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
-    typer.echo(f"Created {CONFIG_FILENAME}")
+    run_init_wizard(path, name)
 
 
 @app.callback()
@@ -101,6 +104,7 @@ def callback(
         os.environ["EMBEDDR_DATA_DIR"] = data_dir
         refresh_settings()
         get_engine.cache_clear()
+        _load_cli_plugins()
         return
 
     # 2. Env var already set (shell, systemd, etc.)
@@ -109,6 +113,7 @@ def callback(
             f"DEBUG: EMBEDDR_DATA_DIR already set to {os.environ.get('EMBEDDR_DATA_DIR')}")
         refresh_settings()
         get_engine.cache_clear()
+        _load_cli_plugins()
         return
 
     # 3. Check for existing project (embeddr.toml)
@@ -124,6 +129,22 @@ def callback(
                 os.environ.setdefault(
                     "EMBEDDR_PORT", str(config["server"]["port"]))
 
+        # CORS configuration
+        cors_config = config.get("cors") if isinstance(config, dict) else None
+        if isinstance(cors_config, dict):
+            origins = cors_config.get("origins")
+            if isinstance(origins, list):
+                cleaned = [str(o).strip() for o in origins if str(o).strip()]
+                if cleaned:
+                    os.environ.setdefault(
+                        "EMBEDDR_CORS_ORIGINS", ",".join(cleaned)
+                    )
+            allow_dev = cors_config.get("allow_dev_origins")
+            if isinstance(allow_dev, bool):
+                os.environ.setdefault(
+                    "EMBEDDR_ALLOW_DEV_ORIGINS", str(allow_dev).lower()
+                )
+
         # Determine data directory
         if "paths" in config and "data_dir" in config["paths"]:
             # Resolve relative to project root
@@ -134,8 +155,26 @@ def callback(
             default_project_data = project_root / ".embeddr"
             os.environ["EMBEDDR_DATA_DIR"] = str(default_project_data)
 
+        # Determine plugins directory
+        if "paths" in config and "plugins_dir" in config["paths"]:
+            custom_plugins_dir = project_root / config["paths"]["plugins_dir"]
+            os.environ["EMBEDDR_PLUGINS_DIR"] = str(custom_plugins_dir)
+
+        # Database configuration (optional)
+        db_config = config.get("database", {}) if isinstance(
+            config, dict) else {}
+        db_provider = db_config.get("provider") if isinstance(
+            db_config, dict) else None
+        db_url = db_config.get("url") if isinstance(db_config, dict) else None
+
+        if db_provider:
+            os.environ["EMBEDDR_DB_PROVIDER"] = str(db_provider)
+        if db_url:
+            os.environ["DATABASE_URL"] = str(db_url)
+
         refresh_settings()
         get_engine.cache_clear()
+        _load_cli_plugins()
         return
 
     # 4. Default OS location
@@ -145,6 +184,7 @@ def callback(
         os.environ["EMBEDDR_DATA_DIR"] = str(default)
         refresh_settings()
         get_engine.cache_clear()
+        _load_cli_plugins()
         return
 
     # 5. First-run: prompt
@@ -158,6 +198,7 @@ def callback(
             os.environ["EMBEDDR_DATA_DIR"] = str(default)
             refresh_settings()
             get_engine.cache_clear()
+            _load_cli_plugins()
             return
 
         typer.secho(

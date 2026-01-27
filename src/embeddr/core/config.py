@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Embeddr Local API"
     DATA_DIR: Path = Field(default_factory=get_data_dir)
     DATABASE_URL: str = Field(default_factory=get_db_url)
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT: int = 60
     THUMBNAILS_DIR: Path = Field(default_factory=get_thumbnails_dir)
     WORKFLOWS_DIR: Path = Field(default_factory=get_workflows_dir)
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)

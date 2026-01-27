@@ -12,16 +12,28 @@ app = typer.Typer()
 @app.command()
 def init(
     name: str = typer.Option(None, help="Project name"),
-    path: Path = typer.Option(Path.cwd(), help="Path to initialize project in"),
+    path: Path = typer.Option(
+        Path.cwd(), help="Path to initialize project in"),
 ):
     """Initialize the configuration."""
     if (path / CONFIG_FILENAME).exists():
-        typer.secho(f"Project already initialized at {path}", fg=typer.colors.YELLOW)
+        typer.secho(
+            f"Project already initialized at {path}", fg=typer.colors.YELLOW)
         return
 
     project_name = name or path.name
+    typer.secho(
+        "DESTRUCTIVE: This will create project files on disk.",
+        fg=typer.colors.YELLOW,
+        bold=True,
+    )
+    typer.echo(f"Target: {path}")
+    if not typer.confirm("Proceed with project initialization?"):
+        typer.secho("Initialization cancelled.", fg=typer.colors.YELLOW)
+        return
     create_default_config(path, project_name)
-    typer.secho(f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
     typer.echo(f"Created {CONFIG_FILENAME}")
 
 
@@ -46,11 +58,13 @@ def show():
     db_path = settings.DATABASE_URL.replace("sqlite:///", "")
     print("\nFile Status:")
     print(f"  Database File Exists: {os.path.exists(db_path)} ({db_path})")
-    print(f"  Vector Storage Exists: {os.path.exists(settings.VECTOR_STORAGE_DIR)}")
+    print(
+        f"  Vector Storage Exists: {os.path.exists(settings.VECTOR_STORAGE_DIR)}")
 
     # Show environment variables
     print("\nEnvironment Variables:")
-    print(f"  EMBEDDR_DATA_DIR: {os.environ.get('EMBEDDR_DATA_DIR', 'Not Set')}")
+    print(
+        f"  EMBEDDR_DATA_DIR: {os.environ.get('EMBEDDR_DATA_DIR', 'Not Set')}")
     print(
         f"  EMBEDDR_FRONTEND_DIR: {os.environ.get('EMBEDDR_FRONTEND_DIR', 'Not Set')}"
     )

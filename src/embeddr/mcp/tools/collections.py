@@ -1,6 +1,5 @@
 from pydantic import BaseModel
 from sqlmodel import select
-from embeddr.mcp.instance import mcp
 from embeddr.mcp.utils import get_db_session
 from embeddr_core.models.collection import Collection, CollectionItem
 from embeddr_core.models.library import LocalImage
@@ -28,19 +27,18 @@ class CollectionListResponse(BaseModel):
 #         )
 
 
-@mcp.tool()
 def list_collections() -> list[CollectionObject]:
     """List all image collections available in the system."""
     with get_db_session() as session:
         collections = session.exec(select(Collection)).all()
 
         return [
-            CollectionObject(id=col.id, name=col.name, image_count=len(col.items))
+            CollectionObject(id=col.id, name=col.name,
+                             image_count=len(col.items))
             for col in collections
         ]
 
 
-@mcp.tool()
 def create_collection(name: str) -> str:
     """Create a new image collection with the given name."""
     with get_db_session() as session:
@@ -58,7 +56,6 @@ def create_collection(name: str) -> str:
         return f"Created collection '{name}' with ID {collection.id}"
 
 
-@mcp.tool()
 def add_image_to_collection(image_id: int, collection_id: int) -> str:
     """Add a specific image to a collection."""
     with get_db_session() as session:
@@ -88,7 +85,6 @@ def add_image_to_collection(image_id: int, collection_id: int) -> str:
         return f"Successfully added image {image_id} to collection '{collection.name}' ({collection_id})"
 
 
-@mcp.tool()
 def add_images_to_collection(image_ids: list[int], collection_id: int) -> str:
     """Add multiple images to a collection."""
     with get_db_session() as session:
@@ -117,7 +113,8 @@ def add_images_to_collection(image_ids: list[int], collection_id: int) -> str:
             if exists:
                 continue
 
-            item = CollectionItem(collection_id=collection_id, image_id=image_id)
+            item = CollectionItem(
+                collection_id=collection_id, image_id=image_id)
             session.add(item)
             added_count += 1
 
@@ -129,7 +126,6 @@ def add_images_to_collection(image_ids: list[int], collection_id: int) -> str:
         return result_msg
 
 
-@mcp.tool()
 def get_collection_items(collection_id: int) -> list[dict]:
     """Get all images in a specific collection."""
     with get_db_session() as session:
@@ -144,3 +140,11 @@ def get_collection_items(collection_id: int) -> list[dict]:
         ).all()
 
         return [{"id": img.id, "path": img.path, "prompt": img.prompt} for img in items]
+
+
+def register_collection_tools(mcp) -> None:
+    mcp.tool()(list_collections)
+    mcp.tool()(create_collection)
+    mcp.tool()(add_image_to_collection)
+    mcp.tool()(add_images_to_collection)
+    mcp.tool()(get_collection_items)

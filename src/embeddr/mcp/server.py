@@ -1,20 +1,15 @@
-# Import tools to register them with the MCP instance
-from embeddr.mcp.instance import mcp
-import embeddr.mcp.tools.library
-import embeddr.mcp.tools.collections
-# import embeddr.mcp.tools.search
-# import embeddr.mcp.tools.workflows
 from embeddr_core.plugin_interface import PluginIntent
 from embeddr.core.plugin_loader import get_plugins_by_intent
+from embeddr.mcp.tools.collections import register_collection_tools
+from embeddr.mcp.tools.library import register_library_resources
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Export mcp for use in other modules (e.g. serve.py)
-__all__ = ["mcp", "register_plugin_tools"]
+__all__ = ["register_plugin_tools", "register_core_tools"]
 
 
-def register_plugin_tools():
+def register_plugin_tools(mcp):
     """
     Iterate over loaded plugins and register their MCP tools.
     """
@@ -38,3 +33,8 @@ def register_plugin_tools():
                 logger.debug(f"Registered plugin tool: {name} from {p.name}")
         except Exception as e:
             logger.error(f"Failed to register tools for plugin {p.name}: {e}")
+
+
+def register_core_tools(mcp) -> None:
+    register_library_resources(mcp)
+    register_collection_tools(mcp)

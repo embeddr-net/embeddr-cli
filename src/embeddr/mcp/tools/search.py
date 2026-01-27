@@ -1,6 +1,5 @@
 import base64
 from sqlmodel import select
-from embeddr.mcp.instance import mcp
 from embeddr.mcp.utils import get_db_session
 from embeddr_core.models.library import LocalImage
 from embeddr_core.services.vector_store import get_vector_store
@@ -11,7 +10,6 @@ from embeddr_core.services.embedding import (
 )
 
 
-@mcp.tool()
 def search_images(query: str, limit: int = 5) -> list[dict | str]:
     """
     Search for images using natural language query.
@@ -47,7 +45,6 @@ def search_images(query: str, limit: int = 5) -> list[dict | str]:
         return [f"Error searching images: {str(e)}"]
 
 
-@mcp.tool()
 def search_by_image_id(image_id: int, limit: int = 5) -> list[dict | str]:
     """
     Search for similar images using an existing image ID.
@@ -86,7 +83,6 @@ def search_by_image_id(image_id: int, limit: int = 5) -> list[dict | str]:
         return [f"Error searching by image ID: {str(e)}"]
 
 
-@mcp.tool()
 def search_by_image_upload(image_base64: str, limit: int = 5) -> list[dict | str]:
     """
     Search for similar images by uploading a base64 encoded image.
@@ -124,3 +120,9 @@ def search_by_image_upload(image_base64: str, limit: int = 5) -> list[dict | str
             ]
     except Exception as e:
         return [f"Error searching by uploaded image: {str(e)}"]
+
+
+def register_search_tools(mcp) -> None:
+    mcp.tool()(search_images)
+    mcp.tool()(search_by_image_id)
+    mcp.tool()(search_by_image_upload)

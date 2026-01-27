@@ -88,5 +88,18 @@ class SimpleEventBus(EventBus):
                     logger.error(
                         f"Error in wildcard subscriber for {event.event_type}: {e}")
 
+    def emit(self, event_type: str, payload: Any = None, source: str = "system") -> None:
+        logger.info("BUS EMIT %s source=%s payload=%s",
+                    event_type, source, payload)
+
+        event = EmbeddrEvent(
+            event_type=event_type,
+            source=source,
+            payload=payload or {},
+            timestamp=time.time(),
+        )
+        self.publish(event)
+
+
 # Global Event Bus Instance
 _EVENT_BUS = SimpleEventBus()
