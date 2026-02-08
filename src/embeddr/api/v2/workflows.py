@@ -20,6 +20,7 @@ from embeddr_core.plugin_interface import PluginContext
 from embeddr_core.services.resource_manager import resource_manager
 from embeddr.api.v2.lotus_service import lotus_prepare_inputs
 from embeddr.services.executors.native import native_executor
+from embeddr.api.security import get_auth_context
 from embeddr.services.template_registry import get_template, list_templates
 
 # Ensure defaults are loaded
@@ -29,6 +30,27 @@ router = APIRouter()
 
 TYPE_WORKFLOW = "workflow"
 LEGACY_WORKFLOW_TYPES = {"action:comfy.workflow"}
+
+
+def _require_operator_scope(auth) -> Optional[UUID]:
+    if not auth or auth.is_open or auth.is_admin:
+        return None
+    if not auth.operator_id:
+        raise HTTPException(status_code=403, detail="Operator scope required")
+    return auth.operator_id
+
+
+def _apply_owner_filter(query, auth):
+    operator_id = _require_operator_scope(auth)
+    if operator_id:
+        return query.where(Artifact.owner_operator_id == operator_id)
+    return query
+
+
+def _ensure_artifact_access(session: Session, artifact: Artifact, auth):
+    operator_id = _require_operator_scope(auth)
+    if operator_id and artifact.owner_operator_id != operator_id:
+        raise HTTPException(status_code=404, detail="Workflow not found")
 
 
 def _is_workflow_type(type_name: str) -> bool:
@@ -85,12 +107,13 @@ async def list_workflow_templates():
 async def list_workflows(
     session: Session = Depends(get_session),
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    auth=Depends(get_auth_context),
 ):
     """
     List workflow artifacts.
     """
-    query = (
+    query = _apply_owner_filter(
         select(Artifact)
         .where(
             or_(
@@ -98,9 +121,8 @@ async def list_workflows(
                 Artifact.type_name.in_(LEGACY_WORKFLOW_TYPES),
             )
         )
-        .limit(limit)
-        .offset(offset)
     )
+    query = query.limit(limit).offset(offset)
     artifacts = session.exec(query).all()
     return artifacts
 
@@ -108,7 +130,8 @@ async def list_workflows(
 @router.post("")
 async def create_workflow(
     payload: Dict[str, Any],
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Creates a new Workflow Artifact.
@@ -149,6 +172,8 @@ async def create_workflow(
             "description": description,
             "workflow": workflow_meta,
         },
+        owner_user_id=auth.user_id,
+        owner_operator_id=auth.operator_id,
     )
 
     session.add(artifact)
@@ -160,12 +185,14 @@ async def create_workflow(
 @router.post("/{id}/duplicate")
 async def duplicate_workflow(
     id: UUID,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Duplicates an existing workflow."""
     original = session.get(Artifact, id)
     if not original or not _is_workflow_type(original.type_name):
         raise HTTPException(status_code=404, detail="Workflow not found")
+    _ensure_artifact_access(session, original, auth)
 
     new_meta = copy.deepcopy(original.metadata_json)
     new_meta["name"] = f"{new_meta.get('name')} (Copy)"
@@ -174,6 +201,8 @@ async def duplicate_workflow(
         type_name=original.type_name if _is_workflow_type(
             original.type_name) else TYPE_WORKFLOW,
         metadata_json=new_meta,
+        owner_user_id=auth.user_id,
+        owner_operator_id=auth.operator_id,
     )
     # TODO: Add relation 'variant_of' -> original.id
 
@@ -187,7 +216,8 @@ async def duplicate_workflow(
 async def compose_workflows(
     workflow_ids: List[UUID],
     name: str = "Composed Workflow",
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Composes multiple workflows into one.
@@ -203,6 +233,7 @@ async def compose_workflows(
         if not a:
             raise HTTPException(
                 status_code=404, detail=f"Workflow {wid} not found")
+        _ensure_artifact_access(session, a, auth)
         artifacts.append(a)
 
     composed_inputs = {}
@@ -282,11 +313,10 @@ async def update_workflow(
     session.add(artifact)
     session.commit()
     session.refresh(artifact)
-    return artifact
 
-    # TODO: Port Disk Sync to V2
-    # manager = WorkflowManager(session)
-    # manager.save_to_disk(workflow)
+    # Disk sync deprecated in V2. Workflows are DB-first.
+
+    return artifact
 
 
 @router.delete("/{workflow_id}")
@@ -296,9 +326,7 @@ def delete_workflow(workflow_id: UUID, session: Session = Depends(get_session)):
     if not artifact or not _is_workflow_type(artifact.type_name):
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # TODO: Port Disk Sync to V2
-    # manager = WorkflowManager(session)
-    # manager.delete_from_disk(workflow)
+    # Disk sync deprecated in V2.
 
     session.delete(artifact)
     session.commit()
@@ -308,10 +336,9 @@ def delete_workflow(workflow_id: UUID, session: Session = Depends(get_session)):
 @router.post("/sync")
 def sync_workflows(session: Session = Depends(get_session)):
     """Sync workflows from disk to database."""
-    # TODO: Port Disk Sync to V2
-    # manager = WorkflowManager(session)
-    # manager.sync_from_disk()
-    return {"status": "synced (stub)"}
+    # Disk sync deprecated in V2.
+    # Use POST /workflows/import for importing JSON files.
+    return {"status": "synced (noop)"}
 
 
 @router.post("/{workflow_id}/run")

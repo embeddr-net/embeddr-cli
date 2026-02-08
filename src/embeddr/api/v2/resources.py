@@ -17,10 +17,12 @@ from embeddr.core.plugin_loader import (
 from embeddr.db.session import get_session
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_blob import ArtifactBlob
-from embeddr.mcp.tools.lotus import _import_model_with_fallbacks
+from embeddr.core.model_imports import import_model_with_fallbacks
 from embeddr_core.models.lotus import LotusKind
 from embeddr_core.plugin_interface import PluginContext
 from embeddr_core.services.resource_manager import resource_manager
+from embeddr_core.services.config_service import resolve_plugin_config
+from embeddr.core.plugin_context_helpers import LotusContext
 from embeddr.services.storage import storage_service
 from embeddr.services.blob_registry import get_resolver_for_provider
 from embeddr.services.resource_adapter_registry import (
@@ -62,7 +64,7 @@ def _cap_input_model(cap):
     if not isinstance(model_path, str) or not model_path.strip():
         return None
 
-    return _import_model_with_fallbacks(
+    return import_model_with_fallbacks(
         model_path,
         plugin_name=plugin_name,
         plugin_module=plugin_module,
@@ -74,8 +76,9 @@ def _invoke_capability_sync(cap_id: str, inputs: Dict[str, Any], session: Sessio
     cap = reg.get(cap_id)
     if not cap:
         raise HTTPException(404, f"Capability not found: {cap_id}")
-    if cap.kind != LotusKind.action:
-        raise HTTPException(400, "Only action capabilities can be invoked")
+    if cap.kind not in (LotusKind.action, LotusKind.resolver):
+        raise HTTPException(
+            400, "Only action or resolver capabilities can be invoked")
     if not _cap_exposes_api(cap):
         raise HTTPException(403, f"Capability not exposed to API: {cap_id}")
 
@@ -104,12 +107,17 @@ def _invoke_capability_sync(cap_id: str, inputs: Dict[str, Any], session: Sessio
         bus=_EVENT_BUS,
         capability_registry=_PLUGIN_CAPABILITY_REGISTRY,
         resources=resource_manager,
+        config=resolve_plugin_config(
+            session=session,
+            plugin_name=plugin_name,
+        ),
+        lotus=LotusContext(session=session),
     )
 
     return plugin.execute(action_name, None, inputs, context=ctx)
 
 
-def _resolve_artifact_urls(session: Session, artifact_id: str) -> Dict[str, Any]:
+def _resolve_artifact_urls(session: Session, artifact_id: UUID) -> Dict[str, Any]:
     artifact = session.get(Artifact, artifact_id)
     if not artifact:
         raise HTTPException(404, "Artifact not found")
@@ -120,6 +128,8 @@ def _resolve_artifact_urls(session: Session, artifact_id: str) -> Dict[str, Any]
         .order_by(col(ArtifactBlob.created_at).desc())
     ).first()
 
+    base_type = artifact.base_type_name or artifact.get_base_type_name()
+
     if blob:
         original = storage_service.resolve_blob(blob, purpose="original")
         preview = storage_service.resolve_blob(blob, purpose="preview")
@@ -127,18 +137,20 @@ def _resolve_artifact_urls(session: Session, artifact_id: str) -> Dict[str, Any]
         return {
             "ok": True,
             "id": str(artifact_id),
-            "type": artifact.base_type_name or artifact.type_name or "artifact",
+            "type": artifact.type_name or base_type or "artifact",
+            "base_type": base_type or "artifact",
             "original": original,
             "preview": preview,
             "storage_provider": blob.storage_backend,
             "storage_resolver": resolver.name if resolver else None,
         }
 
-    base = f"/api/v2/artifacts/{artifact_id}"
+    base = f"/api/v1/artifacts/{artifact_id}"
     return {
         "ok": True,
         "id": str(artifact_id),
-        "type": artifact.base_type_name or artifact.type_name or "artifact",
+        "type": artifact.type_name or base_type or "artifact",
+        "base_type": base_type or "artifact",
         "content_url": f"{base}/content",
         "preview_url": f"{base}/preview",
         "url": f"{base}/content",
@@ -156,17 +168,17 @@ def resolve_resource(
     background_tasks: BackgroundTasks = None,
     session: Session = Depends(get_session),
 ):
-    resolved_artifact_id = None
+    resolved_artifact_id: Optional[UUID] = None
     if payload.artifact_id:
         try:
-            resolved_artifact_id = str(UUID(str(payload.artifact_id)))
+            resolved_artifact_id = UUID(str(payload.artifact_id))
         except ValueError:
             resolved_artifact_id = None
 
     if resolved_artifact_id:
         resolved = _resolve_artifact_urls(session, resolved_artifact_id)
         cap = select_resource_adapter(
-            artifact_id=resolved_artifact_id,
+            artifact_id=str(resolved_artifact_id),
             url=payload.url,
             adapter_id=payload.adapter_id,
         )

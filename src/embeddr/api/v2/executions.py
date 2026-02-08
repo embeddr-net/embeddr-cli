@@ -189,3 +189,21 @@ async def wait_execution(
             return ex
 
         await asyncio.sleep(max(0.05, poll_interval_s))
+
+
+@router.post("/{execution_id}/resume", response_model=ArtifactExecution)
+class ExecutionResume(BaseModel):
+    message: Optional[str] = None
+    inputs: Optional[Dict[str, Any]] = None
+
+
+@router.post("/{execution_id}/resume", response_model=ArtifactExecution)
+def resume_execution(execution_id: UUID, req: ExecutionResume):
+    job = ExecutionSpine.resume_job(
+        execution_id,
+        message=req.message or "resumed",
+        inputs_update=req.inputs,
+    )
+    if not job:
+        raise HTTPException(404, "Execution not found")
+    return job

@@ -30,7 +30,7 @@ def register_core_lotus_capabilities() -> None:
                 data={
                     "type": "nav",
                     "route": route,
-                    "expose": {"lotus": True, "api": True, "mcp": False, "cli": False},
+                    "expose": {"lotus": True, "api": True, "cli": False},
                 },
             )
         )
@@ -38,6 +38,75 @@ def register_core_lotus_capabilities() -> None:
 
 def _core_capabilities() -> list[LotusCapability]:
     return [
+        LotusCapability(
+            id="embeddr-core.transport.policy",
+            kind=LotusKind.config,
+            title="Transport Policy",
+            description="Control which transports can invoke which capabilities.",
+            plugin="embeddr-core",
+            tags=["core", "transport", "policy", "config"],
+            data={
+                "type": "config",
+                "plugin": "embeddr-core",
+                "scope": "global",
+                "input": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "enabled": {"type": "boolean", "default": False},
+                            "default_allow": {
+                                "type": "object",
+                                "properties": {
+                                    "api": {"type": "boolean", "default": False},
+                                    "lotus": {"type": "boolean", "default": False},
+                                    "cli": {"type": "boolean", "default": False},
+                                },
+                                "additionalProperties": {"type": "boolean"},
+                            },
+                            "plugin_allow": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "boolean"},
+                                },
+                            },
+                            "capability_allow": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "boolean"},
+                                },
+                            },
+                        },
+                        "required": [],
+                    },
+                    "defaults": {
+                        "enabled": False,
+                        "default_allow": {
+                            "api": False,
+                            "lotus": False,
+                            "cli": False,
+                        },
+                        "plugin_allow": {},
+                        "capability_allow": {},
+                    },
+                    "ui": {
+                        "order": [
+                            "enabled",
+                            "default_allow",
+                            "plugin_allow",
+                            "capability_allow",
+                        ],
+                        "widgets": {
+                            "enabled": "checkbox",
+                            "default_allow": "json",
+                            "plugin_allow": "json",
+                            "capability_allow": "json",
+                        },
+                    },
+                },
+            },
+        ),
         LotusCapability(
             id="embeddr-core.ingest.pipeline",
             kind=LotusKind.config,
@@ -71,95 +140,4 @@ def _core_capabilities() -> list[LotusCapability]:
                 },
             },
         ),
-        LotusCapability(
-            id="embeddr-core.mcp.transport",
-            kind=LotusKind.config,
-            title="MCP Transport",
-            description="Configure MCP transport (embedded vs plugin).",
-            plugin="embeddr-core",
-            tags=["core", "mcp", "configuration"],
-            data={
-                "type": "config",
-                "plugin": "embeddr-core",
-                "scope": "global",
-                "input": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "enabled": {"type": "boolean", "default": True},
-                            "transport": {
-                                "type": "string",
-                                "enum": ["embedded", "plugin", "disabled"],
-                                "default": "embedded",
-                            },
-                        },
-                        "required": [],
-                    },
-                    "defaults": {
-                        "enabled": True,
-                        "transport": "embedded",
-                    },
-                    "ui": {
-                        "order": ["enabled", "transport"],
-                        "widgets": {
-                            "enabled": "boolean",
-                            "transport": "select",
-                        },
-                        "options": {
-                            "transport": [
-                                {"label": "Embedded", "value": "embedded"},
-                                {"label": "Plugin", "value": "plugin"},
-                                {"label": "Disabled", "value": "disabled"},
-                            ]
-                        },
-                    },
-                },
-            },
-        ),
-        # LotusCapability(
-        #     id="ui.list_routes",
-        #     kind=LotusKind.action,
-        #     title="List Core UI Routes",
-        #     description="List known core UI routes.",
-        #     plugin="core",
-        #     tags=["core", "ui"],
-        #     data={
-        #         "type": "action",
-        #         "plugin": "core",
-        #         "action": "ui.list_routes",
-        #         "expose": {"lotus": True, "api": True, "mcp": True, "cli": False},
-        #         "input": {
-        #             "schema": {
-        #                 "type": "object",
-        #                 "properties": {},
-        #                 "required": [],
-        #             },
-        #         },
-        #         "exec": {"mode": "sync"},
-        #     },
-        # ),
-        # LotusCapability(
-        #     id="ui.navigate",
-        #     kind=LotusKind.action,
-        #     title="Navigate UI",
-        #     description="Navigate the Embeddr UI (client performs navigation).",
-        #     plugin="core",
-        #     tags=["core", "ui"],
-        #     data={
-        #         "type": "action",
-        #         "plugin": "core",
-        #         "action": "ui.navigate",
-        #         "expose": {"lotus": True, "api": True, "mcp": True, "cli": False},
-        #         "input": {
-        #             "schema": {
-        #                 "type": "object",
-        #                 "properties": {
-        #                     "route": {"type": "string", "enum": list(CORE_ROUTES.keys())}
-        #                 },
-        #                 "required": ["route"],
-        #             },
-        #         },
-        #         "exec": {"mode": "sync"},
-        #     },
-        # ),
     ]

@@ -37,6 +37,7 @@ def _safe_path(value: str | None) -> str:
 def list_resource_adapters() -> List[Dict[str, Any]]:
     reg = get_lotus_registry()
     caps = reg.list(kind=LotusKind.action, slot="resource.adapter")
+    caps += reg.list(kind=LotusKind.resolver, slot="resource.adapter")
 
     out: List[Dict[str, Any]] = []
     for cap in caps:
@@ -59,6 +60,16 @@ def list_resource_adapters() -> List[Dict[str, Any]]:
 
 def _score_url_match(url: str, match: Dict[str, Any]) -> Tuple[int, int]:
     prefixes = _matches_prefix(url, match.get("url_prefixes"))
+    uri_prefixes = _matches_prefix(url, match.get("uri_prefixes"))
+
+    scheme = ""
+    try:
+        scheme = urlparse(url).scheme or ""
+    except Exception:
+        scheme = ""
+    uri_schemes = match.get("uri_schemes") or []
+    scheme_match = [scheme] if scheme and scheme in uri_schemes else []
+
     path = _safe_path(url)
     path_prefixes = _matches_prefix(path, match.get("path_prefixes"))
     url_contains = [p for p in (
@@ -66,9 +77,17 @@ def _score_url_match(url: str, match: Dict[str, Any]) -> Tuple[int, int]:
     path_contains = [p for p in (
         match.get("path_contains") or []) if p and p in path]
 
-    max_prefix = max([len(p) for p in (prefixes + path_prefixes)], default=0)
-    max_contains = max([len(p)
-                       for p in (url_contains + path_contains)], default=0)
+    max_prefix = max(
+        [len(p) for p in (prefixes + uri_prefixes + path_prefixes)],
+        default=0,
+    )
+    if scheme_match:
+        max_prefix = max(max_prefix, len(scheme) + 3)
+
+    max_contains = max(
+        [len(p) for p in (url_contains + path_contains)],
+        default=0,
+    )
     return max_prefix, max_contains
 
 
@@ -82,12 +101,17 @@ def select_resource_adapter(
 
     if adapter_id:
         cap = reg.get(adapter_id)
-        if cap and cap.kind == LotusKind.action:
+        if cap and cap.kind in (LotusKind.action, LotusKind.resolver):
             return cap
         return None
 
     caps = [
-        c for c in reg.list(kind=LotusKind.action, slot="resource.adapter") if _cap_exposes_api(c)
+        c
+        for c in (
+            reg.list(kind=LotusKind.action, slot="resource.adapter")
+            + reg.list(kind=LotusKind.resolver, slot="resource.adapter")
+        )
+        if _cap_exposes_api(c)
     ]
 
     if artifact_id:

@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 from embeddr.db.session import get_session
 from embeddr_core.models.config import AutoAnalysisConfig
-from embeddr_core.models.analysis_capability import AnalysisCapability
 from embeddr_core.plugin_interface import PluginIntent
 from embeddr.core.plugin_loader import get_all_plugin_instances
 
@@ -30,28 +29,15 @@ class AnalysisConfigResponse(BaseModel):
 
 class PluginCapabilitiesResponse(BaseModel):
     plugin_name: str
-    capabilities: List[AnalysisCapability]
+    capabilities: List[dict]
 
 
-@router.get("/analysis/capabilities", response_model=List[PluginCapabilitiesResponse])
+@router.get("/analysis/capabilities", response_model=List[PluginCapabilitiesResponse], deprecated=True)
 def get_analysis_capabilities():
     """
-    Get all registered analysis capabilities from currently loaded plugins.
+    Deprecated: No longer used.
     """
-    response = []
-    loaded = get_all_plugin_instances()
-
-    for plugin in loaded:
-        # Check if plugin supports auto analysis
-        if PluginIntent.AUTO_ANALYSIS in plugin.intents:
-            caps = plugin.analysis_capabilities
-            if caps:
-                response.append(PluginCapabilitiesResponse(
-                    plugin_name=plugin.name,
-                    capabilities=caps
-                ))
-
-    return response
+    return []
 
 
 @router.get("/analysis", response_model=List[AnalysisConfigResponse])

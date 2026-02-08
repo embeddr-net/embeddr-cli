@@ -21,6 +21,8 @@ from embeddr.core.plugin_loader import (
 from embeddr.db.session import get_engine
 from embeddr_core.models.lotus import LotusKind
 from embeddr_core.plugin_interface import PluginContext
+from embeddr_core.services.config_service import resolve_plugin_config_for_plugin
+from embeddr.core.plugin_context_helpers import LotusContext
 from embeddr_core.services.resource_manager import resource_manager
 
 logger = logging.getLogger("embeddr.mcp.tools.lotus")
@@ -190,6 +192,8 @@ def _run_sync(
         bus=_EVENT_BUS,
         capability_registry=_PLUGIN_CAPABILITY_REGISTRY,
         resources=resource_manager,
+        config=resolve_plugin_config_for_plugin(plugin_name=plugin_name),
+        lotus=LotusContext(),
     )
 
     # Sync execution returns the plugin output directly (what MCP inspector wants)
@@ -353,7 +357,7 @@ def register_lotus_tools(mcp):
 
     count = 0
     for cap in caps:
-        if cap.kind != LotusKind.action:
+        if cap.kind not in {LotusKind.action, LotusKind.feature}:
             continue
 
         data: Dict[str, Any] = cap.data or {}

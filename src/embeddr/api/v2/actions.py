@@ -9,9 +9,12 @@ from embeddr_core.models.action_graph import ActionGraph
 from embeddr_core.models.artifact_execution import ArtifactExecution
 from embeddr_core.services.action_runner import ActionRunner
 from embeddr.core.execution_spine import ExecutionSpine
+from embeddr.api.security import require_permission
 from embeddr.core.plugin_loader import get_all_plugin_instances, _EVENT_BUS
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_permission("actions:write"))]
+)
 
 # Simple simplified dependency to get runner
 

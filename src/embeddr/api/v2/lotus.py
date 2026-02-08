@@ -28,6 +28,8 @@ from sqlmodel import Session
 from embeddr.db.session import get_session
 from embeddr_core.models.artifact_execution import ArtifactExecution
 from embeddr.core.plugin_loader import get_all_plugin_instances, get_lotus_registry
+from embeddr.api.security import get_auth_context
+from embeddr.services import auth_service
 import logging
 
 logger = logging.getLogger("embeddr.api.lotus")
@@ -120,9 +122,20 @@ _registry = get_lotus_registry()
 
 
 @router.get("/query", response_model=LotusQueryResponse)
-def lotus_query(q: str = Query(""), limit: int = 20):
+def lotus_query(
+    q: str = Query(""),
+    limit: int = 20,
+    auth=Depends(get_auth_context),
+):
     reg = get_lotus_registry()
     core_results: List[CoreLotusResult] = reg.query(q, limit=limit)
+
+    def allowed(cap_id: str) -> bool:
+        if auth.is_open or auth.is_admin:
+            return True
+        if auth.can("lotus:list") or auth.can("lotus:*"):
+            return True
+        return auth.can(auth_service.lotus_permission_for_capability(cap_id))
 
     results = [
         LotusResult(
@@ -134,6 +147,7 @@ def lotus_query(q: str = Query(""), limit: int = 20):
             data=r.capability.data,
         )
         for r in core_results
+        if allowed(r.capability.id)
     ]
     return LotusQueryResponse(query=q, results=results)
 
@@ -145,9 +159,19 @@ def lotus_list(
     slot: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    auth=Depends(get_auth_context),
 ):
     reg = get_lotus_registry()
     items = reg.list(kind=kind, slot=slot, plugin=plugin)
+
+    def allowed(cap_id: str) -> bool:
+        if auth.is_open or auth.is_admin:
+            return True
+        if auth.can("lotus:list") or auth.can("lotus:*"):
+            return True
+        return auth.can(auth_service.lotus_permission_for_capability(cap_id))
+
+    items = [cap for cap in items if allowed(cap.id)]
     total = len(items)
     paged = items[offset: offset + limit]
 
@@ -198,6 +222,7 @@ async def lotus_dispatch(
     payload: LotusDispatchRequest,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Dispatch a Lotus result.
@@ -218,21 +243,27 @@ async def lotus_dispatch(
         raise HTTPException(
             status_code=400, detail=f"Unsupported kind: {payload.kind}")
 
-    # Support BOTH legacy and new keys:
-    # - plugin_name / action_name
-    # - plugin / action
-    plugin_name = payload.data.get("plugin_name") or payload.data.get("plugin")
-    action_name = payload.data.get("action_name") or payload.data.get("action")
+    cap = get_lotus_registry().get(payload.result_id)
+    if cap:
+        if not (auth.is_open or auth.is_admin):
+            allowed = auth.can("lotus:dispatch") or auth.can("lotus:*")
+            allowed = allowed or auth.can(
+                auth_service.lotus_permission_for_capability(cap.id))
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Not authorized")
 
-    # inputs may arrive as "inputs" (legacy) or "input" (new-ish)
-    inputs = payload.data.get("inputs")
-    if inputs is None:
-        inputs = payload.data.get("input")
-    if inputs is None:
-        inputs = {}
+    plugin_name = payload.data.get("plugin_name")
+    action_name = payload.data.get("action_name")
+    if not plugin_name or not action_name:
+        raise HTTPException(
+            status_code=400,
+            detail="data.plugin_name and data.action_name are required",
+        )
+
+    inputs = payload.data.get("inputs", {})
     if not isinstance(inputs, dict):
         raise HTTPException(
-            status_code=400, detail="data.inputs (or data.input) must be an object")
+            status_code=400, detail="data.inputs must be an object")
 
     try:
         out = lotus_dispatch_action(

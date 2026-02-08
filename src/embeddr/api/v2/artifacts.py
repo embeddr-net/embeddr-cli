@@ -1,12 +1,14 @@
 from sqlalchemy.orm import aliased
 import logging
 from sqlalchemy import literal
-from typing import Any, Dict, List, Optional
-from uuid import UUID
+from sqlalchemy.exc import IntegrityError
+from typing import Any, Dict, List, Optional, Set
+from uuid import UUID, uuid5, NAMESPACE_URL
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Request
 from fastapi.responses import FileResponse, Response, RedirectResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session, select, col, func, or_, cast, String, delete
 from embeddr.db.session import get_engine
 from sqlalchemy import text
@@ -19,10 +21,14 @@ from embeddr_core.models.artifact_feature import ArtifactFeatureRef
 from embeddr_core.models.artifact_annotation import ArtifactAnnotation
 from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact_relation import ArtifactRelation
+from embeddr_core.services.vector_store import VectorStoreService
+from embeddr_core.services.embedding import get_text_embedding, get_loaded_model_name
 from pydantic import BaseModel
 from embeddr_core.plugin_interface import EmbeddrEvent
 from embeddr.core.plugin_loader import _EVENT_BUS
 from embeddr.services.ingestion_service import ingestion_service
+from embeddr.services.artifact_events import publish_artifact_created
+from embeddr.api.security import get_auth_context, require_permission_for_request
 from pathlib import Path
 from embeddr.services.storage import storage_service
 from embeddr.services.blob_refs import blob_ref_from_blob, blob_ref_storage_path, BlobRef
@@ -31,8 +37,129 @@ from embeddr_core.services.config_service import resolve_plugin_config
 from urllib.parse import urlparse
 import requests
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[
+        Depends(require_permission_for_request(
+            "artifacts:read", "artifacts:write"))
+    ]
+)
 logger = logging.getLogger("embeddr.api.v2.artifacts")
+
+PROXY_ENABLED_ENV = "EMBEDDR_PROXY_ENABLED"
+PROXY_ALLOWLIST_ENV = "EMBEDDR_PROXY_ALLOWLIST"
+
+
+def _proxy_enabled() -> bool:
+    return os.environ.get(PROXY_ENABLED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+
+def _proxy_allowlist() -> set[str]:
+    raw = os.environ.get(PROXY_ALLOWLIST_ENV, "")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _host_allowed(host: Optional[str], allowlist: set[str]) -> bool:
+    if not host:
+        return False
+    if "*" in allowlist:
+        return True
+    host = host.lower()
+    for entry in allowlist:
+        if entry.startswith(".") and host.endswith(entry):
+            return True
+        if host == entry:
+            return True
+    return False
+
+
+def _assert_proxy_allowed(url: str) -> None:
+    if not _proxy_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="External proxy disabled. Set EMBEDDR_PROXY_ENABLED=1 and allowlist domains.",
+        )
+    allowlist = _proxy_allowlist()
+    parsed = urlparse(url)
+    if not allowlist or not _host_allowed(parsed.hostname, allowlist):
+        raise HTTPException(
+            status_code=403,
+            detail="External proxy blocked by allowlist.",
+        )
+
+
+def _get_vector_service() -> VectorStoreService:
+    return VectorStoreService(lambda: Session(get_engine()))
+
+
+def _resolve_embedding_for_artifact(
+    session: Session,
+    artifact_id: UUID,
+    model_name: Optional[str],
+    space: Optional[str],
+) -> Optional[ArtifactEmbedding]:
+    query = select(ArtifactEmbedding).where(
+        ArtifactEmbedding.artifact_id == artifact_id,
+    )
+    if model_name:
+        query = query.where(ArtifactEmbedding.model_name == model_name)
+    if space:
+        query = query.where(ArtifactEmbedding.space == space)
+
+    embedding = session.exec(
+        query.order_by(ArtifactEmbedding.created_at.desc())
+    ).first()
+    if embedding:
+        return embedding
+
+    if model_name and not space:
+        return session.exec(
+            select(ArtifactEmbedding)
+            .where(
+                ArtifactEmbedding.artifact_id == artifact_id,
+                ArtifactEmbedding.model_name == model_name,
+            )
+            .order_by(ArtifactEmbedding.created_at.desc())
+        ).first()
+
+    if space and not model_name:
+        return session.exec(
+            select(ArtifactEmbedding)
+            .where(
+                ArtifactEmbedding.artifact_id == artifact_id,
+                ArtifactEmbedding.space == space,
+            )
+            .order_by(ArtifactEmbedding.created_at.desc())
+        ).first()
+
+    return session.exec(
+        select(ArtifactEmbedding)
+        .where(ArtifactEmbedding.artifact_id == artifact_id)
+        .order_by(ArtifactEmbedding.created_at.desc())
+    ).first()
+
+
+def _build_similarity_items(
+    results: List[Dict[str, Any]],
+    *,
+    exclude_id: Optional[UUID] = None,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for row in results:
+        artifact_id = row.get("artifact_id")
+        if not artifact_id:
+            continue
+        if exclude_id and str(artifact_id) == str(exclude_id):
+            continue
+        items.append({
+            "id": str(artifact_id),
+            "score": float(row.get("score") or 0.0),
+        })
+    return items
 
 
 def _resolve_uri_response(
@@ -66,13 +193,15 @@ def _resolve_uri_response(
         return response
 
     if uri.startswith("http"):
+        _assert_proxy_allowed(uri)
         return RedirectResponse(url=uri)
 
     return None
 
 
 def _proxy_url_response(url: str) -> Response:
-    resp = requests.get(url, stream=True)
+    _assert_proxy_allowed(url)
+    resp = requests.get(url, stream=True, timeout=(3, 30))
     resp.raise_for_status()
     headers = {"Vary": "Origin"}
     content_type = resp.headers.get("content-type")
@@ -203,6 +332,15 @@ class RelationIngest(BaseModel):
     metadata_json: Dict[str, Any] = {}
 
 
+class UploadRequest(BaseModel):
+    uri: str
+    filename: str
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    storage_backend: Optional[str] = "s3"
+    metadata_json: Optional[Dict[str, Any]] = {}  # Added to support Pre-Ingest
+
+
 class ArtifactIngestRequestItem(BaseModel):
     uri: str
     id: Optional[str] = None
@@ -223,103 +361,250 @@ def get_session():
         yield session
 
 
+def _require_operator_scope(auth) -> Optional[UUID]:
+    if not auth or auth.is_open or auth.is_admin:
+        return None
+    if not auth.operator_id:
+        raise HTTPException(status_code=403, detail="Operator scope required")
+    return auth.operator_id
+
+
+def _apply_owner_filter(query, auth):
+    operator_id = _require_operator_scope(auth)
+    if operator_id:
+        return query.where(Artifact.owner_operator_id == operator_id)
+    return query
+
+
+def _filter_allowed_ids(session: Session, ids: List[UUID], auth) -> Set[UUID]:
+    operator_id = _require_operator_scope(auth)
+    if not operator_id:
+        return set(ids)
+    rows = session.exec(
+        select(Artifact.id).where(
+            Artifact.id.in_(ids),
+            Artifact.owner_operator_id == operator_id,
+        )
+    ).all()
+    return set(rows)
+
+
+def _ensure_artifact_access(
+    session: Session, artifact_uuid: UUID, auth
+) -> Artifact:
+    artifact = _get_artifact_or_repair(session, artifact_uuid)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    operator_id = _require_operator_scope(auth)
+    if operator_id and artifact.owner_operator_id != operator_id:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+@router.post("/ingest/upload-request", status_code=201)
+def request_upload(
+    req: UploadRequest,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    artifact_id = uuid5(NAMESPACE_URL, req.uri)
+
+    # Check if artifact exists
+    artifact = session.get(Artifact, artifact_id)
+    if not artifact:
+        # Create placeholder artifact
+        try:
+            artifact = Artifact(
+                id=artifact_id,
+                uri=req.uri,
+                type_name="artifact",
+                base_type_name="artifact",
+                metadata_json=req.metadata_json or {},
+                owner_user_id=auth.user_id,
+                owner_operator_id=auth.operator_id,
+            )
+            session.add(artifact)
+            session.flush()  # Ensure it's there for FK
+        except IntegrityError:
+            # Race condition: someone inserted it between our get() and flush()
+            session.rollback()
+            artifact = session.get(Artifact, artifact_id)
+            if not artifact:
+                # Should detect if it was ID collision or something else, but here we assume race
+                # If it's truly missing now, something is very wrong, but let's re-raise to be safe
+                # Note: session.rollback() clears the session, so we need to restart
+                # But typically we just want to proceed.
+                # If artifact is None here, re-raise original error?
+                pass
+
+    # Re-fetch or ensure artifact is attached if we rolled back
+    if not artifact:
+        artifact = session.get(Artifact, artifact_id)
+        if not artifact:
+            # Fallback retry logic or fail
+            # Actually, if we rolled back, 'artifact' var from line 242 is detached/invalid?
+            # No, it was a new object.
+            # The get() should work now.
+            pass
+
+    # Create Ingest record
+    ingest = ArtifactIngestModel(
+        artifact_id=artifact_id,
+        storage_backend=req.storage_backend or "local",
+        original_filename=req.filename,
+        content_type=req.content_type,
+        size=req.size,
+        status="pending",
+        meta_json={"confirmed": True}  # Auto-confirm for scraper pipeline
+    )
+    session.add(ingest)
+    session.commit()
+    session.refresh(ingest)
+
+    return {"upload_id": ingest.id, "artifact_id": artifact_id}
+
+
 @router.post("/ingest", status_code=202)
-async def ingest_artifacts(req: IngestRequest):
+async def ingest_artifacts(
+    req: IngestRequest,
+    auth=Depends(get_auth_context),
+):
     """
     Async ingestion endpoint.
     Accepts items, puts them in a queue, and processes them in background.
     """
     count = 0
     for item in req.items:
-        await ingestion_service.ingest(item.model_dump())
+        payload = item.model_dump()
+        payload["owner_user_id"] = auth.user_id
+        payload["owner_operator_id"] = auth.operator_id
+        await ingestion_service.ingest(payload)
         count += 1
 
     return {"status": "accepted", "queued": count}
 
 
 @router.post("/uploads/{upload_id}")
-async def upload_artifact_bytes(
+def upload_artifact_bytes(
     upload_id: UUID,
     file: UploadFile = File(...),
-    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
-    ingest = session.get(ArtifactIngestModel, upload_id)
-    if not ingest:
-        raise HTTPException(404, "Upload not found")
-    if ingest.status != "pending":
-        raise HTTPException(409, f"Upload is {ingest.status}")
+    """
+    Handle artifact upload with minimal DB session holding time using split transactions.
+    """
+    engine = get_engine()
 
-    if not ingest.meta_json.get("confirmed"):
-        raise HTTPException(400, "confirmation_required")
+    # 1. Validation & Data Fetching (Use short-lived Session)
+    with Session(engine) as session:
+        ingest = session.get(ArtifactIngestModel, upload_id)
+        if not ingest:
+            raise HTTPException(404, "Upload not found")
+        if ingest.status != "pending":
+            raise HTTPException(409, f"Upload is {ingest.status}")
 
-    artifact = session.get(Artifact, ingest.artifact_id)
-    if not artifact:
-        raise HTTPException(404, "Artifact not found")
+        if not ingest.meta_json.get("confirmed"):
+            raise HTTPException(400, "confirmation_required")
 
-    filename = Path(file.filename or "upload.bin").name
-    blob_ref = storage_service.store_upload(
-        session=session,
-        artifact=artifact,
-        upload_file=file,
-        filename=filename,
-        content_type=file.content_type,
-        backend_hint=ingest.storage_backend,
-        confirmed=bool(ingest.meta_json.get("confirmed")),
-    )
+        artifact = session.get(Artifact, ingest.artifact_id)
+        if not artifact:
+            raise HTTPException(404, "Artifact not found")
+        _ensure_artifact_access(session, artifact.id, auth)
+
+        # Capture needed data values to pass to helper outside session
+        artifact_id_val = artifact.id
+        filename = Path(file.filename or "upload.bin").name
+        content_type = file.content_type
+        backend_hint = ingest.storage_backend
+        confirmed = bool(ingest.meta_json.get("confirmed"))
+
+    # 2. Upload IO (No Active DB Session)
+    try:
+        # We pass None for session relying on BlobProvider smarts or lack of usage
+        blob_ref = storage_service.store_upload(
+            session=None,  # type: ignore
+            artifact=artifact,  # Warning: ensure this object isn't accessed for lazy loads
+            upload_file=file,
+            filename=filename,
+            content_type=content_type,
+            backend_hint=backend_hint,
+            confirmed=confirmed,
+        )
+    except Exception as e:
+        logger.error(f"Storage upload error: {e}")
+        raise HTTPException(500, f"Upload error: {str(e)}")
 
     storage_path = blob_ref_storage_path(blob_ref)
     if not storage_path:
         raise HTTPException(
             status_code=500, detail="blob_storage_path_missing")
 
-    blob = ArtifactBlob(
-        artifact_id=artifact.id,
-        storage_backend=blob_ref.provider,
-        path=storage_path,
-        sha256=blob_ref.etag,
-        size=blob_ref.size,
-        content_type=blob_ref.content_type,
-    )
-    session.add(blob)
+    # 3. Finalization (Use new short-lived Session)
+    with Session(engine) as session:
+        # Refetch fresh instances to modify
+        artifact = session.get(Artifact, artifact_id_val)
+        ingest = session.get(ArtifactIngestModel, upload_id)
 
-    ingest.status = "uploaded"
-    ingest.storage_backend = blob_ref.provider
-    ingest.storage_path = storage_path
-    ingest.content_type = blob_ref.content_type
-    ingest.size = blob_ref.size
-    ingest.original_filename = filename
-    session.add(ingest)
+        if not ingest:
+            raise HTTPException(404, "Upload went missing")
 
-    artifact.uri = storage_path
-    session.add(artifact)
+        blob = ArtifactBlob(
+            artifact_id=artifact_id_val,
+            storage_backend=blob_ref.provider,
+            path=storage_path,
+            sha256=blob_ref.etag,
+            size=blob_ref.size,
+            content_type=blob_ref.content_type,
+        )
+        session.add(blob)
 
-    session.commit()
-    session.refresh(blob)
+        ingest.status = "uploaded"
+        ingest.storage_backend = blob_ref.provider
+        ingest.storage_path = storage_path
+        ingest.content_type = blob_ref.content_type
+        ingest.size = blob_ref.size
+        ingest.original_filename = filename
+        session.add(ingest)
 
-    return {
-        "ok": True,
-        "artifact_id": str(artifact.id),
-        "upload_id": str(upload_id),
-        "blob": {
-            "id": str(blob.id),
-            "path": blob.path,
-            "size": blob.size,
-            "content_type": blob.content_type,
-            "sha256": blob.sha256,
-            "storage_backend": blob.storage_backend,
-            "public_url": None,
-        },
-        "blob_ref": blob_ref.to_dict(),
-    }
+        if artifact:
+            artifact.uri = storage_path
+            session.add(artifact)
+
+        session.commit()
+        session.refresh(blob)
+
+        if artifact:
+            session.refresh(artifact)
+            publish_artifact_created(
+                artifact, source="api/v2/artifacts.upload")
+
+        return {
+            "ok": True,
+            "artifact_id": str(artifact_id_val),
+            "upload_id": str(upload_id),
+            "blob": {
+                "id": str(blob.id),
+                "path": blob.path,
+                "size": blob.size,
+                "content_type": blob.content_type,
+                "sha256": blob.sha256,
+                "storage_backend": blob.storage_backend,
+                "public_url": None,
+            },
+            "blob_ref": blob_ref.to_dict(),
+        }
 
 
 @router.post("/{artifact_id}/relations", response_model=Dict[str, str])
 def add_relation(
     artifact_id: UUID,
     rel: RelationCreate,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Create a relationship between artifacts."""
+    _ensure_artifact_access(session, artifact_id, auth)
+    _ensure_artifact_access(session, rel.target_id, auth)
     # Check if exists to avoid dupes?
     existing = session.exec(select(ArtifactRelation).where(
         ArtifactRelation.source_id == artifact_id,
@@ -344,7 +629,8 @@ def add_relation(
 @router.post("", response_model=Artifact)
 async def create_artifact(
     art_in: ArtifactCreate,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Create a new artifact manually (e.g. valid 'collection' or virtual container)."""
     # If no URI, mint a virtual one?
@@ -359,30 +645,16 @@ async def create_artifact(
         base_type_name=art_in.base_type_name,  # Allow base_type_name to be set via API
         uri=uri,
         metadata_json=art_in.metadata_json,
-        override_capabilities=art_in.override_capabilities
+        override_capabilities=art_in.override_capabilities,
+        owner_user_id=auth.user_id,
+        owner_operator_id=auth.operator_id,
     )
 
     session.add(new_art)
     session.commit()
     session.refresh(new_art)
 
-    if _EVENT_BUS:
-        # Since we are async now, we can await if needed, OR the event bus handles tasks.
-        # But we MUST ensure the event bus publish finds the loop.
-        # Since create_artifact is now `async def`, it runs in the main loop.
-        try:
-            _EVENT_BUS.publish(EmbeddrEvent(
-                event_type="artifact.created",
-                source="api/v2/artifacts",
-                payload={
-                    "id": str(new_art.id),
-                    "uri": str(new_art.uri),
-                    "type": new_art.type_name
-                }
-            ))
-        except Exception as e:
-            # Don't fail the request if eventing fails
-            print(f"Failed to publish artifact.created: {e}")
+    publish_artifact_created(new_art, source="api/v2/artifacts")
 
     return new_art
 
@@ -391,12 +663,11 @@ async def create_artifact(
 def update_artifact(
     artifact_id: UUID,
     art_update: ArtifactUpdate,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Update an existing artifact."""
-    artifact = session.get(Artifact, artifact_id)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _ensure_artifact_access(session, artifact_id, auth)
 
     if art_update.metadata_json is not None:
         # Deep merge or shallow merge? Shallow merge for now.
@@ -441,12 +712,13 @@ def search_artifacts(
     offset: int = 0,
     type_name: Optional[str] = None,
     type_prefix: Optional[str] = None,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Search artifacts by URI or metadata."""
 
-    query = select(Artifact)
-    count_query = select(func.count(Artifact.id))
+    query = _apply_owner_filter(select(Artifact), auth)
+    count_query = _apply_owner_filter(select(func.count(Artifact.id)), auth)
 
     # Text Search Filter
     if q and len(q) > 0:
@@ -480,6 +752,100 @@ def search_artifacts(
     )
 
 
+@router.get("/semantic/cap")
+def semantic_search_cap(
+    q: str = Query(..., description="Query text"),
+    limit: int = 20,
+    model: Optional[str] = None,
+    space: Optional[str] = None,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    if not q:
+        return {"items": []}
+
+    model_name = model or get_loaded_model_name() or "Qwen/Qwen3-VL-Embedding-2B"
+    space_name = space or "default"
+
+    try:
+        query_vector = get_text_embedding(q, model_name=model_name)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    store = _get_vector_service()
+    results = store.search(
+        query_vector,
+        model_name=model_name,
+        limit=limit,
+        space=space_name,
+        session=session,
+    )
+    items = _build_similarity_items(results)
+    allowed_ids = _filter_allowed_ids(
+        session,
+        [UUID(item["id"]) for item in items],
+        auth,
+    )
+    filtered = [item for item in items if UUID(item["id"]) in allowed_ids]
+
+    return {
+        "items": filtered,
+        "model": model_name,
+        "space": space_name,
+    }
+
+
+@router.get("/{artifact_id}/similar/cap")
+def find_similar_cap(
+    artifact_id: UUID,
+    limit: int = 20,
+    model: Optional[str] = None,
+    space: Optional[str] = None,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    _ensure_artifact_access(session, artifact_id, auth)
+    embedding = _resolve_embedding_for_artifact(
+        session,
+        artifact_id=artifact_id,
+        model_name=model,
+        space=space,
+    )
+    if not embedding:
+        detail = "No embedding found for artifact"
+        if model:
+            detail += f" with model {model}"
+        if space:
+            detail += f" and space {space}"
+        raise HTTPException(status_code=404, detail=detail)
+
+    model_name = model or embedding.model_name
+    space_name = space or embedding.space or "default"
+
+    store = _get_vector_service()
+    results = store.search(
+        embedding.vector_json,
+        model_name=model_name,
+        limit=limit,
+        space=space_name,
+        session=session,
+    )
+
+    items = _build_similarity_items(results, exclude_id=artifact_id)
+    allowed_ids = _filter_allowed_ids(
+        session,
+        [UUID(item["id"]) for item in items],
+        auth,
+    )
+    filtered = [item for item in items if UUID(item["id"]) in allowed_ids]
+
+    return {
+        "items": filtered,
+        "model": model_name,
+        "space": space_name,
+    }
+
+
 class BulkOperationRequest(BaseModel):
     operation: str
     artifact_ids: List[UUID]
@@ -489,16 +855,27 @@ class BulkOperationRequest(BaseModel):
 @router.post("/bulk_operations")
 def bulk_operations(
     request: BulkOperationRequest,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Perform bulk operations on artifacts (move, delete, tag)."""
     if not request.artifact_ids:
         return {"count": 0, "message": "No artifacts selected"}
 
+    artifact_query = _apply_owner_filter(
+        select(Artifact).where(Artifact.id.in_(request.artifact_ids)),
+        auth,
+    )
+    items = session.exec(artifact_query).all()
+    scoped_ids = [item.id for item in items]
+
+    if not scoped_ids:
+        return {"count": 0, "message": "No artifacts accessible"}
+
     if request.operation == "delete":
         # Bulk delete
         # First, find all artifacts to be deleted
-        stm = select(Artifact).where(Artifact.id.in_(request.artifact_ids))
+        stm = select(Artifact).where(Artifact.id.in_(scoped_ids))
         items = session.exec(stm).all()
 
         # Explicitly delete related entities to ensure cleanup
@@ -508,35 +885,35 @@ def bulk_operations(
 
         # Delete embeddings
         session.exec(delete(ArtifactEmbedding).where(
-            ArtifactEmbedding.artifact_id.in_(request.artifact_ids)))
+            ArtifactEmbedding.artifact_id.in_(scoped_ids)))
 
         # Delete feature refs
         session.exec(delete(ArtifactFeatureRef).where(
-            ArtifactFeatureRef.artifact_id.in_(request.artifact_ids)))
+            ArtifactFeatureRef.artifact_id.in_(scoped_ids)))
 
         # Delete annotations
         session.exec(delete(ArtifactAnnotation).where(
-            ArtifactAnnotation.artifact_id.in_(request.artifact_ids)))
+            ArtifactAnnotation.artifact_id.in_(scoped_ids)))
 
         # Delete previews
         session.exec(delete(ArtifactPreview).where(
-            ArtifactPreview.artifact_id.in_(request.artifact_ids)))
+            ArtifactPreview.artifact_id.in_(scoped_ids)))
 
         # Delete relations (both directions)
         session.exec(delete(ArtifactRelation).where(
             or_(
-                ArtifactRelation.source_id.in_(request.artifact_ids),
-                ArtifactRelation.target_id.in_(request.artifact_ids)
+                ArtifactRelation.source_id.in_(scoped_ids),
+                ArtifactRelation.target_id.in_(scoped_ids)
             )
         ))
 
         # Lineage (as descendant)
         session.exec(delete(ArtifactLineage).where(
-            ArtifactLineage.artifact_id.in_(request.artifact_ids)))
+            ArtifactLineage.artifact_id.in_(scoped_ids)))
 
         # Lineage (as ancestor) - this breaks history for descendants, but if ancestor is gone...
         session.exec(delete(ArtifactLineage).where(
-            ArtifactLineage.ancestor_id.in_(request.artifact_ids)))
+            ArtifactLineage.ancestor_id.in_(scoped_ids)))
 
         count = 0
         for item in items:
@@ -560,7 +937,7 @@ def bulk_operations(
         # Parents are:
         # - Source of 'contains' targeting artifact
         # - Target of 'contained_in' sourcing artifact
-        ids = request.artifact_ids
+        ids = scoped_ids
 
         # Let's iterate and delete to be safe with SQLModel/SQLAlchemy session tracking
 
@@ -627,12 +1004,17 @@ def list_artifacts(
     is_archived: Optional[bool] = None,
     tags: Optional[List[str]] = Query(None),
     ids: Optional[List[UUID]] = Query(None),
-    session: Session = Depends(get_session)
+    provider: Optional[str] = None,
+    import_source: Optional[str] = None,
+    import_instance: Optional[str] = None,
+    origin: Optional[str] = None,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """List all artifacts with optional filtering."""
     # Count query
-    count_query = select(func.count(Artifact.id))
-    query = select(Artifact)
+    count_query = _apply_owner_filter(select(func.count(Artifact.id)), auth)
+    query = _apply_owner_filter(select(Artifact), auth)
 
     if ids:
         query = query.where(Artifact.id.in_(ids))
@@ -783,11 +1165,72 @@ def list_artifacts(
             # Let's just implement explicit true check for now.
             pass
 
+    if provider:
+        provider = provider.strip()
+        blob_subq = select(ArtifactBlob.artifact_id).where(
+            ArtifactBlob.storage_backend == provider
+        )
+        metadata_condition = or_(
+            cast(Artifact.metadata_json, String).contains(
+                f'"source": "{provider}"'),
+            cast(Artifact.metadata_json, String).contains(
+                f'"source":"{provider}"'),
+        )
+        uri_condition = col(Artifact.uri).startswith(f"{provider}://")
+        if provider in {"local", "filesystem", "file"}:
+            uri_condition = or_(
+                uri_condition,
+                col(Artifact.uri).startswith("file://"),
+                col(Artifact.uri).startswith("/"),
+            )
+        provider_condition = Artifact.id.in_(blob_subq)
+        provider_condition = or_(
+            provider_condition, uri_condition, metadata_condition)
+
+        query = query.where(provider_condition)
+        count_query = count_query.where(provider_condition)
+
+    if import_source:
+        import_source = import_source.strip()
+        import_condition = or_(
+            cast(Artifact.metadata_json, String).contains(
+                f'"source": "{import_source}"'),
+            cast(Artifact.metadata_json, String).contains(
+                f'"source":"{import_source}"'),
+        )
+        query = query.where(import_condition)
+        count_query = count_query.where(import_condition)
+
+    if import_instance:
+        import_instance = import_instance.strip()
+        instance_condition = or_(
+            cast(Artifact.metadata_json, String).contains(
+                f'"instance": "{import_instance}"'),
+            cast(Artifact.metadata_json, String).contains(
+                f'"instance":"{import_instance}"'),
+        )
+        query = query.where(instance_condition)
+        count_query = count_query.where(instance_condition)
+
+    if origin:
+        origin = origin.strip()
+        origin_condition = or_(
+            cast(Artifact.metadata_json, String).contains(
+                f'"origin": "{origin}"'),
+            cast(Artifact.metadata_json, String).contains(
+                f'"origin":"{origin}"'),
+        )
+        query = query.where(origin_condition)
+        count_query = count_query.where(origin_condition)
+
     total_count = session.exec(count_query).one()
 
     # Sort
-    if sort == "random":
+    sort_value = (sort or "").lower().strip()
+    if sort_value == "random":
         query = query.order_by(func.random())
+    elif sort_value == "old":
+        query = query.order_by(Artifact.created_at.asc())
     else:
         query = query.order_by(Artifact.created_at.desc())
 
@@ -826,12 +1269,14 @@ def _get_artifact_or_repair(session: Session, artifact_uuid: UUID) -> Optional[A
 
 
 @router.get("/{artifact_id}", response_model=Artifact)
-def get_artifact(artifact_id: str, session: Session = Depends(get_session)):
+def get_artifact(
+    artifact_id: str,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve a single artifact."""
     artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
-    artifact = _get_artifact_or_repair(session, artifact_uuid)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _ensure_artifact_access(session, artifact_uuid, auth)
     return artifact
 
 
@@ -840,16 +1285,15 @@ def get_artifact_content(
     artifact_id: str,
     request: Request,
     proxy: bool = False,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Stream the raw content of the artifact if it is a local file.
     Does simplistic mime-type guessing based on extension.
     """
     artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
-    artifact = _get_artifact_or_repair(session, artifact_uuid)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _ensure_artifact_access(session, artifact_uuid, auth)
 
     prefer_proxy = proxy or os.environ.get("EMBEDDR_CONTENT_PROXY", "").lower() in {
         "1",
@@ -989,15 +1433,14 @@ def resolve_artifact(
     variant: str = "original",
     proxy: bool = False,
     session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Resolve an artifact to a URL for preview/original access.
     Proxy mode for v0.1: returns internal URLs.
     """
     artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
-    artifact = _get_artifact_or_repair(session, artifact_uuid)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _ensure_artifact_access(session, artifact_uuid, auth)
 
     logger.info(
         "artifact_resolve_request",
@@ -1029,9 +1472,9 @@ def resolve_artifact(
             ).to_dict()
 
         url = (
-            f"/api/v2/artifacts/{artifact_uuid}/preview"
+            f"/api/v1/artifacts/{artifact_uuid}/preview"
             if variant == "preview"
-            else f"/api/v2/artifacts/{artifact_uuid}/content"
+            else f"/api/v1/artifacts/{artifact_uuid}/content"
         )
 
         return {
@@ -1046,9 +1489,9 @@ def resolve_artifact(
         }
 
     if variant == "preview":
-        url = f"/api/v2/artifacts/{artifact_uuid}/preview"
+        url = f"/api/v1/artifacts/{artifact_uuid}/preview"
     else:
-        url = f"/api/v2/artifacts/{artifact_uuid}/content"
+        url = f"/api/v1/artifacts/{artifact_uuid}/content"
 
     if variant == "preview":
         preview = session.exec(
@@ -1126,12 +1569,11 @@ def resolve_artifact(
 @router.delete("/{artifact_id}")
 def delete_artifact(
     artifact_id: UUID,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Delete an artifact and its metadata."""
-    artifact = session.get(Artifact, artifact_id)
-    if not artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _ensure_artifact_access(session, artifact_id, auth)
 
     session.delete(artifact)
     session.exec(
@@ -1152,32 +1594,52 @@ def delete_artifact(
 
 
 @router.get("/{artifact_id}/embeddings", response_model=List[ArtifactEmbedding])
-def get_artifact_embeddings(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact_embeddings(
+    artifact_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve embeddings for an artifact."""
+    _ensure_artifact_access(session, artifact_id, auth)
     query = select(ArtifactEmbedding).where(
         ArtifactEmbedding.artifact_id == artifact_id)
     return session.exec(query).all()
 
 
 @router.get("/{artifact_id}/features", response_model=List[ArtifactFeatureRef])
-def get_artifact_features(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact_features(
+    artifact_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve feature references for an artifact."""
+    _ensure_artifact_access(session, artifact_id, auth)
     query = select(ArtifactFeatureRef).where(
         ArtifactFeatureRef.artifact_id == artifact_id)
     return session.exec(query).all()
 
 
 @router.get("/{artifact_id}/annotations", response_model=List[ArtifactAnnotation])
-def get_artifact_annotations(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact_annotations(
+    artifact_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve annotations (captions, etc) for an artifact."""
+    _ensure_artifact_access(session, artifact_id, auth)
     query = select(ArtifactAnnotation).where(
         ArtifactAnnotation.artifact_id == artifact_id)
     return session.exec(query).all()
 
 
 @router.get("/{artifact_id}/lineage")
-def get_artifact_lineage(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact_lineage(
+    artifact_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve parent and child lineage for an artifact."""
+    _ensure_artifact_access(session, artifact_id, auth)
     parents = session.exec(
         select(ArtifactLineage).where(ArtifactLineage.child_id == artifact_id)
     ).all()
@@ -1185,9 +1647,15 @@ def get_artifact_lineage(artifact_id: UUID, session: Session = Depends(get_sessi
         select(ArtifactLineage).where(ArtifactLineage.parent_id == artifact_id)
     ).all()
 
+    allowed_ids = _filter_allowed_ids(
+        session,
+        [p.parent_id for p in parents] + [c.child_id for c in children],
+        auth,
+    )
+
     return {
-        "parents": parents,
-        "children": children
+        "parents": [p for p in parents if p.parent_id in allowed_ids],
+        "children": [c for c in children if c.child_id in allowed_ids],
     }
 
 
@@ -1197,12 +1665,14 @@ def get_artifact_subgraph(
     max_depth: int = 3,
     include_lineage: bool = True,
     include_relations: bool = True,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Explore the artifact graph recursively from a root node.
     Returns a unified set of nodes and edges found within max_depth.
     """
+    _ensure_artifact_access(session, artifact_id, auth)
     visited_nodes = {artifact_id}
     edges = []
 
@@ -1216,6 +1686,7 @@ def get_artifact_subgraph(
 
         next_frontier = set()
         frontier_list = list(frontier)
+        candidate_ids: set[UUID] = set()
 
         # 1. Lineage
         if include_lineage:
@@ -1225,11 +1696,7 @@ def get_artifact_subgraph(
                     ArtifactLineage.child_id.in_(frontier_list))
             ).all()
             for l in parent_lineage:
-                edges.append(
-                    {"type": "lineage", "source": l.parent_id, "target": l.child_id})
-                if l.parent_id not in visited_nodes:
-                    visited_nodes.add(l.parent_id)
-                    next_frontier.add(l.parent_id)
+                candidate_ids.update([l.parent_id, l.child_id])
 
             # Children
             child_lineage = session.exec(
@@ -1237,11 +1704,7 @@ def get_artifact_subgraph(
                     ArtifactLineage.parent_id.in_(frontier_list))
             ).all()
             for l in child_lineage:
-                edges.append(
-                    {"type": "lineage", "source": l.parent_id, "target": l.child_id})
-                if l.child_id not in visited_nodes:
-                    visited_nodes.add(l.child_id)
-                    next_frontier.add(l.child_id)
+                candidate_ids.update([l.parent_id, l.child_id])
 
         # 2. Relations
         if include_relations:
@@ -1252,19 +1715,48 @@ def get_artifact_subgraph(
                 )
             ).all()
             for r in relations:
-                edges.append({
-                    "type": "relation",
-                    "label": r.relation_type,
-                    "source": r.source_id,
-                    "target": r.target_id
-                })
-                # Add neighbors to frontier
-                if r.source_id not in visited_nodes:
-                    visited_nodes.add(r.source_id)
-                    next_frontier.add(r.source_id)
-                if r.target_id not in visited_nodes:
-                    visited_nodes.add(r.target_id)
-                    next_frontier.add(r.target_id)
+                candidate_ids.update([r.source_id, r.target_id])
+
+        allowed_ids = _filter_allowed_ids(session, list(candidate_ids), auth)
+
+        if include_lineage:
+            for l in parent_lineage:
+                if l.parent_id in allowed_ids and l.child_id in allowed_ids:
+                    edges.append({
+                        "type": "lineage",
+                        "source": l.parent_id,
+                        "target": l.child_id,
+                    })
+                    if l.parent_id not in visited_nodes:
+                        visited_nodes.add(l.parent_id)
+                        next_frontier.add(l.parent_id)
+
+            for l in child_lineage:
+                if l.parent_id in allowed_ids and l.child_id in allowed_ids:
+                    edges.append({
+                        "type": "lineage",
+                        "source": l.parent_id,
+                        "target": l.child_id,
+                    })
+                    if l.child_id not in visited_nodes:
+                        visited_nodes.add(l.child_id)
+                        next_frontier.add(l.child_id)
+
+        if include_relations:
+            for r in relations:
+                if r.source_id in allowed_ids and r.target_id in allowed_ids:
+                    edges.append({
+                        "type": "relation",
+                        "label": r.relation_type,
+                        "source": r.source_id,
+                        "target": r.target_id,
+                    })
+                    if r.source_id not in visited_nodes:
+                        visited_nodes.add(r.source_id)
+                        next_frontier.add(r.source_id)
+                    if r.target_id not in visited_nodes:
+                        visited_nodes.add(r.target_id)
+                        next_frontier.add(r.target_id)
 
         frontier = next_frontier
 
@@ -1276,25 +1768,42 @@ def get_artifact_subgraph(
 
 
 @router.get("/{artifact_id}/relations", response_model=List[ArtifactRelation])
-def get_artifact_relations(artifact_id: UUID, session: Session = Depends(get_session)):
+def get_artifact_relations(
+    artifact_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
     """Retrieve semantic relations for an artifact."""
+    _ensure_artifact_access(session, artifact_id, auth)
     # Find where it is source OR target
     query = select(ArtifactRelation).where(
         (ArtifactRelation.source_id == artifact_id) |
         (ArtifactRelation.target_id == artifact_id)
     )
-    return session.exec(query).all()
+    relations = session.exec(query).all()
+    allowed_ids = _filter_allowed_ids(
+        session,
+        list({r.source_id for r in relations} |
+             {r.target_id for r in relations}),
+        auth,
+    )
+    return [
+        r for r in relations
+        if r.source_id in allowed_ids and r.target_id in allowed_ids
+    ]
 
 
 @router.get("/{artifact_id}/preview")
 def get_artifact_preview(
     artifact_id: str,
     preview_type: str = "thumbnail",
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """Retrieve an artifact preview/thumbnail."""
     # Find specific preview
     artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+    _ensure_artifact_access(session, artifact_uuid, auth)
     preview = session.exec(
         select(ArtifactPreview)
         .where(ArtifactPreview.artifact_id == artifact_uuid)

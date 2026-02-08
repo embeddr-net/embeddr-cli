@@ -80,21 +80,6 @@ def lotus_prepare_inputs(
             scope_id=None,
             config_id=config_id,
         )
-        if (not cfg) and config_id:
-            fallback_cfg = resolve_plugin_config(
-                session=session,
-                plugin_name=str(plugin_name),
-                scope="global",
-                scope_id=None,
-                config_id=None,
-            )
-            if isinstance(fallback_cfg, dict) and fallback_cfg:
-                cfg = fallback_cfg
-                logger.info(
-                    "[Lotus] Loaded legacy/default config for %s (config_id=%s)",
-                    plugin_name,
-                    config_id,
-                )
         if isinstance(cfg, dict) and cfg:
             # cfg provides defaults, caller overrides
             merged = {**cfg, **merged}

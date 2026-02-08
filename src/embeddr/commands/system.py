@@ -26,7 +26,7 @@ def status(
         port = os.environ.get("EMBEDDR_PORT", "8003")
         try:
             resp = requests.get(
-                f"http://{host}:{port}/api/v2/system/resources", timeout=2)
+                f"http://{host}:{port}/api/v1/system/resources", timeout=2)
             if resp.ok:
                 data = resp.json()
                 resources = data.get("resources", [])
@@ -87,7 +87,7 @@ def unload(resource_id: str):
     port = os.environ.get("EMBEDDR_PORT", "8003")
     try:
         resp = requests.post(
-            f"http://{host}:{port}/api/v2/system/resources/unload?resource_id={resource_id}", timeout=5)
+            f"http://{host}:{port}/api/v1/system/resources/unload?resource_id={resource_id}", timeout=5)
         if resp.ok:
             console.print(
                 f"[green]Successfully requested unload for {resource_id}[/green]")
@@ -107,7 +107,7 @@ def unload_all():
     port = os.environ.get("EMBEDDR_PORT", "8003")
     try:
         resp = requests.post(
-            f"http://{host}:{port}/api/v2/system/resources/unload_all", timeout=5)
+            f"http://{host}:{port}/api/v1/system/resources/unload_all", timeout=5)
         if resp.ok:
             console.print(
                 "[green]Successfully requested unload for all resources[/green]")

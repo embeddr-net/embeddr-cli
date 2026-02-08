@@ -16,11 +16,13 @@ from rich.table import Table
 from embeddr.core.config import refresh_settings
 from embeddr.core.project import CONFIG_FILENAME, create_default_config
 from embeddr.db.session import get_engine, run_migrations
+from embeddr.services import auth_service
+from sqlmodel import Session
 
 
 DEFAULT_DIST_PLUGINS_DIR = (
     Path(__file__).resolve().parents[4] /
-    "embeddr-sdk" / "workspace" / ".sdk" / "dist"
+    "embeddr-plugins" / "dist"
 )
 
 # Pack Definitions - Easy to edit hardcoded packs
@@ -37,6 +39,16 @@ PACK_DEFINITIONS = {
             "embeddr-inspect",
         ],
     },
+    "creative": {
+        "name": "Creative (ComfyUI)",
+        "description": "Includes Standard plus ComfyUI integration and basic image tooling.",
+        "includes": ["standard"],
+        "plugins": [
+            "embeddr-comfyui",
+            "embeddr-editor-image",
+            "embeddr-page-gallery",
+        ],
+    },
     "data-science": {
         "name": "Data Science Pack",
         "description": "Includes standard tools plus UMAP visualization and dataset management.",
@@ -50,7 +62,10 @@ PACK_DEFINITIONS = {
     "minimal": {
         "name": "Minimal Core",
         "description": "Just the bare essentials. Good for building custom pipelines from scratch.",
-        "plugins": ["embeddr-core"],
+        "plugins": [
+            "embeddr-core",
+            "embeddr-storage-local",
+        ],
     },
 }
 
@@ -138,6 +153,17 @@ def _prompt_database_config() -> tuple[str, Optional[str]]:
         database_url = url_input or None
 
     return provider, database_url
+
+
+def _prompt_auth_mode() -> str:
+    return _prompt_select(
+        "Authentication mode",
+        choices=[
+            "open",
+            "single",
+            "multi",
+        ],
+    )
 
 
 def _check_database_driver(provider: str) -> bool:
@@ -295,6 +321,34 @@ def _prompt_plugin_pack() -> tuple[str, list[str]]:
     return "unknown", []
 
 
+def _maybe_warn_comfyui(plugin_names: list[str]) -> list[str]:
+    if "embeddr-comfyui" not in plugin_names:
+        return plugin_names
+
+    CONSOLE.print(
+        Panel.fit(
+            "[bold yellow]ComfyUI setup required[/bold yellow]\n"
+            "- Install and run ComfyUI separately.\n"
+            "- Configure the ComfyUI endpoint/API key in Embeddr.\n"
+            "- Install the Embeddr ComfyUI nodepack for required nodes.\n"
+            "See docs: https://docs.embeddr.net",
+            box=box.ROUNDED,
+            style="yellow",
+        )
+    )
+
+    proceed = _prompt_confirm("Continue with the ComfyUI plugin selected?")
+    if proceed:
+        return plugin_names
+
+    filtered = [name for name in plugin_names if name != "embeddr-comfyui"]
+    typer.secho(
+        "Removed embeddr-comfyui from the selection.",
+        fg=typer.colors.YELLOW,
+    )
+    return filtered
+
+
 def _get_dist_plugins_dir() -> Path:
     env_value = os.environ.get("EMBEDDR_PLUGINS_DIST_DIR")
     if env_value:
@@ -350,6 +404,14 @@ def run_init_wizard(
         ".embeddr/plugins",
     )
     provider, database_url = _prompt_database_config()
+    auth_mode = _prompt_auth_mode()
+    operator_name: Optional[str] = None
+    admin_username: Optional[str] = None
+    if auth_mode != "open":
+        default_operator = "local" if auth_mode == "single" else "server-admin"
+        default_admin = "local" if auth_mode == "single" else "admin"
+        operator_name = _prompt_text("Operator name", default=default_operator)
+        admin_username = _prompt_text("Admin username", default=default_admin)
     if not _check_database_driver(provider):
         CONSOLE.print(
             Panel.fit(
@@ -366,6 +428,7 @@ def run_init_wizard(
         )
         return
     pack_id, plugin_names = _prompt_plugin_pack()
+    plugin_names = _maybe_warn_comfyui(plugin_names)
 
     resolved_data_dir = _resolve_path(path, data_dir_input)
     resolved_plugins_dir = _resolve_path(path, plugins_dir_input)
@@ -389,6 +452,10 @@ def run_init_wizard(
     summary.add_row("DB provider", provider)
     summary.add_row("DB URL", database_url or "(none)")
     summary.add_row("Plugin pack", pack_display)
+    summary.add_row("Auth mode", auth_mode)
+    if auth_mode != "open":
+        summary.add_row("Operator", operator_name or "")
+        summary.add_row("Admin user", admin_username or "")
 
     if plugin_names:
         summary.add_row("Plugins", ", ".join(plugin_names))
@@ -417,6 +484,7 @@ def run_init_wizard(
         database_url,
         data_dir_input,
         plugins_dir_input,
+        auth_mode,
     )
     typer.secho(
         f"Initialized Embeddr project at {path}", fg=typer.colors.GREEN)
@@ -429,6 +497,7 @@ def run_init_wizard(
     os.environ["EMBEDDR_DB_PROVIDER"] = provider
     if database_url:
         os.environ["DATABASE_URL"] = database_url
+    os.environ["EMBEDDR_AUTH_MODE"] = auth_mode
     refresh_settings()
     get_engine.cache_clear()
 
@@ -443,6 +512,33 @@ def run_init_wizard(
                 if reset_db:
                     db_path.unlink()
         run_migrations()
+
+    if auth_mode != "open" and operator_name and admin_username:
+        admin_username_value = None
+        raw_key_value = None
+        with Session(get_engine()) as session:
+            result = auth_service.bootstrap_operator_flow(
+                session,
+                mode=auth_mode,
+                operator_name=operator_name,
+                admin_username=admin_username,
+            )
+            if result:
+                user, api_key, raw_key = result
+                admin_username_value = user.username
+                raw_key_value = raw_key
+        if admin_username_value and raw_key_value:
+            CONSOLE.print(
+                Panel.fit(
+                    "[bold green]Bootstrap complete[/bold green]\n"
+                    f"Operator: {operator_name}\n"
+                    f"Admin user: {admin_username_value}\n"
+                    f"Client Key: {raw_key_value}\n"
+                    "Store this key securely. It will not be shown again.",
+                    box=box.ROUNDED,
+                    style="green",
+                )
+            )
 
     if plugin_names:
         _install_plugins_from_dist(resolved_plugins_dir, plugin_names)

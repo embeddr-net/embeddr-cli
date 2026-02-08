@@ -11,8 +11,8 @@ class DequeHandler(logging.Handler):
         if record.name == "uvicorn.access":
             return
 
-        # Filter out docket and mcp logs
-        if record.name.startswith("docket") or record.name.startswith("mcp"):
+        # Filter out docket logs
+        if record.name.startswith("docket"):
             return
 
         log_entry = self.format(record)
@@ -50,8 +50,6 @@ def setup_logging(verbose: bool | None = None):
         logging.INFO if verbose else logging.WARNING)
 
     logging.getLogger("docket").setLevel(logging.WARNING)
-    logging.getLogger("mcp").setLevel(
-        logging.WARNING if not verbose else logging.INFO)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
     setup_log_capture()

@@ -39,6 +39,7 @@ def create_default_config(
     database_url: str | None = None,
     data_dir: str | None = None,
     plugins_dir: str | None = None,
+    auth_mode: str | None = None,
 ):
     """
     Create a default embeddr.toml file.
@@ -60,6 +61,11 @@ def create_default_config(
     else:
         plugins_dir_line = "# plugins_dir = \".embeddr/plugins\""
 
+    if auth_mode:
+        auth_mode_line = f"mode = \"{auth_mode}\""
+    else:
+        auth_mode_line = "# mode = \"open\"  # open | single | multi | db"
+
     config_content = f"""[project]
 name = "{name}"
 description = "Embeddr project configuration"
@@ -80,6 +86,9 @@ port = 8003
 [paths]
 {data_dir_line}
 {plugins_dir_line}
+
+[auth]
+{auth_mode_line}
 """
     with open(root_path / CONFIG_FILENAME, "w") as f:
         f.write(config_content)

@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from embeddr.api.v2.collections import router as collections_router_v2
 from embeddr.api.v2.config import router as config_router_v2
+from embeddr.api.v2.plugins import router as plugins_router_v2
 
 router = APIRouter()
 
@@ -26,5 +27,5 @@ router.include_router(collections_router_v2,
 
 # Potentially safe?
 # router.include_router(comfy.router, prefix="/comfy", tags=["comfy"])
-# router.include_router(plugins.router, prefix="/plugins", tags=["plugins"])
+router.include_router(plugins_router_v2, prefix="/plugins", tags=["plugins"])
 # router.include_router(ws.router, tags=["websocket"])

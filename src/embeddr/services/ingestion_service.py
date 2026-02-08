@@ -112,124 +112,144 @@ class IngestionService:
 
         try:
             with Session(self.engine) as session:
-                # 1. Identify all URIs
-                item_uris = {x.get('uri') for x in items if x.get('uri')}
-                relation_uris = set()
+                # 1. Pre-calculate IDs for all items to safely check existence
+                uri_to_uuid = {}
+                for item in items:
+                    u = item.get('uri')
+                    if not u:
+                        continue
 
+                    if item.get('id'):
+                        try:
+                            uid = UUID(str(item.get('id')))
+                        except:
+                            uid = uuid5(NAMESPACE_URL, u)
+                    else:
+                        uid = uuid5(NAMESPACE_URL, u)
+
+                    uri_to_uuid[u] = uid
+
+                # Also collect target URIs for relations
+                relation_target_uris = set()
                 for item in items:
                     for rel in item.get('relations', []):
                         if rel.get('target_uri'):
-                            relation_uris.add(rel['target_uri'])
+                            relation_target_uris.add(rel['target_uri'])
 
-                all_uris = item_uris | relation_uris
+                # 2. Check which IDs already exist in DB
+                all_ids = list(uri_to_uuid.values())
+                existing_ids = set()
+                if all_ids:
+                    id_chunks = [all_ids[i:i + 100]
+                                 for i in range(0, len(all_ids), 100)]
+                    for chunk in id_chunks:
+                        # Only select IDs that exist
+                        found = session.exec(select(Artifact.id).where(
+                            Artifact.id.in_(chunk))).all()
+                        existing_ids.update(found)
 
-                # 2. Resolve existing UUIDs
-                # Map URI -> UUID Object
-                uri_to_id = {}
-                if all_uris:
-                    # Batch fetch existing
-                    chunks = [list(all_uris)[i:i + 100]
-                              for i in range(0, len(all_uris), 100)]
+                # 3. Resolve existing relation targets (by URI or just assume they might not exist yet?)
+                # Actually, we need to map relation target URIs to IDs too.
+                # If they are NOT in the items list, we need to fetch them or generate IDs.
+                # For simplicity, let's treat relation targets same as items loop logic:
+                # But we might need to lookup their IDs from DB if they exist.
+
+                # Let's do a loose check for target URIs in DB to get their IDs
+                if relation_target_uris:
+                    chunks = [list(relation_target_uris)[i:i + 100]
+                              for i in range(0, len(relation_target_uris), 100)]
                     for chunk in chunks:
-                        statement = select(Artifact.uri, Artifact.id).where(
-                            Artifact.uri.in_(chunk))
-                        results = session.exec(statement).all()
-                        for u, i in results:
-                            # Verify i is UUID object
-                            if isinstance(i, str):
-                                uri_to_id[u] = UUID(i)
-                            else:
-                                uri_to_id[u] = i
+                        res = session.exec(select(Artifact.uri, Artifact.id).where(
+                            Artifact.uri.in_(chunk))).all()
+                        for u, i in res:
+                            if u not in uri_to_uuid:
+                                uri_to_uuid[u] = i if isinstance(
+                                    i, UUID) else UUID(str(i))
 
                 to_insert_artifacts = []
-                # 3. Process Artifacts
+                processed_uris = set()
+
+                # 4. Process Artifacts to Insert
                 for item in items:
                     uri = item.get('uri')
                     if not uri:
                         continue
 
-                    # Deterministic ID generation if not exists
-                    if uri not in uri_to_id:
-                        # Check if scraper sent an ID
-                        provided_id = item.get('id')
-                        new_id_obj = None
+                    if uri in processed_uris:
+                        continue  # Dedup batch
 
-                        if provided_id:
-                            try:
-                                new_id_obj = UUID(str(provided_id))
-                            except ValueError:
-                                logger.warning(
-                                    f"Invalid UUID provided for {uri}: {provided_id}. Genererating new.")
+                    uid = uri_to_uuid.get(uri)
+                    if not uid:
+                        # Should be impossible given step 1, but safe fallback
+                        uid = uuid5(NAMESPACE_URL, uri)
+                        uri_to_uuid[uri] = uid
 
-                        if not new_id_obj:
-                            new_id_obj = uuid5(NAMESPACE_URL, uri)
-
-                        uri_to_id[uri] = new_id_obj
-
-                        # Check if we already staged this artifact in this batch
-                        if any(art.uri == uri for art in to_insert_artifacts):
-                            continue  # Already added in this batch
-
+                    # If ID not in existing_ids, we insert
+                    if uid not in existing_ids:
                         art = Artifact(
-                            id=new_id_obj,
+                            id=uid,
                             type_name=item.get('type_name', 'artifact'),
                             base_type_name=item.get(
                                 'base_type_name', 'artifact'),
                             uri=uri,
                             metadata_json=item.get('metadata_json', {}),
                             override_capabilities=item.get(
-                                'override_capabilities', [])
+                                'override_capabilities', []),
+                            owner_user_id=item.get('owner_user_id'),
+                            owner_operator_id=item.get('owner_operator_id'),
                         )
-                        # DEBUG: Verify ID type
-                        if not isinstance(art.id, UUID):
-                            logger.warning(
-                                f"Artifact ID became {type(art.id)}: {art.id}. Forcing UUID.")
-                            try:
-                                art.id = UUID(str(art.id))
-                            except Exception as e:
-                                logger.error(f"Failed to force UUID: {e}")
-
                         to_insert_artifacts.append(art)
+                        existing_ids.add(uid)  # Mark processed
 
-                # 4. Insert Artifacts
+                    processed_uris.add(uri)
+
+                # 5. Insert Artifacts
                 if to_insert_artifacts:
                     for obj in to_insert_artifacts:
                         session.add(obj)
                     session.flush()
 
-                # 5. Process Relations
+                # 6. Process Relations
                 to_insert_relations = []
                 for item in items:
                     source_uri = item.get('uri')
-                    if not source_uri or source_uri not in uri_to_id:
+                    if not source_uri or source_uri not in uri_to_uuid:
                         continue
 
-                    source_id = uri_to_id[source_uri]
+                    source_id = uri_to_uuid[source_uri]
 
                     for rel in item.get('relations', []):
                         target_uri = rel.get('target_uri')
                         if not target_uri:
                             continue
 
-                        if target_uri in uri_to_id:
-                            target_id = uri_to_id[target_uri]
+                        # We need an ID for target.
+                        target_id = uri_to_uuid.get(target_uri)
+                        if not target_id:
+                            # Generate if missing (Relation to external/unseen artifact)
+                            target_id = uuid5(NAMESPACE_URL, target_uri)
+                            # Note: If this target artifact doesn't exist, relation might fail FK?
+                            # ArtifactRelation typically requires foreign key to Artifact.
+                            # If we haven't inserted the target, this will fail.
+                            # So we should only add relations where target is known/inserted.
+                            continue
 
-                            rel_type = rel.get('relation_type', 'contains')
+                        rel_type = rel.get('relation_type', 'contains')
 
-                            exists = session.exec(select(ArtifactRelation).where(
-                                ArtifactRelation.source_id == source_id,
-                                ArtifactRelation.target_id == target_id,
-                                ArtifactRelation.relation_type == rel_type
-                            )).first()
+                        exists = session.exec(select(ArtifactRelation).where(
+                            ArtifactRelation.source_id == source_id,
+                            ArtifactRelation.target_id == target_id,
+                            ArtifactRelation.relation_type == rel_type
+                        )).first()
 
-                            if not exists:
-                                new_rel = ArtifactRelation(
-                                    source_id=source_id,
-                                    target_id=target_id,
-                                    relation_type=rel_type,
-                                    metadata_json=rel.get('metadata_json', {})
-                                )
-                                session.add(new_rel)
+                        if not exists:
+                            new_rel = ArtifactRelation(
+                                source_id=source_id,
+                                target_id=target_id,
+                                relation_type=rel_type,
+                                metadata_json=rel.get('metadata_json', {})
+                            )
+                            session.add(new_rel)
 
                 session.commit()
 

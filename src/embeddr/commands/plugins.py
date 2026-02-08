@@ -6,7 +6,14 @@ import re
 import importlib
 import importlib.util
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
+import json
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from importlib import metadata as importlib_metadata
 
 from embeddr.core.config import get_data_dir
@@ -113,6 +120,50 @@ def _get_plugin_search_paths(override: Optional[Path] = None) -> List[Path]:
     return paths
 
 
+def _get_plugins_dist_dir(override: Optional[Path] = None) -> Path:
+    if override:
+        return override
+
+    env_dir = os.environ.get("EMBEDDR_PLUGINS_DIST")
+    if env_dir:
+        return Path(env_dir)
+
+    repo_dist = Path(__file__).resolve(
+    ).parents[4] / "embeddr-plugins" / "dist"
+    return repo_dist
+
+
+def _build_dist_manifest(dist_dir: Path, base_url: str) -> Dict[str, Any]:
+    plugins: List[Dict[str, Any]] = []
+    if not dist_dir.exists():
+        return {"plugins": []}
+
+    for plugin_dir in sorted(dist_dir.iterdir()):
+        if not plugin_dir.is_dir():
+            continue
+        dist_path = plugin_dir / "dist"
+        if not dist_path.exists():
+            continue
+
+        bundle = None
+        for candidate in dist_path.glob("*.umd.js"):
+            bundle = candidate.name
+            break
+
+        if not bundle:
+            continue
+
+        plugins.append(
+            {
+                "id": plugin_dir.name,
+                "name": plugin_dir.name,
+                "bundle": f"{base_url}/plugins/{plugin_dir.name}/dist/{bundle}",
+            }
+        )
+
+    return {"plugins": plugins}
+
+
 @app.command("install-deps")
 def install_deps(
     plugin_name: str = typer.Argument(...,
@@ -139,6 +190,57 @@ def install_deps(
         for p in search_paths:
             typer.echo(f"  - {p}")
         raise typer.Exit(1)
+
+
+@app.command("serve")
+def serve_plugins(
+    dist_dir: Optional[Path] = typer.Option(
+        None,
+        "--dist-dir",
+        help="Path to built plugin dist directory (defaults to embeddr-plugins/dist)",
+    ),
+    host: str = typer.Option("127.0.0.1", help="Host to bind"),
+    port: int = typer.Option(8899, help="Port to bind"),
+    cors_origins: str = typer.Option(
+        "*",
+        help="Comma-separated CORS origins (use * for all)",
+    ),
+):
+    """Serve built plugin bundles and a manifest for public instances."""
+    dist_path = _get_plugins_dist_dir(dist_dir)
+
+    if not dist_path.exists():
+        typer.secho(
+            f"❌ Plugins dist directory not found: {dist_path}",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    app = FastAPI()
+    origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    allow_origins = origins if origins and origins != ["*"] else ["*"]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/plugins/index.json")
+    def plugins_index(request: Request):
+        base_url = str(request.base_url).rstrip("/")
+        return JSONResponse(_build_dist_manifest(dist_path, base_url))
+
+    app.mount("/plugins", StaticFiles(directory=dist_path), name="plugins")
+
+    typer.secho(
+        f"✅ Serving plugin bundles from {dist_path}", fg=typer.colors.GREEN
+    )
+    typer.echo(f"Manifest: http://{host}:{port}/plugins/index.json")
+
+    uvicorn.run(app, host=host, port=port)
 
     typer.secho(f"✅ Found plugin at: {plugin_path}", fg=typer.colors.GREEN)
 

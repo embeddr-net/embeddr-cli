@@ -39,6 +39,10 @@ class ScriptInfo(BaseModel):
     description: str = ""
 
 
+class ScriptRunRequest(BaseModel):
+    dryRun: bool = True
+
+
 # Define scripts directory (Standardized location)
 SCRIPTS_DIR = Path("/home/user/git/embeddr-net/embeddr-scripts/maintenance")
 
@@ -96,6 +100,12 @@ def run_script(script_name: str, dry_run: bool = True):
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Script execution failed: {str(e)}")
+
+
+@router.post("/scripts/{script_name}")
+def run_script_by_name(script_name: str, payload: ScriptRunRequest):
+    """Run a maintenance script by name (preferred route)."""
+    return run_script(script_name=script_name, dry_run=payload.dryRun)
 
 
 @router.get("/orphans", response_model=List[OrphanItem])

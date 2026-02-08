@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system, lotus
+from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system, lotus, manage, nelumbo
 
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
@@ -25,6 +25,8 @@ app.add_typer(inspect.app, name="inspect")
 app.add_typer(tui.app, name="tui")
 app.add_typer(system.app, name="system")
 app.add_typer(lotus.app, name="lotus")
+app.add_typer(manage.app, name="manage")
+app.add_typer(nelumbo.app, name="nelumbo")
 # app.add_typer(fixtures.app, name="fixtures") # Moved to Plugin
 
 
@@ -34,8 +36,12 @@ def _load_cli_plugins() -> None:
     is_serve = "serve" in sys.argv
     is_init = "init" in sys.argv or "init-v2" in sys.argv
     is_plugins_deps = "plugins" in sys.argv and "deps" in sys.argv
+    is_remote_lotus = "lotus" in sys.argv and "--local" not in sys.argv
+    is_manage = "manage" in sys.argv
+    skip_plugins = os.environ.get(
+        "EMBEDDR_SKIP_CLI_PLUGINS", "false").lower() == "true"
 
-    if is_serve or is_init or is_plugins_deps:
+    if is_serve or is_init or is_plugins_deps or is_remote_lotus or is_manage or skip_plugins:
         return
 
     allow_dev_plugins = os.environ.get(
@@ -64,16 +70,18 @@ def _load_cli_plugins() -> None:
     initialize_all_plugins()
     startup_all_plugins()
 
-    # START AUTOMATION MANAGER (Headless Mode)
+    # START JOB RUNTIME (Headless Mode)
     # When running CLI commands, we might trigger artifact creation
-    # so we should have the manager running if events fire.
+    # so we should have the runtime running if events fire.
     try:
-        from embeddr.services.automation_manager_v2 import automation_manager
+        from embeddr.services.job_runtime import runtime
+        from embeddr.core.event_bus import _EVENT_BUS
         import asyncio
 
-        asyncio.run(automation_manager.start())
+        asyncio.run(runtime.start())
+        _EVENT_BUS.subscribe("*", runtime.handle_event)
     except Exception as e:
-        print(f"Failed to start AutomationManager V2: {e}")
+        print(f"Failed to start JobRuntime: {e}")
 
 
 @app.command()

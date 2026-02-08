@@ -17,6 +17,15 @@ from embeddr_core.plugin_interface import EmbeddrEvent
 logger = logging.getLogger("embeddr.spine")
 
 
+class JobDeferred(Exception):
+    """Signal a job should pause and wait for external resumption."""
+
+    def __init__(self, message: str = "waiting", payload: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.message = message
+        self.payload = payload or {}
+
+
 def _redact_inputs(value: Dict[str, Any] | None) -> Dict[str, Any]:
     redacted: Dict[str, Any] = {}
     for k, v in (value or {}).items():
@@ -85,6 +94,34 @@ class DBJobContext:
             self.session.commit()
         except Exception:
             logger.debug("Failed to record execution log", exc_info=True)
+
+    def defer(self, message: str = "waiting", payload: Optional[Dict[str, Any]] = None) -> None:
+        """Mark job as waiting and yield control for external resume."""
+        raise JobDeferred(message=message, payload=payload)
+
+    def submit_child(
+        self,
+        *,
+        job_type: str,
+        inputs: Dict[str, Any],
+        plugin_name: str,
+        resource_class: str = "cpu",
+        priority: int = 0,
+        trigger: str = "runtime",
+        primary_artifact_id: Optional[UUID] = None,
+    ) -> ArtifactExecution:
+        """Submit a child execution linked to this job."""
+        return ExecutionSpine.submit_job(
+            job_type=job_type,
+            inputs=inputs,
+            plugin_name=plugin_name,
+            resource_class=resource_class,
+            priority=priority,
+            parent_execution_id=self.execution_id,
+            trigger=trigger,
+            primary_artifact_id=primary_artifact_id,
+            session=self.session,
+        )
 
     def is_cancelled(self) -> bool:
         self.session.refresh(self.execution)
@@ -245,7 +282,7 @@ class ExecutionSpine:
                 await asyncio.sleep(check_interval)
                 continue
 
-            if job.status in ["completed", "failed", "canceled"]:
+            if job.status in ["completed", "failed", "canceled", "waiting"]:
                 return job
 
             await asyncio.sleep(check_interval)
@@ -284,6 +321,51 @@ class ExecutionSpine:
                     session, job_type, inputs, plugin_name, resource_class,
                     priority, parent_execution_id, trigger, primary_artifact_id
                 )
+
+    @classmethod
+    def resume_job(
+        cls,
+        job_id: UUID,
+        message: str = "resumed",
+        inputs_update: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ArtifactExecution]:
+        """Move a waiting job back to pending for re-dispatch."""
+        engine = get_engine()
+        with Session(engine) as session:
+            job = session.get(ArtifactExecution, job_id)
+            if not job:
+                return None
+            if inputs_update:
+                merged_inputs = dict(job.inputs or {})
+                merged_inputs.update(inputs_update)
+                job.inputs = merged_inputs
+
+            job.status = "pending"
+            job.message = message
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+
+            _EVENT_BUS.publish(EmbeddrEvent(
+                event_type="execution.resumed",
+                source="spine",
+                payload={
+                    "id": str(job.id),
+                    "status": job.status,
+                    "message": job.message,
+                    "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                }
+            ))
+            session.add(ArtifactExecutionEvent(
+                execution_id=job.id,
+                event_type="execution.resumed",
+                message=job.message,
+                payload={
+                    "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                },
+            ))
+            session.commit()
+            return job
 
     @staticmethod
     def _create_job_in_session(
@@ -617,6 +699,30 @@ class ExecutionSpine:
                     },
                 ))
 
+            except JobDeferred as e:
+                job.status = "waiting"
+                job.message = e.message
+
+                _EVENT_BUS.publish(EmbeddrEvent(
+                    event_type="execution.waiting",
+                    source="spine",
+                    payload={
+                        "id": str(job_id),
+                        "status": job.status,
+                        "message": job.message,
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                        "payload": e.payload,
+                    }
+                ))
+                session.add(ArtifactExecutionEvent(
+                    execution_id=job_id,
+                    event_type="execution.waiting",
+                    message=job.message,
+                    payload={
+                        "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                        "payload": e.payload,
+                    },
+                ))
             except Exception as e:
                 logger.error(f"Job {job_id} failed: {traceback.format_exc()}")
                 job.status = "failed"
