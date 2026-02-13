@@ -82,6 +82,15 @@ async def get_auth_context(
     raw_key = _extract_raw_key(api_key_header_val, api_key_query_val, request)
     mode = auth_service.get_auth_mode()
 
+    # Log auth source for diagnostics
+    _source = "header" if api_key_header_val else ("query" if (request and request.query_params.get(
+        "api_key")) else ("cookie" if (request and request.cookies.get(COOKIE_NAME)) else "none"))
+    logger.debug(
+        "auth_context_resolve mode=%s key_source=%s key_present=%s path=%s",
+        mode, _source, bool(raw_key),
+        request.url.path if request else "unknown",
+    )
+
     if mode == "open":
         return auth_service.AuthContext(
             mode=mode,
@@ -91,6 +100,10 @@ async def get_auth_context(
         )
 
     if not raw_key:
+        logger.warning(
+            "auth_rejected reason=missing_credentials path=%s",
+            request.url.path if request else "unknown",
+        )
         raise HTTPException(
             status_code=HTTP_403_FORBIDDEN, detail="Missing credentials"
         )
@@ -98,10 +111,21 @@ async def get_auth_context(
     with Session(get_engine()) as session:
         api_key = auth_service.lookup_api_key(session, raw_key)
         if not api_key:
+            logger.warning(
+                "auth_rejected reason=invalid_key key_prefix=%s path=%s",
+                raw_key[:8] if raw_key else "?",
+                request.url.path if request else "unknown",
+            )
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
             )
-        return auth_service.build_auth_context(session, api_key, raw_key)
+        ctx = auth_service.build_auth_context(session, api_key, raw_key)
+        logger.debug(
+            "auth_success user=%s operator=%s is_admin=%s path=%s",
+            ctx.username, ctx.operator_name, ctx.is_admin,
+            request.url.path if request else "unknown",
+        )
+        return ctx
 
 
 def _has_permission(auth: auth_service.AuthContext, permission: str) -> bool:
@@ -137,3 +161,15 @@ def require_permission_for_request(read_permission: str, write_permission: str):
         return auth
 
     return _dep
+
+
+def require_admin(auth=Depends(get_auth_context)):
+    """Require admin access.  Open mode is always allowed."""
+    if auth.is_open:
+        return auth
+    if not auth.is_admin:
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return auth

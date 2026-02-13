@@ -5,7 +5,6 @@ from embeddr_core.models.workflow import (
     WorkflowPort,
 )
 from embeddr.services.template_registry import register_template
-from embeddr.services.transforms.image_flip import register_image_flip_transform
 
 
 def get_empty_template() -> WorkflowArtifactMetadata:
@@ -94,4 +93,3 @@ def get_image_ingest_default_template() -> WorkflowArtifactMetadata:
 register_template("empty", get_empty_template)
 register_template("image_flip", get_image_flip_template)
 register_template("image_ingest_default", get_image_ingest_default_template)
-register_image_flip_transform()

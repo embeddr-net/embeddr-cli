@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system, lotus, manage, nelumbo
+from embeddr.commands import config, serve, db, init_v2, process, inspect, tui, plugins, system, lotus, manage, nelumbo, debug
 
 from embeddr.core.config import get_data_dir, refresh_settings
 from embeddr.core.project import find_project_root, load_project_config
@@ -27,6 +27,7 @@ app.add_typer(system.app, name="system")
 app.add_typer(lotus.app, name="lotus")
 app.add_typer(manage.app, name="manage")
 app.add_typer(nelumbo.app, name="nelumbo")
+app.add_typer(debug.app, name="debug")
 # app.add_typer(fixtures.app, name="fixtures") # Moved to Plugin
 
 
@@ -108,7 +109,6 @@ def callback(
 ):
     # 1. Explicit override always wins
     if data_dir:
-        print(f"DEBUG: Setting EMBEDDR_DATA_DIR to {data_dir}")
         os.environ["EMBEDDR_DATA_DIR"] = data_dir
         refresh_settings()
         get_engine.cache_clear()
@@ -117,8 +117,6 @@ def callback(
 
     # 2. Env var already set (shell, systemd, etc.)
     if os.environ.get("EMBEDDR_DATA_DIR"):
-        print(
-            f"DEBUG: EMBEDDR_DATA_DIR already set to {os.environ.get('EMBEDDR_DATA_DIR')}")
         refresh_settings()
         get_engine.cache_clear()
         _load_cli_plugins()

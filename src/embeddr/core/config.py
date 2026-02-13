@@ -42,20 +42,6 @@ def get_db_url():
     return f"sqlite:///{os.path.join(data_dir, 'embeddr.db')}"
 
 
-def get_thumbnails_dir() -> Path:
-    data_dir = get_data_dir()
-    thumbnails_dir = os.path.join(data_dir, "thumbnails")
-    os.makedirs(thumbnails_dir, exist_ok=True)
-    return Path(thumbnails_dir)
-
-
-def get_workflows_dir() -> Path:
-    data_dir = get_data_dir()
-    workflows_dir = os.path.join(data_dir, "workflows")
-    os.makedirs(workflows_dir, exist_ok=True)
-    return Path(workflows_dir)
-
-
 def get_vector_storage_dir() -> Path:
     data_dir = get_data_dir()
     vector_dir = os.path.join(data_dir, "vector_storage")
@@ -63,19 +49,22 @@ def get_vector_storage_dir() -> Path:
     return Path(vector_dir)
 
 
+def is_dev_mode() -> bool:
+    """Check if the server is running in development mode.
+
+    Set EMBEDDR_DEV=1 (or true/yes) in the environment to enable.
+    Dev mode relaxes CORS, exposes extra diagnostics, etc.
+    """
+    return os.environ.get("EMBEDDR_DEV", "").lower() in ("1", "true", "yes")
+
+
 class Settings(BaseSettings):
-    DEV_MODE: bool = True
-    PROJECT_NAME: str = "Embeddr Local API"
     DATA_DIR: Path = Field(default_factory=get_data_dir)
     DATABASE_URL: str = Field(default_factory=get_db_url)
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
     DB_POOL_TIMEOUT: int = 60
-    THUMBNAILS_DIR: Path = Field(default_factory=get_thumbnails_dir)
-    WORKFLOWS_DIR: Path = Field(default_factory=get_workflows_dir)
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)
-    API_V1_STR: str = "/api/v1"
-    COMFYUI_URL: str = "http://127.0.0.1:8188"
 
     class Config:
         case_sensitive = True

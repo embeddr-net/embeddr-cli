@@ -4,6 +4,7 @@ import logging
 import asyncio
 import inspect
 from embeddr_core.plugin_interface import EventBus, EmbeddrEvent
+from embeddr_core.async_compat import run_sync
 
 logger = logging.getLogger(__name__)
 
@@ -32,41 +33,14 @@ class SimpleEventBus(EventBus):
                     res = callback(event)
                     if inspect.isawaitable(res):
                         try:
-                            # Schedule async callbacks on the running loop
                             loop = asyncio.get_running_loop()
                             loop.create_task(res)
                         except RuntimeError:
-                            # No running loop (e.g. called from synchronous script context, or uvicorn threaded context)
-                            # Create a new loop or run locally?
-                            # If we are in a thread without a loop, we can't easily "create_task".
-                            # But if this is called from an async endpoint, get_running_loop SHOULD works.
-                            # If it's called from a sync endpoint in FastAPI, it runs in a threadpool.
-
-                            # Fallback: Create a Fire-and-Forget task via run_coroutine_threadsafe if we can find a main loop,
-                            # or just run_until_complete if we don't care about blocking (we do).
-
-                            # Hack: Just run it synchronously if we can't find a loop? No, that blocks.
-                            # Better: Print a clearer warning and hint at using background tasks.
-
-                            # Actually, for the "Async event handler called outside of event loop" error:
-                            # This usually happens when `publish` is called from standard def (sync) code,
-                            # AND there is no *active* loop in that specific thread.
-
-                            if hasattr(asyncio, 'to_thread'):
-                                # If we are in a sync thread, maybe we can run it?
-                                # But `res` is a coroutine object. We need an event loop to run it.
-
-                                # Try to get a new loop for this thread?
-                                try:
-                                    logger.warning(
-                                        f"Creating ephemeral loop for {event.event_type}")
-                                    asyncio.run(res)
-                                except Exception as loop_err:
-                                    logger.error(
-                                        f"Failed to run ephemeral loop: {loop_err}")
-                            else:
-                                logger.warning(
-                                    f"Async event handler {callback} called outside of event loop for {event.event_type}")
+                            try:
+                                run_sync(res)
+                            except Exception as sync_err:
+                                logger.error(
+                                    f"Failed to run async handler for {event.event_type}: {sync_err}")
 
                 except Exception as e:
                     logger.error(
@@ -82,15 +56,18 @@ class SimpleEventBus(EventBus):
                             loop = asyncio.get_running_loop()
                             loop.create_task(res)
                         except RuntimeError:
-                            logger.warning(
-                                f"Async wildcard handler called outside loop")
+                            try:
+                                run_sync(res)
+                            except Exception as sync_err:
+                                logger.error(
+                                    f"Failed to run async wildcard handler for {event.event_type}: {sync_err}")
                 except Exception as e:
                     logger.error(
                         f"Error in wildcard subscriber for {event.event_type}: {e}")
 
     def emit(self, event_type: str, payload: Any = None, source: str = "system") -> None:
-        logger.info("BUS EMIT %s source=%s payload=%s",
-                    event_type, source, payload)
+        logger.debug("BUS EMIT %s source=%s payload=%s",
+                     event_type, source, payload)
 
         event = EmbeddrEvent(
             event_type=event_type,

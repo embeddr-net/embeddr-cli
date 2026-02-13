@@ -423,7 +423,7 @@ def invoke_cap(
         # 2. Resolve Dynamic Inputs
         if local:
             # Full local support
-            plugin_name = c_data.get("plugin") or cap.plugin
+            plugin_name = c_data.get("plugin_name") or c_data.get("plugin") or cap.plugin
             plugin = get_plugin_instance(plugin_name)
             if plugin:
                 resolver_action = resolver.get(
@@ -467,8 +467,8 @@ def invoke_cap(
                             "result_id": str(uuid4()),
                             "kind": "action",
                             "data": {
-                                "plugin": c_data.get("plugin") or (cap.get("plugin") if isinstance(cap, dict) else cap.plugin),
-                                "action": resolver_action,
+                                "plugin_name": c_data.get("plugin_name") or c_data.get("plugin") or (cap.get("plugin") if isinstance(cap, dict) else cap.plugin),
+                                "action_name": resolver_action,
                                 "inputs": inputs
                             }
                         }
@@ -517,8 +517,8 @@ def invoke_cap(
 
     # Execute
     if local:
-        action_name = c_data.get("action") or cap.id
-        plugin_name = c_data.get("plugin") or cap.plugin
+        action_name = c_data.get("action_name") or c_data.get("action") or cap.id
+        plugin_name = c_data.get("plugin_name") or c_data.get("plugin") or cap.plugin
 
         if not plugin_name:
             typer.echo(json.dumps({"ok": False, "error": "missing_plugin"}))
@@ -554,16 +554,16 @@ def invoke_cap(
                 "result_id": cap_id,  # Or use UUID if just dispatching
                 "kind": "action",
                 "data": {
-                    "plugin": c_data.get("plugin") or (cap.get("plugin") if isinstance(cap, dict) else cap.plugin),
-                    "action": c_data.get("action") or (cap.get("data", {}).get("action_name") if isinstance(cap, dict) else cap.id),
+                    "plugin_name": c_data.get("plugin_name") or c_data.get("plugin") or (cap.get("plugin") if isinstance(cap, dict) else cap.plugin),
+                    "action_name": c_data.get("action_name") or c_data.get("action") or (cap.get("data", {}).get("action_name") if isinstance(cap, dict) else cap.id),
                     "inputs": inputs
                 }
             }
             # Handle action naming fallback
-            if not payload["data"]["action"]:
+            if not payload["data"]["action_name"]:
                 # Try using cap ID if action not explicit?
                 # Usually cap ID != action name exactly (e.g. search.text might be action search.text)
-                payload["data"]["action"] = cap_id
+                payload["data"]["action_name"] = cap_id
 
             # Post
             try:

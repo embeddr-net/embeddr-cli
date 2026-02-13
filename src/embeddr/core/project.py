@@ -89,6 +89,10 @@ port = 8003
 
 [auth]
 {auth_mode_line}
+
+[content]
+# proxy_enabled = true
+# proxy_allowlist = ["*"]  # or specific domains: [".amazonaws.com", ".nynxz.com"]
 """
     with open(root_path / CONFIG_FILENAME, "w") as f:
         f.write(config_content)

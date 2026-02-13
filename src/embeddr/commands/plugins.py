@@ -138,28 +138,51 @@ def _build_dist_manifest(dist_dir: Path, base_url: str) -> Dict[str, Any]:
     if not dist_dir.exists():
         return {"plugins": []}
 
-    for plugin_dir in sorted(dist_dir.iterdir()):
-        if not plugin_dir.is_dir():
-            continue
-        dist_path = plugin_dir / "dist"
-        if not dist_path.exists():
-            continue
+    def _scan_dir(parent: Path, url_prefix: str) -> None:
+        """Scan *parent* for plugin directories containing ``dist/*.umd.js``."""
+        for plugin_dir in sorted(parent.iterdir()):
+            if not plugin_dir.is_dir():
+                continue
+            dist_path = plugin_dir / "dist"
+            if not dist_path.exists():
+                continue
 
-        bundle = None
-        for candidate in dist_path.glob("*.umd.js"):
-            bundle = candidate.name
-            break
+            bundle = None
+            for candidate in dist_path.glob("*.umd.js"):
+                bundle = candidate.name
+                break
 
-        if not bundle:
-            continue
+            if not bundle:
+                continue
 
-        plugins.append(
-            {
-                "id": plugin_dir.name,
-                "name": plugin_dir.name,
-                "bundle": f"{base_url}/plugins/{plugin_dir.name}/dist/{bundle}",
-            }
-        )
+            plugins.append(
+                {
+                    "id": plugin_dir.name,
+                    "name": plugin_dir.name,
+                    "bundle": f"{base_url}/{url_prefix}/{plugin_dir.name}/dist/{bundle}",
+                }
+            )
+
+    # Check if dist_dir contains output-prefix subdirectories (e.g. plugins/, services/)
+    # or the legacy flat layout where plugins sit directly in dist_dir.
+    has_prefixed = any(
+        (child / next(child.iterdir()).name / "dist").exists()
+        if child.is_dir() and any(child.iterdir())
+        else False
+        for child in dist_dir.iterdir()
+        if child.is_dir()
+    ) if any(dist_dir.iterdir()) else False
+
+    if has_prefixed:
+        for prefix_dir in sorted(dist_dir.iterdir()):
+            if not prefix_dir.is_dir():
+                continue
+            # Skip non-prefix dirs (inspections, registry)
+            if prefix_dir.name in {"inspections", "registry"}:
+                continue
+            _scan_dir(prefix_dir, prefix_dir.name)
+    else:
+        _scan_dir(dist_dir, "plugins")
 
     return {"plugins": plugins}
 

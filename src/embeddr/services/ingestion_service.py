@@ -10,6 +10,94 @@ from embeddr_core.plugin_interface import EmbeddrEvent
 logger = logging.getLogger(__name__)
 
 
+def _submit_ingestion_execution(
+    count: int,
+    batch_size: int,
+    trigger: str = "system",
+) -> Optional[Any]:
+    """
+    Create an ExecutionSpine record for a batch flush.
+    Returns the execution or None if spine isn't available.
+    """
+    try:
+        from embeddr.core.execution_spine import ExecutionSpine
+
+        return ExecutionSpine.submit_job(
+            job_type="ingest.batch",
+            inputs={"count": count, "batch_size": batch_size},
+            plugin_name="core",
+            resource_class="io",
+            priority=5,
+            trigger=trigger,
+        )
+    except Exception as e:
+        logger.debug("Could not create ingestion execution: %s", e)
+        return None
+
+
+def _complete_ingestion_execution(
+    execution_id: UUID,
+    artifact_ids: List[UUID],
+    status: str = "completed",
+    error: Optional[str] = None,
+) -> None:
+    """
+    Mark the ingestion execution complete and link created artifacts.
+    """
+    try:
+        from embeddr.core.execution_spine import ExecutionSpine, DBJobContext
+        from embeddr_core.models.artifact_execution import ArtifactExecution
+        from embeddr_core.models.artifact_execution_event import ArtifactExecutionEvent
+        from embeddr.db.session import get_engine
+        from datetime import UTC, datetime
+
+        engine = get_engine()
+        with Session(engine) as session:
+            execution = session.get(ArtifactExecution, execution_id)
+            if not execution:
+                return
+
+            # Link all created artifacts
+            if artifact_ids:
+                ctx = DBJobContext(session, execution)
+                ctx.link_artifacts(
+                    artifact_ids, action="created", detail="batch ingestion")
+
+            execution.status = status
+            execution.progress = 100
+            execution.finished_at = datetime.now(UTC)
+            if error:
+                execution.error = error
+                execution.message = error
+            else:
+                execution.message = f"Ingested {len(artifact_ids)} artifacts"
+            execution.outputs = {
+                "artifact_count": len(artifact_ids),
+                "artifact_ids": [str(a) for a in artifact_ids],
+            }
+            session.add(execution)
+
+            session.add(ArtifactExecutionEvent(
+                execution_id=execution_id,
+                event_type=f"execution.{status}",
+                message=execution.message,
+                payload={"artifact_count": len(artifact_ids)},
+            ))
+            session.commit()
+
+            _EVENT_BUS.publish(EmbeddrEvent(
+                event_type=f"execution.{status}",
+                source="spine",
+                payload={
+                    "id": str(execution_id),
+                    "status": status,
+                    "artifact_count": len(artifact_ids),
+                },
+            ))
+    except Exception as e:
+        logger.debug("Could not complete ingestion execution: %s", e)
+
+
 class IngestionService:
     def __init__(self, batch_size: int = 50, flush_interval: float = 1.0, queue_size: int = 1000):
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
@@ -109,6 +197,13 @@ class IngestionService:
     def _flush_sync(self, items: List[Dict]):
         from uuid import uuid5, NAMESPACE_URL, UUID
         from embeddr_core.models.artifact_relation import ArtifactRelation
+
+        # Create a tracked execution for this batch
+        execution = _submit_ingestion_execution(
+            count=len(items),
+            batch_size=self.batch_size,
+        )
+        execution_id = execution.id if execution else None
 
         try:
             with Session(self.engine) as session:
@@ -253,9 +348,11 @@ class IngestionService:
 
                 session.commit()
 
-                # Emit events
+                # Emit events for created artifacts
+                created_ids: List[UUID] = []
                 if to_insert_artifacts:
                     for art in to_insert_artifacts:
+                        created_ids.append(art.id)
                         payload = {
                             "id": str(art.id),
                             "uri": art.uri,
@@ -268,9 +365,24 @@ class IngestionService:
                             payload=payload
                         ))
 
+                # Complete the execution and link created artifacts
+                if execution_id:
+                    _complete_ingestion_execution(
+                        execution_id=execution_id,
+                        artifact_ids=created_ids,
+                    )
+
                 logger.info(
                     f"Ingested {len(to_insert_artifacts)} artifacts. (Batch: {len(items)})")
         except Exception as e:
+            # Mark execution as failed if we have one
+            if execution_id:
+                _complete_ingestion_execution(
+                    execution_id=execution_id,
+                    artifact_ids=[],
+                    status="failed",
+                    error=str(e),
+                )
             logger.error(f"Failed to flush batch on DB: {e}", exc_info=True)
 
 

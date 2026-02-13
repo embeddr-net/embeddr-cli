@@ -74,6 +74,8 @@ class ServerStatusResponse(BaseModel):
     started_at: Optional[int] = None
     log_path: Optional[str] = None
     message: Optional[str] = None
+    root_key: Optional[str] = None
+    user_key: Optional[str] = None
 
 
 class ServerStartRequest(BaseModel):

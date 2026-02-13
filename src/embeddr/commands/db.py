@@ -14,7 +14,8 @@ def get_alembic_config():
     db_dir = Path(embeddr.db.__file__).parent
     ini_path = db_dir / "alembic.ini"
     if not ini_path.exists():
-        typer.secho(f"Could not find alembic.ini at {ini_path}", fg=typer.colors.RED)
+        typer.secho(
+            f"Could not find alembic.ini at {ini_path}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
     return Config(str(ini_path))
@@ -58,3 +59,44 @@ def history():
     """List changeset scripts in chronological order."""
     alembic_cfg = get_alembic_config()
     command.history(alembic_cfg)
+
+
+@app.command("relink-uris")
+def relink_uris(
+    old_prefix: str = typer.Argument(
+        ..., help="The old absolute path prefix to replace (e.g. /old/path/.embeddr)"
+    ),
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--apply",
+        help="Preview changes without writing (default). Use --apply to commit."
+    ),
+):
+    """Rewrite stale absolute URIs to portable workspace:// URIs.
+
+    Use this after moving a workspace directory. Rewrites artifact, preview,
+    and ingest URIs that match OLD_PREFIX to workspace:// relative paths.
+
+    Examples:
+
+        embeddr db relink-uris /old/path/.embeddr --dry-run
+
+        embeddr db relink-uris /old/path/.embeddr --apply
+    """
+    from embeddr.services.uri_resolver import relink_absolute_uris
+
+    typer.secho(
+        f"{'DRY RUN' if dry_run else 'APPLYING'} — relink URIs from: {old_prefix}", fg=typer.colors.YELLOW)
+
+    results = relink_absolute_uris(old_prefix=old_prefix, dry_run=dry_run)
+
+    for table, count in results.items():
+        color = typer.colors.CYAN if count > 0 else typer.colors.WHITE
+        typer.secho(
+            f"  {table}: {count} rows {'would be' if dry_run else ''} updated", fg=color)
+
+    total = sum(results.values())
+    if dry_run:
+        typer.secho(
+            f"\nTotal: {total} rows would be updated. Run with --apply to commit.", fg=typer.colors.YELLOW)
+    else:
+        typer.secho(f"\nDone. {total} rows updated.", fg=typer.colors.GREEN)

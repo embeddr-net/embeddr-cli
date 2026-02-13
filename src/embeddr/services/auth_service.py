@@ -5,6 +5,7 @@ import hmac
 import os
 import secrets
 import binascii
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Set, Tuple
@@ -17,6 +18,8 @@ from embeddr_core.models.operator import Operator
 from embeddr_core.models.role import Role, RolePermission
 from embeddr_core.models.user_account import UserAccount, UserRole
 from embeddr.core.project import find_project_root, load_project_config
+
+logger = logging.getLogger(__name__)
 
 AUTH_MODE_ENV = "EMBEDDR_AUTH_MODE"
 AUTH_SALT_ENV = "EMBEDDR_AUTH_SALT"
@@ -177,10 +180,22 @@ def lookup_api_key(session: Session, raw_key: str) -> Optional[ApiKey]:
     api_key = session.exec(select(ApiKey).where(
         ApiKey.key_hash == key_hash)).first()
     if not api_key:
+        logger.warning(
+            "api_key_lookup_failed reason=hash_not_found prefix=%s",
+            raw_key[:8] if raw_key else "?",
+        )
         return None
     if not api_key.is_active:
+        logger.warning(
+            "api_key_lookup_failed reason=inactive key_id=%s prefix=%s",
+            api_key.id, raw_key[:8] if raw_key else "?",
+        )
         return None
     if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+        logger.warning(
+            "api_key_lookup_failed reason=expired key_id=%s expires_at=%s",
+            api_key.id, api_key.expires_at,
+        )
         return None
     return api_key
 
@@ -271,17 +286,26 @@ def _ensure_user(
     display_name: str,
     is_admin: bool,
     role: Role,
+    default_password: Optional[str] = None,
 ) -> UserAccount:
     user = session.exec(select(UserAccount).where(
         UserAccount.username == username)).first()
     if user:
         return user
+
+    password_hash_val = None
+    password_salt_val = None
+    if default_password:
+        password_hash_val, password_salt_val = hash_password(default_password)
+
     user = UserAccount(
         username=username,
         display_name=display_name,
         is_active=True,
         is_admin=is_admin,
         operator_id=operator_id,
+        password_hash=password_hash_val,
+        password_salt=password_salt_val,
     )
     session.add(user)
     session.flush()
@@ -311,6 +335,7 @@ def ensure_default_admin(
         display_name="Root Client",
         is_admin=True,
         role=admin_role,
+        default_password="password",
     )
 
     root_api_key, root_raw_key = create_api_key(
@@ -334,6 +359,7 @@ def ensure_default_admin(
             display_name=admin_username.title(),
             is_admin=True,
             role=admin_role,
+            default_password="password",
         )
 
         user_api_key, user_raw_key = create_api_key(
@@ -370,6 +396,7 @@ def bootstrap_operator_flow(
         display_name="Root User",
         is_admin=True,
         role=admin_role,
+        default_password="password",
     )
 
     operator = _ensure_operator(session, name=operator_name, is_root=False)
@@ -380,6 +407,7 @@ def bootstrap_operator_flow(
         display_name=admin_username.title(),
         is_admin=True,
         role=admin_role,
+        default_password="password",
     )
 
     key_name = "operator" if mode == "single" else "server-admin"

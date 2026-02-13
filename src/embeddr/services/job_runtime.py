@@ -65,6 +65,7 @@ class JobRuntime:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._batch_buffers: Dict[str, Dict[str, Any]] = {}
         self._batch_flush_tasks: Dict[str, asyncio.Task] = {}
+        self._last_flush_times: Dict[str, float] = {}
 
         logger.info("JobRuntime initialized")
 
@@ -474,9 +475,23 @@ class JobRuntime:
         if key in self._batch_flush_tasks:
             return
 
+        import time as _time
+
         async def delayed_flush() -> None:
             buffer = self._batch_buffers.get(key) or {}
-            delay = float(buffer.get("batch_wait_s") or 5.0)
+            full_delay = float(buffer.get("batch_wait_s") or 5.0)
+
+            # Adaptive delay: if we flushed recently (burst mode),
+            # use a much shorter delay so we don't waste time waiting
+            # when many items are queued.
+            last_flush = self._last_flush_times.get(key, 0)
+            elapsed = _time.monotonic() - last_flush
+            if elapsed < full_delay * 2:
+                # Burst mode: use 20% of full delay (min 0.3s)
+                delay = max(0.3, full_delay * 0.2)
+            else:
+                delay = full_delay
+
             await asyncio.sleep(delay)
             try:
                 await self._flush_batch(key)
@@ -486,6 +501,8 @@ class JobRuntime:
         self._batch_flush_tasks[key] = asyncio.create_task(delayed_flush())
 
     async def _flush_batch(self, key: str) -> None:
+        import time as _time
+
         task = self._batch_flush_tasks.pop(key, None)
         if task:
             task.cancel()
@@ -499,6 +516,8 @@ class JobRuntime:
             return
 
         buffer["artifact_ids"] = []
+        self._last_flush_times[key] = _time.monotonic()
+
         inputs = {**(buffer.get("base_inputs") or {}),
                   "artifact_ids": artifact_ids}
 
@@ -525,6 +544,10 @@ class JobRuntime:
             trigger=trigger,
             parent_execution_id=buffer.get("parent_execution_id"),
         )
+
+        # If items accumulated during submission, schedule a quick flush
+        if buffer.get("artifact_ids") and key not in self._batch_flush_tasks:
+            self._schedule_batch_flush(key)
 
     async def _submit_job_with_retry(
         self,

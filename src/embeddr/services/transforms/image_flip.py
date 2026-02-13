@@ -12,6 +12,7 @@ from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact_relation import ArtifactRelation
 from embeddr.services.transform_registry import register_transform
+from embeddr.services.uri_resolver import resolve_uri, make_workspace_uri
 
 
 def _resolve_image_input(
@@ -35,8 +36,9 @@ def _resolve_image_input(
             image_input = image_input["path"]
 
     if isinstance(image_input, str):
-        if image_input.startswith("file://"):
-            image_path = Path(image_input.replace("file://", ""))
+        resolved = resolve_uri(image_input)
+        if resolved:
+            image_path = Path(resolved)
         else:
             try:
                 parent_id = UUID(image_input)
@@ -47,9 +49,12 @@ def _resolve_image_input(
         artifact = session.get(Artifact, parent_id)
         if not artifact:
             raise ValueError(f"Artifact {parent_id} not found")
-        if not artifact.uri or not artifact.uri.startswith("file://"):
+        if not artifact.uri:
             raise ValueError("Artifact must reference a local file")
-        image_path = Path(artifact.uri.replace("file://", ""))
+        resolved_path = resolve_uri(artifact.uri)
+        if not resolved_path:
+            raise ValueError("Artifact must reference a local file")
+        image_path = Path(resolved_path)
 
     if not image_path:
         raise ValueError("Unable to resolve image input")
@@ -78,12 +83,12 @@ async def execute_image_flip(
         img.save(output_path)
 
         if not session:
-            return {"image": {"uri": f"file://{output_path}"}}
+            return {"image": {"uri": make_workspace_uri(str(output_path))}}
 
         new_artifact = Artifact(
             id=uuid4(),
             type_name="image",
-            uri=f"file://{output_path}",
+            uri=make_workspace_uri(str(output_path)),
             metadata_json={
                 "name": "Flipped Image",
                 "width": img.width,

@@ -728,7 +728,47 @@ def start_embeddr_server(
             "log_path": str(log_path),
         }
     )
-    return {"running": True, "pid": process.pid, **_EMBEDDR_SERVER_META}
+
+    # Poll the log file briefly to capture API keys emitted at boot.
+    # The server prints "Root Key: em_..." and optionally "Client Key: em_..."
+    # during first-time bootstrap. We try for up to ~12 seconds.
+    root_key: Optional[str] = None
+    user_key: Optional[str] = None
+    for _ in range(24):
+        time.sleep(0.5)
+        # Check the process is still alive
+        if process.poll() is not None:
+            break
+        try:
+            log_handle.flush()
+            content = log_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not root_key:
+            m = re.search(r"Root Key:\s*(\S+)", content)
+            if m:
+                root_key = m.group(1)
+        if not user_key:
+            m = re.search(r"Client Key:\s*(\S+)", content)
+            if m:
+                user_key = m.group(1)
+        # If server is already up (has root key) or we found the key, stop waiting
+        if root_key:
+            break
+        # Also stop if the server logged "already exists" (no new keys to find)
+        if "skipping bootstrap" in content.lower():
+            break
+
+    result: Dict[str, Any] = {
+        "running": True,
+        "pid": process.pid,
+        **_EMBEDDR_SERVER_META,
+    }
+    if root_key:
+        result["root_key"] = root_key
+    if user_key:
+        result["user_key"] = user_key
+    return result
 
 
 def stop_embeddr_server(confirm: bool) -> Dict[str, Any]:

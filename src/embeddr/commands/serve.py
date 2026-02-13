@@ -228,13 +228,6 @@ async def lifespan(app: FastAPI):
     _bootstrap_default_admin()
     _maybe_print_dev_admin_key()
 
-    try:
-        from embeddr_core.services.scanner_registry import scanner_registry
-        logger.info(
-            f"Registry state BEFORE plugin load: {scanner_registry._scanners.keys()}")
-    except ImportError:
-        logger.error("Could not import scanner_registry for debugging")
-
     # Plugin loading is handled in create_app to ensure API registration works
     # Here we just trigger startup hooks
 
@@ -259,16 +252,6 @@ async def lifespan(app: FastAPI):
 
     # Transport tool registration is handled by transport plugins
 
-    try:
-        from embeddr_core.services.scanner_registry import scanner_registry
-        logger.info(
-            f"Registry state AFTER plugin load: {scanner_registry._scanners.keys()}")
-        if "collection:directory" in scanner_registry._scanners:
-            logger.info(
-                f"Final scanner for collection:directory: {scanner_registry._scanners['collection:directory']}")
-    except ImportError:
-        pass
-
     # --- Event Bus <-> WebSocket Bridge ---
     loop = asyncio.get_running_loop()
 
@@ -276,8 +259,8 @@ async def lifespan(app: FastAPI):
         try:
             raw_event_type = str(event.event_type or "")
             if raw_event_type.startswith("ui:") or raw_event_type.startswith("ui."):
-                logger.info("[UI EVENT] %s payload=%s",
-                            event.event_type, event.payload)
+                logger.debug("[UI EVENT] %s payload=%s",
+                             event.event_type, event.payload)
             event_type = raw_event_type
             payload = event.payload
 
@@ -579,7 +562,11 @@ def dev_origins() -> list[str]:
     logger.info("Loading development CORS origins...")
     return [
         "http://localhost:3000",  # React Dev Server
-        "http://localhost:4173",  # SDK Dev UI
+        "http://localhost:4173",  # SDK Dev UI / Vite preview
+        "http://localhost:5173",  # Sprout / Vite default dev
+        "http://localhost:5174",  # Sprout / Vite secondary dev
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
     ]
 
 
@@ -606,6 +593,26 @@ def aitoolkit_origins() -> list[str]:
     return [
         "http://localhost:3001",  # AI Toolkit default
     ]
+
+
+def toml_cors_origins() -> list[str]:
+    """Read [cors] origins from embeddr.toml if present."""
+    try:
+        from embeddr.core.project import find_project_root, load_project_config
+        root = find_project_root()
+        if not root:
+            return []
+        cfg = load_project_config(root)
+        cors_cfg = cfg.get("cors", {})
+        raw = cors_cfg.get("origins", [])
+        if isinstance(raw, list):
+            return [str(o).strip() for o in raw if str(o).strip()]
+        if isinstance(raw, str):
+            return [o.strip() for o in raw.split(",") if o.strip()]
+        return []
+    except Exception as e:
+        logger.warning("Failed to read [cors] from embeddr.toml: %s", e)
+        return []
 
 
 def _register_endpoints(app: FastAPI, router, prefix: str, tags: list[str], dependencies: list = None):
@@ -637,18 +644,44 @@ def create_app(
     allowed_origins |= set(parse_env_origins())
     allowed_origins |= set(dynamic_origins())
     allowed_origins |= set(nelumbo_origins())
-    if os.environ.get("EMBEDDR_ALLOW_DEV_ORIGINS", "false").lower() == "true":
+
+    # Read [cors] from embeddr.toml
+    toml_origins = toml_cors_origins()
+    if toml_origins:
+        allowed_origins |= set(toml_origins)
+
+    # Also check toml allow_dev_origins flag
+    toml_dev = False
+    try:
+        from embeddr.core.project import find_project_root, load_project_config
+        root = find_project_root()
+        if root:
+            cors_cfg = load_project_config(root).get("cors", {})
+            toml_dev = cors_cfg.get("allow_dev_origins", False)
+    except Exception:
+        pass
+
+    if os.environ.get("EMBEDDR_ALLOW_DEV_ORIGINS", "false").lower() == "true" or toml_dev:
         allowed_origins |= set(dev_origins())
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(allowed_origins),
+    # Handle wildcard: allow_origin_regex so credentials still work
+    use_wildcard = "*" in allowed_origins
+    allowed_origins.discard("*")
+
+    cors_kwargs: dict = dict(
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT",
                        "PATCH", "DELETE", "OPTIONS", "HEAD"],
         allow_headers=["Authorization", "Content-Type",
                        "ngrok-skip-browser-warning", "X-API-Key"],
     )
+    if use_wildcard:
+        cors_kwargs["allow_origin_regex"] = r".*"
+        typer.secho("   ⚠  Wildcard (*) origin — all origins allowed",
+                    fg=typer.colors.YELLOW)
+    cors_kwargs["allow_origins"] = list(allowed_origins)
+
+    app.add_middleware(CORSMiddleware, **cors_kwargs)
     typer.secho("🔐 Allowed CORS origins:", fg=typer.colors.CYAN)
     for origin in allowed_origins:
         typer.echo(f"   - {origin}")
@@ -672,91 +705,72 @@ def create_app(
                        dependencies=api_dependencies)
 
     # Include V2 Routes
-    from embeddr.api.v2 import artifacts as artifacts_v2
-    from embeddr.api.v2 import plugins as plugins_v2
-    from embeddr.api.v2 import system as system_v2
-    from embeddr.api.v2 import system_public as system_public_v2
-    from embeddr.api.v2 import collections as collections_v2
-    from embeddr.api.v2 import executions as executions_v2
-    from embeddr.api.v2 import workflows as workflows_v2
-    from embeddr.api.v2 import config as config_v2
-    from embeddr.api.v2 import maintenance as maintenance_v2
-    # from embeddr.api.v2 import projections as projections_v2 # Moved to Plugin
-    from embeddr.api.v2 import actions as actions_v2
-    from embeddr.api.v2 import lotus as lotus_v2
-    from embeddr.api.v2 import lotus_invoke_routes
-    from embeddr.api.v2 import config_api as lotus_config
-    from embeddr.api.v2 import resources as resources_v2
-    from embeddr.api.v2 import security as security_v2
-    from embeddr.api.v2 import themes as themes_v2
+    from embeddr.api.v1 import artifacts as artifacts_v2
+    from embeddr.api.v1 import plugins as plugins_v2
+    from embeddr.api.v1 import system as system_v2
+    from embeddr.api.v1 import system_public as system_public_v2
+    from embeddr.api.v1 import collections as collections_v2
+    from embeddr.api.v1 import executions as executions_v2
+    from embeddr.api.v1 import workflows as workflows_v2
+    from embeddr.api.v1 import config as config_v2
+    from embeddr.api.v1 import maintenance as maintenance_v2
+    # from embeddr.api1v2 import projections as projections_v2 # Moved to Plugin
+    from embeddr.api.v1 import actions as actions_v2
+    from embeddr.api.v1 import lotus as lotus_v2
+    from embeddr.api.v1 import lotus_invoke_routes
+    from embeddr.api.v1 import config_api as lotus_config
+    from embeddr.api.v1 import resources as resources_v2
+    from embeddr.api.v1 import security as security_router
+    from embeddr.api.v1 import themes as themes_v2
+    from embeddr.api.v1 import workers as workers_v1
+    from embeddr.api.v1 import panels as panels_v1
 
-    _register_endpoints(app, artifacts_v2.router,
-                        prefix="/api/v1/artifacts", tags=["artifacts"], dependencies=api_dependencies)
-    _register_endpoints(app, artifacts_v2.router,
-                        prefix="/api/artifacts", tags=["artifacts"], dependencies=api_dependencies)
-    _register_endpoints(app, plugins_v2.router,
-                        prefix="/api/v1/plugins", tags=["plugins"], dependencies=api_dependencies)
-    _register_endpoints(app, plugins_v2.router,
-                        prefix="/api/plugins", tags=["plugins"], dependencies=api_dependencies)
-    _register_endpoints(app, system_v2.router,
-                        prefix="/api/v1/system", tags=["system"], dependencies=api_dependencies)
-    _register_endpoints(app, system_v2.router,
-                        prefix="/api/system", tags=["system"], dependencies=api_dependencies)
-    _register_endpoints(app, system_public_v2.router,
-                        prefix="/api/v1", tags=["system"], dependencies=[])
-    _register_endpoints(app, system_public_v2.router,
-                        prefix="/api", tags=["system"], dependencies=[])
-    _register_endpoints(app, collections_v2.router,
-                        prefix="/api/v1/collections", tags=["collections"], dependencies=api_dependencies)
-    _register_endpoints(app, collections_v2.router,
-                        prefix="/api/collections", tags=["collections"], dependencies=api_dependencies)
-    _register_endpoints(app, executions_v2.router,
-                        prefix="/api/v1/executions", tags=["executions"], dependencies=api_dependencies)
-    _register_endpoints(app, executions_v2.router,
-                        prefix="/api/executions", tags=["executions"], dependencies=api_dependencies)
-    _register_endpoints(app, workflows_v2.router,
-                        prefix="/api/v1/workflows", tags=["workflows"], dependencies=api_dependencies)
-    _register_endpoints(app, workflows_v2.router,
-                        prefix="/api/workflows", tags=["workflows"], dependencies=api_dependencies)
-    _register_endpoints(app, config_v2.router,
-                        prefix="/api/v1/config", tags=["config"], dependencies=api_dependencies)
-    _register_endpoints(app, config_v2.router,
-                        prefix="/api/config", tags=["config"], dependencies=api_dependencies)
-    _register_endpoints(app, maintenance_v2.router,
-                        prefix="/api/v1/maintenance", tags=["maintenance"], dependencies=api_dependencies)
-    _register_endpoints(app, maintenance_v2.router,
-                        prefix="/api/maintenance", tags=["maintenance"], dependencies=api_dependencies)
-    _register_endpoints(app, actions_v2.router,
-                        prefix="/api/v1/actions", tags=["actions"], dependencies=api_dependencies)
-    _register_endpoints(app, actions_v2.router,
-                        prefix="/api/actions", tags=["actions"], dependencies=api_dependencies)
-    _register_endpoints(app, resources_v2.router,
-                        prefix="/api/v1/resources", tags=["resources"], dependencies=api_dependencies)
-    _register_endpoints(app, resources_v2.router,
-                        prefix="/api/resources", tags=["resources"], dependencies=api_dependencies)
-    _register_endpoints(app, security_v2.router,
-                        prefix="/api/v1/security", tags=["security"], dependencies=[])
-    _register_endpoints(app, security_v2.router,
-                        prefix="/api/security", tags=["security"], dependencies=[])
-    _register_endpoints(app, themes_v2.router,
-                        prefix="/api/v1/themes", tags=["themes"], dependencies=[])
-    _register_endpoints(app, themes_v2.router,
-                        prefix="/api/themes", tags=["themes"], dependencies=[])
+    route_registrations = [
+        (artifacts_v2.router, "/api/v1/artifacts", ["artifacts"], api_dependencies),
+        (artifacts_v2.router, "/api/artifacts", ["artifacts"], api_dependencies),
+        (plugins_v2.router, "/api/v1/plugins", ["plugins"], api_dependencies),
+        (plugins_v2.router, "/api/plugins", ["plugins"], api_dependencies),
+        (system_v2.router, "/api/v1/system", ["system"], api_dependencies),
+        (system_v2.router, "/api/system", ["system"], api_dependencies),
+        (system_public_v2.router, "/api/v1", ["system"], []),
+        (system_public_v2.router, "/api", ["system"], []),
+        (collections_v2.router, "/api/v1/collections", ["collections"], api_dependencies),
+        (collections_v2.router, "/api/collections", ["collections"], api_dependencies),
+        (executions_v2.router, "/api/v1/executions", ["executions"], api_dependencies),
+        (executions_v2.router, "/api/executions", ["executions"], api_dependencies),
+        (workflows_v2.router, "/api/v1/workflows", ["workflows"], api_dependencies),
+        (workflows_v2.router, "/api/workflows", ["workflows"], api_dependencies),
+        (config_v2.router, "/api/v1/config", ["config"], api_dependencies),
+        (config_v2.router, "/api/config", ["config"], api_dependencies),
+        (maintenance_v2.router, "/api/v1/maintenance", ["maintenance"], api_dependencies),
+        (maintenance_v2.router, "/api/maintenance", ["maintenance"], api_dependencies),
+        (actions_v2.router, "/api/v1/actions", ["actions"], api_dependencies),
+        (actions_v2.router, "/api/actions", ["actions"], api_dependencies),
+        (resources_v2.router, "/api/v1/resources", ["resources"], api_dependencies),
+        (resources_v2.router, "/api/resources", ["resources"], api_dependencies),
+        (security_router.router, "/api/v1/security", ["security"], []),
+        (security_router.router, "/api/security", ["security"], []),
+        (themes_v2.router, "/api/v1/themes", ["themes"], []),
+        (themes_v2.router, "/api/themes", ["themes"], []),
+        (workers_v1.router, "/api/v1/workers", ["workers"], []),
+        (panels_v1.router, "/api/v1/panels", ["panels"], api_dependencies),
+        (panels_v1.router, "/api/panels", ["panels"], api_dependencies),
+        (lotus_v2.router, "/api/v1/lotus", ["lotus"], api_dependencies),
+        (lotus_v2.router, "/api/lotus", ["lotus"], api_dependencies),
+        (lotus_config.router, "/api/v1/lotus", ["lotus", "config"], api_dependencies),
+        (lotus_config.router, "/api/lotus", ["lotus", "config"], api_dependencies),
+        (lotus_invoke_routes.router, "/api/v1/lotus", ["lotus"], api_dependencies),
+        (lotus_invoke_routes.router, "/api/lotus", ["lotus"], api_dependencies),
+    ]
 
-    _register_endpoints(app, lotus_v2.router,
-                        prefix="/api/v1/lotus", tags=["lotus"], dependencies=api_dependencies)
-    _register_endpoints(app, lotus_v2.router,
-                        prefix="/api/lotus", tags=["lotus"], dependencies=api_dependencies)
-    _register_endpoints(app, lotus_config.router, tags=["lotus", "config"],
-                        prefix="/api/v1/lotus", dependencies=api_dependencies
-                        )
-    _register_endpoints(app, lotus_config.router, tags=["lotus", "config"],
-                        prefix="/api/lotus", dependencies=api_dependencies
-                        )
-    _register_endpoints(app, lotus_invoke_routes.router,
-                        prefix="/api/v1/lotus", tags=["lotus"], dependencies=api_dependencies)
-    _register_endpoints(app, lotus_invoke_routes.router,
-                        prefix="/api/lotus", tags=["lotus"], dependencies=api_dependencies)
+    for router_obj, prefix, tags, dependencies in route_registrations:
+        _register_endpoints(
+            app,
+            router_obj,
+            prefix=prefix,
+            tags=tags,
+            dependencies=dependencies,
+        )
     # app.include_router(projections_v2.router,
     #                    prefix="/api/v2/projections", tags=["projections"])
 
@@ -818,23 +832,50 @@ def create_app(
         # This ensures the correct directory (Source vs Dist) is served for each plugin
         mounted_plugins: set[str] = set()
 
+        def _resolve_dist_root(plugin_name: str) -> "Path | None":
+            """Find a plugin's built output in the dist directory.
+
+            Searches ``dist/{plugin_name}`` (legacy flat layout) first, then
+            ``dist/{prefix}/{plugin_name}`` for any subdirectory *prefix* that
+            the SDK build may have produced (e.g. ``plugins``, ``services``).
+            """
+            cli_root = Path(__file__).resolve().parents[3]
+            repo_root = cli_root.parent
+            dist_base = repo_root / "embeddr-plugins" / "dist"
+
+            # Legacy: dist/<plugin_name>
+            flat = dist_base / plugin_name
+            if flat.exists():
+                return flat
+
+            # New: dist/<prefix>/<plugin_name>
+            if dist_base.exists():
+                for prefix_dir in sorted(dist_base.iterdir()):
+                    if not prefix_dir.is_dir():
+                        continue
+                    candidate = prefix_dir / plugin_name
+                    if candidate.exists():
+                        return candidate
+
+            return None
+
         def _mount_plugin_static(plugin_name: str, source_path: Path) -> None:
             if plugin_name in mounted_plugins:
                 return
             try:
-                cli_root = Path(__file__).resolve().parents[3]
-                repo_root = cli_root.parent
-                dist_root = repo_root / "embeddr-plugins" / "dist" / plugin_name
-                static_root = dist_root if dist_root.exists() else source_path
+                dist_root = _resolve_dist_root(plugin_name)
+                static_root = dist_root if dist_root and dist_root.exists() else source_path
                 public_root = static_root
-                public_web_root = dist_root / "web" / "dist"
-                if public_web_root.exists():
-                    public_root = public_web_root
+                if dist_root:
+                    public_web_root = dist_root / "web" / "dist"
+                    if public_web_root.exists():
+                        public_root = public_web_root
                 public_assets_root = None
-                dist_assets_root = dist_root / "assets"
-                if dist_assets_root.exists():
-                    public_assets_root = dist_assets_root
-                else:
+                if dist_root:
+                    dist_assets_root = dist_root / "assets"
+                    if dist_assets_root.exists():
+                        public_assets_root = dist_assets_root
+                if not public_assets_root:
                     source_assets_root = source_path / "assets"
                     if source_assets_root.exists():
                         public_assets_root = source_assets_root
@@ -979,10 +1020,38 @@ def register(app: typer.Typer):
             False, help="Disable all plugin loading."),
         plugins_dir: str = typer.Option(
             None, help="Directory to serve plugins from."),
+        worker: bool = typer.Option(
+            False, help="Run as a headless worker node (no UI, no auth routes)."),
+        main_url: str = typer.Option(
+            None, help="URL of the main instance to connect to (worker mode)."),
+        worker_key: str = typer.Option(
+            None, help="API key for authenticating with the main instance (worker mode)."),
+        worker_name: str = typer.Option(
+            None, help="Human-readable name for this worker (defaults to hostname)."),
+        worker_tags: str = typer.Option(
+            None, help="Comma-separated capability tags (e.g., gpu,encoder,av1)."),
     ):
         """
         Start the Embeddr Local API server.
+
+        In worker mode (--worker), starts a headless instance that connects to
+        a main embeddr server and processes jobs remotely.
         """
+        # Validate worker mode flags
+        if worker:
+            if not main_url:
+                typer.secho(
+                    "Error: --main-url is required in worker mode.",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(1)
+            if not worker_key:
+                typer.secho(
+                    "Error: --worker-key is required in worker mode.",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(1)
+
         # Set environment variables for the app to use in lifespan
         os.environ["EMBEDDR_HOST"] = host
         os.environ["EMBEDDR_PORT"] = str(port)
@@ -991,6 +1060,16 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
         os.environ["EMBEDDR_NO_PLUGINS"] = str(no_plugins).lower()
+
+        # Worker mode env vars
+        if worker:
+            os.environ["EMBEDDR_WORKER_MODE"] = "true"
+            os.environ["EMBEDDR_WORKER_MAIN_URL"] = main_url
+            os.environ["EMBEDDR_WORKER_KEY"] = worker_key
+            if worker_name:
+                os.environ["EMBEDDR_WORKER_NAME"] = worker_name
+            if worker_tags:
+                os.environ["EMBEDDR_WORKER_TAGS"] = worker_tags
 
         # Check if data directory exists
         data_dir_env = os.environ.get("EMBEDDR_DATA_DIR")
@@ -1035,7 +1114,30 @@ def register(app: typer.Typer):
 
         log_level = "info" if verbose else "warning"
 
-        if reload:
+        if worker:
+            # Worker mode: use the lightweight worker app
+            from embeddr.worker.app import create_worker_app
+            worker_app = create_worker_app(
+                enable_docs=docs,
+                no_plugins=no_plugins,
+            )
+            typer.secho(
+                f"\n🔧 Starting Embeddr Worker Node",
+                fg=typer.colors.CYAN,
+                bold=True,
+            )
+            typer.secho(
+                f"   Connecting to: {main_url}",
+                fg=typer.colors.CYAN,
+            )
+            uvicorn.run(
+                worker_app,
+                host=host,
+                port=port,
+                log_level=log_level,
+                ws="websockets-sansio",
+            )
+        elif reload:
             # When reloading, we can't pass the app instance directly
             # We need to pass the import string.
             # However, factory=True allows us to pass arguments to the factory function

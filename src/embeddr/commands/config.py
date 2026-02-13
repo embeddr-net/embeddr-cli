@@ -40,10 +40,8 @@ def init(
 @app.command()
 def show():
     """Show the current configuration and paths."""
-    print(f"Project Name: {settings.PROJECT_NAME}")
     print(f"Data Directory: {settings.DATA_DIR}")
     print(f"Database URL: {settings.DATABASE_URL}")
-    print(f"Thumbnails Dir: {settings.THUMBNAILS_DIR}")
     print(f"Vector Storage Dir: {settings.VECTOR_STORAGE_DIR}")
 
     # Calculate Frontend Dir (same logic as serve.py)
