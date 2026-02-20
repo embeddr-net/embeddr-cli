@@ -3,13 +3,17 @@ from sqlmodel import Session, select
 from embeddr.commands.serve import create_app
 from embeddr.db.session import get_engine
 from embeddr_core.models.artifact_execution import ArtifactExecution
-from embeddr.core.plugin_loader import load_python_plugins
 from pathlib import Path
 from uuid import uuid4
 import time
 import os
+import pytest
 
 
+@pytest.mark.skipif(
+    not os.environ.get("EMBEDDR_INTEGRATION"),
+    reason="Integration test – requires EMBEDDR_INTEGRATION=1 and loaded plugins",
+)
 def test_execution_lifecycle():
     # 1. Setup App & Plugins
     app = create_app()
@@ -24,9 +28,9 @@ def test_execution_lifecycle():
     # but the execution framework should handle the failure gracefully.
     dummy_id = str(uuid4())
 
-    response = client.post("/api/v2/executions/", json={
+    response = client.post("/api/v1/executions", json={
         "plugin_name": "embeddr-thumbnailer",
-        "action_name": "generate_thumbnail",
+        "job_type": "generate_thumbnail",
         "inputs": {"artifact_id": dummy_id, "preview_size": 50},
     })
 
@@ -43,13 +47,13 @@ def test_execution_lifecycle():
 
     # Poll for status update
     for _ in range(5):
-        resp = client.get(f"/api/v2/executions/{execution_id}")
+        resp = client.get(f"/api/v1/executions/{execution_id}")
         d = resp.json()
         if d["status"] != "pending" and d["status"] != "running":
             break
         time.sleep(0.5)
 
-    final_resp = client.get(f"/api/v2/executions/{execution_id}")
+    final_resp = client.get(f"/api/v1/executions/{execution_id}")
     final_data = final_resp.json()
 
     # It should have failed because artifact doesn't exist

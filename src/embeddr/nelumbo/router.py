@@ -63,6 +63,7 @@ class NelumboContextResponse(BaseModel):
     workspace_detected: bool
     project_root: Optional[str] = None
     api_base_url: Optional[str] = None
+    selected_workspace: Optional[str] = None
 
 
 class ServerStatusResponse(BaseModel):
@@ -83,6 +84,7 @@ class ServerStartRequest(BaseModel):
     port: int = 8003
     data_dir: Optional[str] = None
     plugins_dir: Optional[str] = None
+    workspace_path: Optional[str] = None
     enable_docs: bool = False
     allow_dev_origins: bool = False
     confirm: bool = False
@@ -122,6 +124,39 @@ class WorkspaceCreateResponse(BaseModel):
     plugins_dir: str
     installed_plugins: List[str] = Field(default_factory=list)
     missing_plugins: List[str] = Field(default_factory=list)
+
+
+class WorkspaceSummary(BaseModel):
+    name: str
+    path: str
+    auth_mode: str
+    api_base_url: Optional[str] = None
+    is_selected: bool = False
+
+
+class WorkspaceDiscoverResponse(BaseModel):
+    ok: bool
+    root: str
+    count: int
+    workspaces: List[WorkspaceSummary] = Field(default_factory=list)
+    message: Optional[str] = None
+
+
+class WorkspaceSelectRequest(BaseModel):
+    workspace_path: str
+    confirm: bool = False
+
+
+class WorkspaceSelectResponse(BaseModel):
+    ok: bool
+    message: Optional[str] = None
+    workspace_path: Optional[str] = None
+
+
+class WorkspaceCurrentResponse(BaseModel):
+    ok: bool
+    selected_workspace: Optional[str] = None
+    active_workspace: str
 
 
 class DatabaseTestRequest(BaseModel):
@@ -214,6 +249,7 @@ def start_server(payload: ServerStartRequest) -> ServerStatusResponse:
         port=payload.port,
         data_dir=payload.data_dir,
         plugins_dir=payload.plugins_dir,
+        workspace_path=payload.workspace_path,
         enable_docs=payload.enable_docs,
         allow_dev_origins=payload.allow_dev_origins,
         confirm=payload.confirm,
@@ -225,12 +261,6 @@ def start_server(payload: ServerStartRequest) -> ServerStatusResponse:
 def stop_server(payload: ServerStopRequest) -> ServerStatusResponse:
     result = nelumbo_service.stop_embeddr_server(confirm=payload.confirm)
     return ServerStatusResponse(**result)
-
-
-@router.get("/server/logs", response_model=ServerLogsResponse)
-def get_server_logs(lines: int = 200) -> ServerLogsResponse:
-    result = nelumbo_service.get_embeddr_server_logs(lines=lines)
-    return ServerLogsResponse(**result)
 
 
 @router.get("/server/logs", response_model=ServerLogsResponse)
@@ -333,6 +363,32 @@ def create_workspace(payload: WorkspaceCreateRequest) -> WorkspaceCreateResponse
         database_url=payload.database_url,
     )
     return WorkspaceCreateResponse(**result)
+
+
+@router.get("/workspaces/discover", response_model=WorkspaceDiscoverResponse)
+def discover_workspaces(root: Optional[str] = None, max_depth: int = 4) -> WorkspaceDiscoverResponse:
+    result = nelumbo_service.discover_workspaces(
+        search_root=root,
+        max_depth=max(1, min(max_depth, 8)),
+    )
+    return WorkspaceDiscoverResponse(**result)
+
+
+@router.get("/workspace/current", response_model=WorkspaceCurrentResponse)
+def get_current_workspace() -> WorkspaceCurrentResponse:
+    return WorkspaceCurrentResponse(**nelumbo_service.get_selected_workspace())
+
+
+@router.post("/workspace/select", response_model=WorkspaceSelectResponse)
+def select_workspace(payload: WorkspaceSelectRequest) -> WorkspaceSelectResponse:
+    if not payload.confirm:
+        raise HTTPException(status_code=400, detail="Confirmation required")
+    if not payload.workspace_path.strip():
+        raise HTTPException(status_code=400, detail="Workspace path required")
+    result = nelumbo_service.set_selected_workspace(
+        workspace_path=payload.workspace_path.strip(),
+    )
+    return WorkspaceSelectResponse(**result)
 
 
 @router.post("/database/test", response_model=DatabaseTestResponse)

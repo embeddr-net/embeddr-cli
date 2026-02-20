@@ -9,10 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select, func
 
-from embeddr.api.security import get_auth_context
+from embeddr.api.security import COOKIE_NAME, get_auth_context
 from embeddr.db.session import get_session
 from embeddr.services import auth_service
 from embeddr_core.models.api_key import ApiKey, ApiKeyPermission
+from embeddr_core.models.auth_session import AuthSession
 from embeddr_core.models.role import Role, RolePermission
 from embeddr_core.models.operator import Operator
 from embeddr_core.models.user_account import UserAccount, UserRole
@@ -70,6 +71,22 @@ class AuthSessionInfo(BaseModel):
     user: Optional[SessionUserInfo] = None
     client_key: Optional[SessionClientKeyInfo] = None
     permissions: List[str] = Field(default_factory=list)
+
+
+class AuthSessionSummary(BaseModel):
+    id: str
+    session_name: Optional[str] = None
+    auth_method: Optional[str] = None
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    created_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    revoked_at: Optional[str] = None
+    revoked_reason: Optional[str] = None
+    rotated_from_id: Optional[str] = None
+    api_key_id: Optional[str] = None
+    current: bool = False
 
 
 class OperatorSummary(BaseModel):
@@ -146,6 +163,22 @@ class ApiKeySelfCreateRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    session_name: Optional[str] = None
+
+
+class RefreshSessionRequest(BaseModel):
+    session_name: Optional[str] = None
+
+
+class LogoutAllRequest(BaseModel):
+    confirm: bool = False
+    include_current: bool = False
+    user_id: Optional[UUID] = None
+
+
+class SwitchClientSessionRequest(BaseModel):
+    user_id: UUID
+    session_name: Optional[str] = None
 
 
 class UserProfileResponse(BaseModel):
@@ -170,7 +203,7 @@ class OperatorProfileUpdateRequest(BaseModel):
 
 
 def _validate_self_key_permissions(auth, permissions: List[str], scopes: List[str]) -> None:
-    if auth.is_open or auth.is_admin:
+    if auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
         return
     for perm in permissions:
         if not auth.can(perm):
@@ -179,6 +212,15 @@ def _validate_self_key_permissions(auth, permissions: List[str], scopes: List[st
     for scope in scopes:
         if not auth.can(scope):
             raise HTTPException(status_code=403, detail="Scope not allowed")
+
+
+def _request_client_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        primary = forwarded_for.split(",")[0].strip()
+        if primary:
+            return primary
+    return request.client.host if request.client else None
 
 
 def _get_operator_stats(
@@ -894,7 +936,7 @@ def create_api_key_self(
         raise HTTPException(status_code=400, detail="Confirmation required")
     if not auth.user_id:
         raise HTTPException(status_code=403, detail="No authenticated user")
-    if not (auth.is_open or auth.is_admin or auth.can("keys:create:self")):
+    if not (auth.is_open or auth.is_admin or getattr(auth, "is_root", False) or auth.can("keys:create:self")):
         raise HTTPException(status_code=403, detail="Not authorized")
     _validate_self_key_permissions(auth, payload.permissions, payload.scopes)
     if auth.user_id:
@@ -1005,19 +1047,23 @@ def login_with_password(
     ):
         raise HTTPException(status_code=403, detail="Invalid credentials")
 
-    api_key, raw_key = auth_service.create_api_key(
+    operator_id = user.operator_id
+    auth_session, session_token = auth_service.create_auth_session(
         session,
         user_id=user.id,
-        name="login",
-        scopes=[],
-        permissions=[],
+        operator_id=operator_id,
+        api_key_id=None,
+        session_name=payload.session_name or "password-login",
+        auth_method="password",
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_request_client_ip(request),
     )
 
     secure = request.url.scheme == "https"
     samesite = "none" if secure else "lax"
     response.set_cookie(
-        "embeddr_auth",
-        raw_key,
+        COOKIE_NAME,
+        session_token,
         httponly=True,
         secure=secure,
         samesite=samesite,
@@ -1026,8 +1072,10 @@ def login_with_password(
 
     return {
         "ok": True,
-        "key": raw_key,
-        "key_prefix": api_key.key_prefix,
+        "key": session_token,
+        "key_prefix": session_token[:8],
+        "session_id": str(auth_session.id),
+        "expires_at": auth_session.expires_at.isoformat() if auth_session.expires_at else None,
         "user": {
             "id": str(user.id),
             "username": user.username,
@@ -1053,30 +1101,37 @@ def logout(
     if not auth.authenticated:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Revoke the API key used for this request
-    if auth.api_key_id:
+    raw_cookie_credential = request.cookies.get(COOKIE_NAME)
+
+    if auth.session_id:
+        current_session = session.get(AuthSession, auth.session_id)
+        if current_session:
+            auth_service.revoke_auth_session_with_reason(
+                session, current_session, "logout"
+            )
+    elif raw_cookie_credential and raw_cookie_credential.startswith(auth_service.SESSION_TOKEN_PREFIX):
+        current_session = auth_service.lookup_auth_session(
+            session, raw_cookie_credential)
+        if current_session:
+            auth_service.revoke_auth_session_with_reason(
+                session, current_session, "logout"
+            )
+
+    # Legacy compatibility: if old disposable login API keys still exist, revoke on logout.
+    if auth.api_key_id and auth.api_key_name == "login":
         api_key = session.get(ApiKey, auth.api_key_id)
         if api_key:
-            # Only revoke login-created keys automatically.
-            # For named keys, just disable rather than delete to preserve audit trail.
-            if api_key.name == "login":
-                # Delete login session keys entirely (they're disposable)
-                session.exec(select(ApiKeyPermission).where(
-                    ApiKeyPermission.api_key_id == api_key.id)).all()
-                for perm in session.exec(select(ApiKeyPermission).where(
-                        ApiKeyPermission.api_key_id == api_key.id)):
-                    session.delete(perm)
-                session.delete(api_key)
-            else:
-                # For named API keys, just disable them
-                api_key.is_active = False
+            for perm in session.exec(select(ApiKeyPermission).where(
+                    ApiKeyPermission.api_key_id == api_key.id)):
+                session.delete(perm)
+            session.delete(api_key)
             session.commit()
 
     # Clear the auth cookie regardless
     secure = request.url.scheme == "https"
     samesite = "none" if secure else "lax"
     response.delete_cookie(
-        "embeddr_auth",
+        COOKIE_NAME,
         path="/",
         httponly=True,
         secure=secure,
@@ -1084,6 +1139,277 @@ def logout(
     )
 
     return {"ok": True, "message": "Logged out successfully"}
+
+
+@router.get("/sessions")
+def list_my_sessions(
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    rows = session.exec(
+        select(AuthSession)
+        .where(AuthSession.user_id == auth.user_id)
+        .order_by(AuthSession.last_used_at.desc())
+    ).all()
+
+    items = [
+        AuthSessionSummary(
+            id=str(row.id),
+            session_name=row.session_name,
+            auth_method=row.auth_method,
+            user_agent=row.user_agent,
+            ip_address=row.ip_address,
+            created_at=row.created_at.isoformat() if row.created_at else None,
+            last_used_at=row.last_used_at.isoformat()
+            if row.last_used_at
+            else None,
+            expires_at=row.expires_at.isoformat() if row.expires_at else None,
+            revoked_at=row.revoked_at.isoformat() if row.revoked_at else None,
+            revoked_reason=row.revoked_reason,
+            rotated_from_id=str(row.rotated_from_id)
+            if row.rotated_from_id
+            else None,
+            api_key_id=str(row.api_key_id) if row.api_key_id else None,
+            current=bool(auth.session_id and row.id == auth.session_id),
+        )
+        for row in rows
+    ]
+    return {"items": [item.model_dump() for item in items]}
+
+
+@router.post("/sessions/refresh")
+def refresh_my_session(
+    request: Request,
+    response: Response,
+    payload: RefreshSessionRequest,
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not auth_service.is_auth_enabled():
+        raise HTTPException(
+            status_code=400, detail="Authentication is disabled")
+    if not auth.session_id:
+        raise HTTPException(
+            status_code=400, detail="Current credential is not a session")
+
+    current = session.get(AuthSession, auth.session_id)
+    if not current or current.revoked_at is not None:
+        raise HTTPException(status_code=401, detail="Session is not active")
+
+    rotated, raw_token = auth_service.rotate_auth_session(
+        session,
+        auth_session=current,
+        session_name=payload.session_name,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_request_client_ip(request),
+    )
+
+    secure = request.url.scheme == "https"
+    samesite = "none" if secure else "lax"
+    response.set_cookie(
+        COOKIE_NAME,
+        raw_token,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        path="/",
+    )
+
+    return {
+        "ok": True,
+        "session_id": str(rotated.id),
+        "key": raw_token,
+        "key_prefix": raw_token[:8],
+        "expires_at": rotated.expires_at.isoformat() if rotated.expires_at else None,
+    }
+
+
+@router.delete("/sessions/{session_id}")
+def revoke_session(
+    session_id: UUID,
+    confirm: bool = Query(False),
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Confirmation required")
+
+    target = session.get(AuthSession, session_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not auth.is_admin and auth.user_id != target.user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    auth_service.revoke_auth_session_with_reason(session, target, "revoked")
+    return {"ok": True, "id": str(target.id), "revoked": True}
+
+
+@router.post("/logout-all")
+def logout_all_sessions(
+    request: Request,
+    response: Response,
+    payload: LogoutAllRequest,
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not payload.confirm:
+        raise HTTPException(status_code=400, detail="Confirmation required")
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    target_user_id = payload.user_id or auth.user_id
+    if payload.user_id and not auth.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    exclude_session_id = None if payload.include_current else auth.session_id
+    revoked_count = auth_service.revoke_all_auth_sessions(
+        session,
+        user_id=target_user_id,
+        exclude_session_id=exclude_session_id,
+        reason="logout_all",
+    )
+
+    if payload.include_current:
+        secure = request.url.scheme == "https"
+        samesite = "none" if secure else "lax"
+        response.delete_cookie(
+            COOKIE_NAME,
+            path="/",
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+        )
+
+    return {
+        "ok": True,
+        "revoked": revoked_count,
+        "target_user_id": str(target_user_id),
+        "included_current": payload.include_current,
+    }
+
+
+@router.get("/clients/me")
+def list_operator_clients_for_session(
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    current_user = session.get(UserAccount, auth.user_id)
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not current_user.operator_id:
+        return {
+            "items": [
+                {
+                    "id": str(current_user.id),
+                    "username": current_user.username,
+                    "display_name": current_user.display_name,
+                    "is_admin": bool(current_user.is_admin),
+                    "is_active": bool(current_user.is_active),
+                    "current": True,
+                }
+            ]
+        }
+
+    users = session.exec(
+        select(UserAccount)
+        .where(UserAccount.operator_id == current_user.operator_id)
+        .order_by(UserAccount.username)
+    ).all()
+    return {
+        "items": [
+            {
+                "id": str(user.id),
+                "username": user.username,
+                "display_name": user.display_name,
+                "is_admin": bool(user.is_admin),
+                "is_active": bool(user.is_active),
+                "current": bool(auth.user_id == user.id),
+            }
+            for user in users
+        ]
+    }
+
+
+@router.post("/sessions/switch-client")
+def switch_client_session(
+    request: Request,
+    response: Response,
+    payload: SwitchClientSessionRequest,
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    if not auth_service.is_auth_enabled():
+        raise HTTPException(
+            status_code=400, detail="Authentication is disabled")
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    source_user = session.get(UserAccount, auth.user_id)
+    if not source_user:
+        raise HTTPException(status_code=404, detail="Current user not found")
+
+    target_user = session.get(UserAccount, payload.user_id)
+    if not target_user or not target_user.is_active:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    if source_user.operator_id != target_user.operator_id:
+        raise HTTPException(
+            status_code=403, detail="Target user is outside current operator")
+
+    if not auth.is_admin and target_user.id != source_user.id:
+        raise HTTPException(
+            status_code=403, detail="Admin access required to switch client")
+
+    if auth.session_id:
+        current_session = session.get(AuthSession, auth.session_id)
+        if current_session:
+            auth_service.revoke_auth_session_with_reason(
+                session, current_session, "switch_identity"
+            )
+
+    new_session, raw_token = auth_service.create_auth_session(
+        session,
+        user_id=target_user.id,
+        operator_id=target_user.operator_id,
+        api_key_id=None,
+        session_name=payload.session_name or f"switch:{target_user.username}",
+        auth_method="switch",
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_request_client_ip(request),
+    )
+
+    secure = request.url.scheme == "https"
+    samesite = "none" if secure else "lax"
+    response.set_cookie(
+        COOKIE_NAME,
+        raw_token,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        path="/",
+    )
+
+    return {
+        "ok": True,
+        "session_id": str(new_session.id),
+        "key": raw_token,
+        "key_prefix": raw_token[:8],
+        "user": {
+            "id": str(target_user.id),
+            "username": target_user.username,
+            "display_name": target_user.display_name,
+            "is_admin": bool(target_user.is_admin),
+        },
+        "operator_id": str(target_user.operator_id) if target_user.operator_id else None,
+    }
 
 
 # ── Permissions catalogue ──────────────────────────────────────────────

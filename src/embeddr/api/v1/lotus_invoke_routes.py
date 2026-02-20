@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Dict, Optional, Type
+from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, ValidationError
 from sqlmodel import Session
 
 from embeddr.db.session import get_engine, get_session
@@ -19,6 +20,7 @@ from embeddr_core.services.resource_manager import resource_manager
 from embeddr_core.models.lotus import LotusCapability, LotusKind
 from embeddr_core.services.config_service import resolve_plugin_config
 from embeddr.core.plugin_context_helpers import LotusContext
+from embeddr.core.execution_spine import ExecutionSpine
 
 from embeddr.core.model_imports import import_model_with_fallbacks
 
@@ -132,11 +134,61 @@ def _cap_input_model(cap: LotusCapability) -> Optional[Type[BaseModel]]:
     )
 
 
+def _normalize_legacy_inputs(
+    *,
+    cap_id: str,
+    plugin_name: str,
+    action_name: str,
+    inputs: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized = dict(inputs or {})
+
+    is_comfy = plugin_name == "embeddr-comfyui"
+    comfy_workflow_actions = {
+        "embeddr-comfyui.get_workflow",
+        "embeddr-comfyui.run_workflow",
+        "embeddr-comfyui.resolve_workflow_inputs",
+    }
+    if (
+        is_comfy
+        and cap_id in comfy_workflow_actions
+        and "workflow_id" not in normalized
+        and normalized.get("id")
+    ):
+        normalized["workflow_id"] = normalized["id"]
+
+    if (
+        is_comfy
+        and action_name in comfy_workflow_actions
+        and "workflow_id" not in normalized
+        and normalized.get("id")
+    ):
+        normalized["workflow_id"] = normalized["id"]
+
+    return normalized
+
+
+def _resolve_wait_timeout_seconds(inputs: Dict[str, Any]) -> float:
+    raw_timeout = (
+        inputs.get("wait_timeout_seconds")
+        or inputs.get("timeout_seconds")
+        or inputs.get("timeout")
+    )
+    if raw_timeout is None:
+        return 300.0
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        return 300.0
+    return timeout if timeout > 0 else 300.0
+
+
 @router.post("/{cap_id}")
 async def lotus_invoke(
     cap_id: str,
     input: Dict[str, Any] = None,
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
@@ -144,12 +196,15 @@ async def lotus_invoke(
     cap = reg.get(cap_id)
     if not cap:
         raise HTTPException(404, f"Capability not found: {cap_id}")
-    if cap.kind != LotusKind.action:
-        raise HTTPException(400, "Only action capabilities can be invoked")
+    if cap.kind not in (LotusKind.action, LotusKind.feature):
+        raise HTTPException(
+            400,
+            "Only action or feature capabilities can be invoked",
+        )
     if not _cap_exposes_api(cap):
         raise HTTPException(403, f"Capability not exposed to API: {cap_id}")
 
-    if not (auth.is_open or auth.is_admin):
+    if not (auth.is_open or auth.is_admin or getattr(auth, "is_root", False)):
         allowed = auth.can("lotus:dispatch") or auth.can("lotus:*")
         allowed = allowed or auth.can(
             auth_service.lotus_permission_for_capability(cap.id))
@@ -175,18 +230,38 @@ async def lotus_invoke(
         transport="lotus",
     )
 
-    inputs = input or {}
+    inputs = _normalize_legacy_inputs(
+        cap_id=cap_id,
+        plugin_name=plugin_name,
+        action_name=action_name,
+        inputs=input or {},
+    )
 
     # Validate/normalize inputs via capability model (if provided)
     Model = _cap_input_model(cap)
     if Model is not None:
-        obj = Model.model_validate(inputs)
-        inputs = obj.model_dump()
+        try:
+            obj = Model.model_validate(inputs)
+            inputs = obj.model_dump()
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     exec_cfg = (cap.action.exec if cap.action else None) or (
         data.get("exec") or {})
     mode = exec_cfg.get("mode", "async")
     emit_events = bool(exec_cfg.get("emit_events", False))
+    caller_client_id = ""
+    if request is not None:
+        caller_client_id = (request.headers.get(
+            "x-embeddr-client-id") or "").strip()
+
+    event_target_payload = {
+        "target_user_id": str(getattr(auth, "user_id", None)) if getattr(auth, "user_id", None) else None,
+        "target_operator_id": str(getattr(auth, "operator_id", None)) if getattr(auth, "operator_id", None) else None,
+        "target_api_key_id": str(getattr(auth, "api_key_id", None)) if getattr(auth, "api_key_id", None) else None,
+    }
+    if caller_client_id:
+        event_target_payload["target_client_id"] = caller_client_id
 
     # ✅ SYNC path (returns outputs immediately)
     if mode == "sync":
@@ -205,6 +280,10 @@ async def lotus_invoke(
             lotus=LotusContext(session=session),
             user_id=getattr(auth, "user_id", None),
             operator_id=getattr(auth, "operator_id", None),
+            is_admin=bool(getattr(auth, "is_admin", False)),
+            is_root=bool(getattr(auth, "is_root", False)),
+            is_open=bool(getattr(auth, "is_open", False)),
+            permissions=set(getattr(auth, "permissions", set()) or set()),
         )
 
         if emit_events:
@@ -217,6 +296,7 @@ async def lotus_invoke(
                     "action_name": action_name,
                     "inputs": inputs,
                     "mode": "sync",
+                    **event_target_payload,
                 },
                 source="lotus",
             )
@@ -241,6 +321,7 @@ async def lotus_invoke(
                         "action_name": action_name,
                         "error": str(e),
                         "mode": "sync",
+                        **event_target_payload,
                     },
                     source="lotus",
                 )
@@ -256,6 +337,7 @@ async def lotus_invoke(
                     "action_name": action_name,
                     "outputs": out,
                     "mode": "sync",
+                    **event_target_payload,
                 },
                 source="lotus",
             )
@@ -281,6 +363,8 @@ async def lotus_invoke(
         inputs=inputs,
         session=session,
         capability=cap,
+        auth=auth,
+        caller_client_id=caller_client_id,
     )
     _log_lotus_call(
         cap_id=cap_id,
@@ -290,4 +374,50 @@ async def lotus_invoke(
         transport="lotus",
         outcome="queued",
     )
+
+    should_wait = bool(inputs.get("wait_for_completion"))
+    execution_id = response.get("execution_id") if isinstance(
+        response, dict) else None
+    if should_wait and execution_id:
+        timeout = _resolve_wait_timeout_seconds(inputs)
+        try:
+            result = await ExecutionSpine.wait_for_job_async(
+                UUID(str(execution_id)), timeout=timeout,
+            )
+            final_status = result.status or "unknown"
+            final_response: Dict[str, Any] = {
+                "ok": final_status != "failed",
+                "kind": "action",
+                "execution_id": str(execution_id),
+                "status": final_status,
+                "message": "completed" if final_status == "completed" else final_status,
+                "outputs": result.outputs or {},
+            }
+            if result.error:
+                final_response["error"] = result.error
+            _log_lotus_call(
+                cap_id=cap_id,
+                plugin_name=plugin_name,
+                action_name=action_name,
+                auth=auth,
+                transport="lotus",
+                outcome=final_status,
+            )
+            return final_response
+        except TimeoutError:
+            return {
+                "ok": True,
+                "kind": "action",
+                "execution_id": str(execution_id),
+                "status": "timeout",
+                "message": f"Timed out waiting for completion after {timeout:.1f}s",
+            }
+        except Exception as exc:
+            logger.warning(
+                "Failed waiting for completion cap=%s execution_id=%s: %s",
+                cap_id,
+                execution_id,
+                exc,
+            )
+
     return response

@@ -15,6 +15,10 @@ from embeddr_core.models.artifact_feature import ArtifactFeatureRef
 from embeddr_core.models.artifact_annotation import ArtifactAnnotation
 from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact import ArtifactPreview
+from embeddr_core.relations import (
+    STRUCTURAL_CHILD_TO_PARENT,
+    STRUCTURAL_PARENT_TO_CHILD,
+)
 from embeddr.api.security import require_permission_for_request
 from embeddr.auth.permissions import Permissions
 from pydantic import BaseModel
@@ -124,12 +128,12 @@ def get_db_orphans(limit: int = 100, session: Session = Depends(get_session)):
 
     # Subquery for items that are contained in something
     subq_inside = select(ArtifactRelation.source_id).where(
-        ArtifactRelation.relation_type.in_(["contained_in", "member_of"])
+        ArtifactRelation.relation_type.in_(STRUCTURAL_CHILD_TO_PARENT)
     )
 
     # Subquery for items that contain something (parents)
     subq_contains = select(ArtifactRelation.target_id).where(
-        ArtifactRelation.relation_type.in_(["contains", "group"])
+        ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
     )
 
     # Find items that are NOT in these subqueries

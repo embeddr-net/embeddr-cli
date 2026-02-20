@@ -209,6 +209,9 @@ class DBJobContext:
             parent_execution_id=self.execution_id,
             trigger=trigger,
             primary_artifact_id=primary_artifact_id,
+            operator_id=self.execution.operator_id,
+            api_key_id=self.execution.api_key_id,
+            tags=dict(self.execution.tags or {}),
             session=self.session,
         )
 
@@ -386,7 +389,8 @@ class ExecutionSpine:
         with Session(engine) as session:
             job = session.get(ArtifactExecution, job_id)
             if not job:
-                raise RuntimeError(f"Job {job_id} not found after completion signal")
+                raise RuntimeError(
+                    f"Job {job_id} not found after completion signal")
             return job
 
     @staticmethod
@@ -428,7 +432,8 @@ class ExecutionSpine:
 
         job = await asyncio.to_thread(_fetch)
         if not job:
-            raise RuntimeError(f"Job {job_id} not found after completion signal")
+            raise RuntimeError(
+                f"Job {job_id} not found after completion signal")
         return job
 
     @classmethod
@@ -447,6 +452,9 @@ class ExecutionSpine:
                    parent_execution_id: Optional[UUID] = None,
                    trigger: str = "user",
                    primary_artifact_id: Optional[UUID] = None,
+                   operator_id: Optional[UUID] = None,
+                   api_key_id: Optional[str] = None,
+                   tags: Optional[Dict[str, str]] = None,
                    session: Optional[Session] = None) -> ArtifactExecution:
         """
         Public API to queue work.
@@ -455,7 +463,8 @@ class ExecutionSpine:
             # Use existing session
             return cls._create_job_in_session(
                 session, job_type, inputs, plugin_name, resource_class,
-                priority, parent_execution_id, trigger, primary_artifact_id
+                priority, parent_execution_id, trigger, primary_artifact_id,
+                operator_id, api_key_id, tags,
             )
         else:
             # Create new session
@@ -463,7 +472,8 @@ class ExecutionSpine:
             with Session(engine) as session:
                 return cls._create_job_in_session(
                     session, job_type, inputs, plugin_name, resource_class,
-                    priority, parent_execution_id, trigger, primary_artifact_id
+                    priority, parent_execution_id, trigger, primary_artifact_id,
+                    operator_id, api_key_id, tags,
                 )
 
     @classmethod
@@ -564,7 +574,10 @@ class ExecutionSpine:
         priority: int,
         parent_execution_id: Optional[UUID],
         trigger: str,
-        primary_artifact_id: Optional[UUID]
+        primary_artifact_id: Optional[UUID],
+        operator_id: Optional[UUID],
+        api_key_id: Optional[str],
+        tags: Optional[Dict[str, str]],
     ) -> ArtifactExecution:
 
         job = ArtifactExecution(
@@ -576,7 +589,10 @@ class ExecutionSpine:
             parent_execution_id=parent_execution_id,
             trigger=trigger,
             primary_artifact_id=primary_artifact_id,
-            status="pending"
+            status="pending",
+            operator_id=operator_id,
+            api_key_id=api_key_id,
+            tags=dict(tags or {}),
         )
         session.add(job)
         session.commit()

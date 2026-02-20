@@ -78,6 +78,7 @@ class ConnectionManager:
         websocket: WebSocket,
         *,
         user_id: Optional[str] = None,
+        operator_id: Optional[str] = None,
         username: Optional[str] = None,
         api_key_id: Optional[str] = None,
     ) -> str:
@@ -87,6 +88,8 @@ class ConnectionManager:
         meta = self._extract_client_meta(websocket)
         if user_id:
             meta["user_id"] = user_id
+        if operator_id:
+            meta["operator_id"] = operator_id
         if username:
             meta["username"] = username
         if api_key_id:
@@ -123,7 +126,51 @@ class ConnectionManager:
                 ))
                 break
 
-    async def broadcast_event(self, event_type: str, data: Any, source: str = "embeddr"):
+    @staticmethod
+    def _normalize_audience_ids(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            return {str(v) for v in value if v}
+        return {str(value)}
+
+    def _client_matches_audience(self, client_id: str, audience: Optional[Dict[str, Any]]) -> bool:
+        if not audience:
+            return True
+
+        meta = self.client_meta.get(client_id, {})
+
+        client_ids = self._normalize_audience_ids(
+            audience.get("client_ids") or audience.get("client_id")
+        )
+        user_ids = self._normalize_audience_ids(
+            audience.get("user_ids") or audience.get("user_id")
+        )
+        operator_ids = self._normalize_audience_ids(
+            audience.get("operator_ids") or audience.get("operator_id")
+        )
+        api_key_ids = self._normalize_audience_ids(
+            audience.get("api_key_ids") or audience.get("api_key_id")
+        )
+
+        if client_ids and client_id not in client_ids:
+            return False
+        if user_ids and str(meta.get("user_id") or "") not in user_ids:
+            return False
+        if operator_ids and str(meta.get("operator_id") or "") not in operator_ids:
+            return False
+        if api_key_ids and str(meta.get("api_key_id") or "") not in api_key_ids:
+            return False
+
+        return True
+
+    async def broadcast_event(
+        self,
+        event_type: str,
+        data: Any,
+        source: str = "embeddr",
+        audience: Optional[Dict[str, Any]] = None,
+    ):
         """
         Structured broadcast that ensures messages follow the standard envelope:
         { "source": ..., "type": ..., "data": ... }
@@ -133,9 +180,9 @@ class ConnectionManager:
             "type": event_type,
             "data": data
         }
-        await self.broadcast(message)
+        await self.broadcast(message, audience=audience)
 
-    async def broadcast(self, message: dict):
+    async def broadcast(self, message: dict, audience: Optional[Dict[str, Any]] = None):
         if not self.active_connections:
             return
 
@@ -154,6 +201,8 @@ class ConnectionManager:
         # Iterate over items to get client_id for cleanup
         for client_id, connection in self.active_connections.items():
             try:
+                if not self._client_matches_audience(client_id, audience):
+                    continue
                 if getattr(connection, "client_state", None) == WebSocketState.DISCONNECTED:
                     dead_client_ids.append(client_id)
                     continue

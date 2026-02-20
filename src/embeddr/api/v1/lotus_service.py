@@ -12,6 +12,30 @@ from embeddr.core.plugin_loader import get_all_plugin_instances, get_lotus_regis
 logger = logging.getLogger("embeddr.api.lotus")
 
 
+def _build_dispatch_auth_payload(
+    auth: Any | None,
+    caller_client_id: str | None = None,
+) -> Dict[str, Any] | None:
+    if auth is None:
+        if caller_client_id:
+            return {"client_id": caller_client_id}
+        return None
+
+    payload = {
+        "mode": getattr(auth, "mode", None),
+        "user_id": str(getattr(auth, "user_id", None)) if getattr(auth, "user_id", None) else None,
+        "operator_id": str(getattr(auth, "operator_id", None)) if getattr(auth, "operator_id", None) else None,
+        "api_key_id": str(getattr(auth, "api_key_id", None)) if getattr(auth, "api_key_id", None) else None,
+        "is_admin": bool(getattr(auth, "is_admin", False)),
+        "is_root": bool(getattr(auth, "is_root", False)),
+        "is_open": bool(getattr(auth, "is_open", False)),
+        "permissions": sorted(getattr(auth, "permissions", []) or []),
+    }
+    if caller_client_id:
+        payload["client_id"] = caller_client_id
+    return payload
+
+
 def _should_trace() -> bool:
     return os.environ.get("EMBEDDR_LOTUS_TRACE") == "1"
 
@@ -107,6 +131,8 @@ def lotus_dispatch_action(
     session: Session,
     parent_execution_id: str | None = None,
     capability: Any | None = None,
+    auth: Any | None = None,
+    caller_client_id: str | None = None,
 ) -> Dict[str, Any]:
     if not plugin_name or not action_name:
         raise ValueError(
@@ -123,6 +149,10 @@ def lotus_dispatch_action(
     )
     if not isinstance(merged_inputs, dict):
         merged_inputs = inputs or {}
+
+    auth_payload = _build_dispatch_auth_payload(auth, caller_client_id)
+    if auth_payload:
+        merged_inputs["__embeddr_auth"] = auth_payload
 
     parent_uuid = None
     if parent_execution_id:
@@ -166,7 +196,22 @@ def lotus_dispatch_action(
         priority=10,
         parent_execution_id=parent_uuid,
         trigger="lotus",
+        session=session,
     )
+
+    execution.operator_id = getattr(auth, "operator_id", None)
+    execution.api_key_id = (
+        str(getattr(auth, "api_key_id", None))
+        if getattr(auth, "api_key_id", None)
+        else None
+    )
+    if caller_client_id:
+        tags = dict(execution.tags or {})
+        tags["target_client_id"] = str(caller_client_id)
+        execution.tags = tags
+    session.add(execution)
+    session.commit()
+    session.refresh(execution)
 
     logger.warning(
         "[Lotus] Queued action result_id=%s plugin=%s action=%s execution_id=%s",

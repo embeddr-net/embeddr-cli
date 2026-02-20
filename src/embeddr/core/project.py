@@ -40,6 +40,9 @@ def create_default_config(
     data_dir: str | None = None,
     plugins_dir: str | None = None,
     auth_mode: str | None = None,
+    auth_default_operator_name: str | None = None,
+    auth_default_admin_username: str | None = None,
+    auth_salt: str | None = None,
 ):
     """
     Create a default embeddr.toml file.
@@ -66,6 +69,25 @@ def create_default_config(
     else:
         auth_mode_line = "# mode = \"open\"  # open | single | multi | db"
 
+    if auth_default_operator_name:
+        auth_default_operator_line = (
+            f"default_operator_name = \"{auth_default_operator_name}\""
+        )
+    else:
+        auth_default_operator_line = "# default_operator_name = \"user\""
+
+    if auth_default_admin_username:
+        auth_default_admin_line = (
+            f"default_admin_username = \"{auth_default_admin_username}\""
+        )
+    else:
+        auth_default_admin_line = "# default_admin_username = \"user\""
+
+    if auth_salt:
+        auth_salt_line = f"salt = \"{auth_salt}\""
+    else:
+        auth_salt_line = "# salt = \"<set-or-generated-salt>\""
+
     config_content = f"""[project]
 name = "{name}"
 description = "Embeddr project configuration"
@@ -89,6 +111,9 @@ port = 8003
 
 [auth]
 {auth_mode_line}
+{auth_default_operator_line}
+{auth_default_admin_line}
+{auth_salt_line}
 
 [content]
 # proxy_enabled = true

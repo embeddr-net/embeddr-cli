@@ -33,12 +33,12 @@ def _extract_raw_key(
 
 
 async def get_api_key(
+    request: Request,
     api_key_header_val: str = Security(api_key_header_scheme),
     api_key_query_val: str = Security(api_key_query_scheme),
-    request: Request = None,
 ):
     """
-    Validate the API key from header, query param, or cookie.
+    Validate an auth credential from header, query param, or cookie.
     CHECKPOINTS:
     1. Checks X-API-Key header
     2. Checks api_key query param
@@ -55,18 +55,13 @@ async def get_api_key(
             status_code=HTTP_403_FORBIDDEN, detail="Missing credentials"
         )
 
-    # DB-backed keys
+    # DB-backed keys/sessions
     with Session(get_engine()) as session:
-        api_key = auth_service.lookup_api_key(session, raw_key)
-        if not api_key:
+        ctx = auth_service.resolve_auth_context(session, raw_key)
+        if not ctx:
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
             )
-        try:
-            auth_service.touch_api_key(session, api_key)
-        except Exception:
-            logger.debug(
-                "Failed to update api key last_used_at", exc_info=True)
         return raw_key
 
 
@@ -75,9 +70,9 @@ def check_auth_enabled() -> bool:
 
 
 async def get_auth_context(
+    request: Request,
     api_key_header_val: str = Security(api_key_header_scheme),
     api_key_query_val: str = Security(api_key_query_scheme),
-    request: Request = None,
 ):
     raw_key = _extract_raw_key(api_key_header_val, api_key_query_val, request)
     mode = auth_service.get_auth_mode()
@@ -97,6 +92,7 @@ async def get_auth_context(
             authenticated=False,
             permissions={"*"},
             is_admin=True,
+            is_root=True,
         )
 
     if not raw_key:
@@ -109,27 +105,27 @@ async def get_auth_context(
         )
 
     with Session(get_engine()) as session:
-        api_key = auth_service.lookup_api_key(session, raw_key)
-        if not api_key:
+        ctx = auth_service.resolve_auth_context(session, raw_key)
+        if not ctx:
             logger.warning(
-                "auth_rejected reason=invalid_key key_prefix=%s path=%s",
+                "auth_rejected reason=invalid_credential key_prefix=%s path=%s",
                 raw_key[:8] if raw_key else "?",
                 request.url.path if request else "unknown",
             )
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
             )
-        ctx = auth_service.build_auth_context(session, api_key, raw_key)
         logger.debug(
-            "auth_success user=%s operator=%s is_admin=%s path=%s",
-            ctx.username, ctx.operator_name, ctx.is_admin,
+            "auth_success user=%s operator=%s is_admin=%s is_root=%s session_id=%s path=%s",
+            ctx.username, ctx.operator_name, ctx.is_admin, getattr(
+                ctx, "is_root", False), ctx.session_id,
             request.url.path if request else "unknown",
         )
         return ctx
 
 
 def _has_permission(auth: auth_service.AuthContext, permission: str) -> bool:
-    if auth.is_open or auth.is_admin:
+    if auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
         return True
     return auth.can(permission)
 
@@ -148,7 +144,7 @@ def require_permission(permission: str):
 
 def require_permission_for_request(read_permission: str, write_permission: str):
     def _dep(request: Request, auth=Depends(get_auth_context)):
-        if auth.is_open or auth.is_admin:
+        if auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
             return auth
         method = request.method.upper() if request else "GET"
         permission = read_permission if method in {
@@ -167,7 +163,7 @@ def require_admin(auth=Depends(get_auth_context)):
     """Require admin access.  Open mode is always allowed."""
     if auth.is_open:
         return auth
-    if not auth.is_admin:
+    if not auth.is_admin and not getattr(auth, "is_root", False):
         raise HTTPException(
             status_code=HTTP_403_FORBIDDEN,
             detail="Admin access required",

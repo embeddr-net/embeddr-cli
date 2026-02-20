@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, Query, HTTPException, Response
-from sqlmodel import Session, select, col
+from sqlmodel import Session, select, col, or_, cast, String, func
 from embeddr.db.session import get_session
 from embeddr_core.models.artifact_embedding import ArtifactEmbedding
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_lineage import ArtifactLineage
+from embeddr.api.security import get_auth_context, require_permission_for_request
+from embeddr.auth.permissions import Permissions
 from uuid import UUID
 import numpy as np
 import warnings
@@ -17,7 +19,28 @@ try:
 except ImportError:
     umap = None
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_permission_for_request(
+        Permissions.ARTIFACTS_READ, Permissions.ARTIFACTS_WRITE
+    ))]
+)
+
+
+def _public_visibility_expr():
+    meta_text = func.lower(cast(Artifact.metadata_json, String))
+    return or_(
+        meta_text.contains('"visibility":"public"'),
+        meta_text.contains('"visibility": "public"'),
+    )
+
+
+def _visibility_filter_expr(auth):
+    if not auth or auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
+        return None
+    user_id = getattr(auth, "user_id", None)
+    if user_id:
+        return or_(Artifact.owner_user_id == user_id, _public_visibility_expr())
+    return _public_visibility_expr()
 
 
 @router.get("/umap")
@@ -29,7 +52,8 @@ def get_umap_projection(
     spread: float = 1.0,
     limit: int = 1000,
     random_state: int = 42,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     if not umap:
         raise HTTPException(
@@ -42,8 +66,11 @@ def get_umap_projection(
         select(ArtifactEmbedding, Artifact)
         .join(Artifact, Artifact.id == ArtifactEmbedding.artifact_id)
         .where(ArtifactEmbedding.model_name == model_name)
-        .limit(limit)
     )
+    visibility_expr = _visibility_filter_expr(auth)
+    if visibility_expr is not None:
+        stmt = stmt.where(visibility_expr)
+    stmt = stmt.limit(limit)
     results = session.exec(stmt).all()
 
     # Maps artifact_id (str) -> embedding (np.array)

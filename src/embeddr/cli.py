@@ -1,4 +1,5 @@
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -29,6 +30,74 @@ app.add_typer(manage.app, name="manage")
 app.add_typer(nelumbo.app, name="nelumbo")
 app.add_typer(debug.app, name="debug")
 # app.add_typer(fixtures.app, name="fixtures") # Moved to Plugin
+
+
+SECURED_AUTH_MODES = {"single", "multi", "db"}
+
+
+def _normalized_auth_mode(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _ensure_secured_auth_salt(data_dir: Path | None, config: dict | None = None) -> None:
+    effective_config = config
+    if not isinstance(effective_config, dict):
+        try:
+            project_root = find_project_root(
+                Path(os.environ.get("PWD") or Path.cwd()))
+            if project_root:
+                loaded = load_project_config(project_root)
+                if isinstance(loaded, dict):
+                    effective_config = loaded
+        except Exception:
+            effective_config = None
+
+    auth_config = (
+        effective_config.get("auth", {})
+        if isinstance(effective_config, dict)
+        else {}
+    )
+    config_mode = auth_config.get("mode") if isinstance(
+        auth_config, dict) else None
+    mode = _normalized_auth_mode(config_mode) or _normalized_auth_mode(
+        os.environ.get("EMBEDDR_AUTH_MODE")
+    )
+
+    if mode not in SECURED_AUTH_MODES:
+        return
+
+    env_salt = os.environ.get("EMBEDDR_AUTH_SALT", "").strip()
+    config_salt = (
+        str(auth_config.get("salt", "")).strip()
+        if isinstance(auth_config, dict)
+        else ""
+    )
+    chosen_salt = env_salt or config_salt
+    if chosen_salt and chosen_salt != "embeddr-local":
+        os.environ["EMBEDDR_AUTH_SALT"] = chosen_salt
+        return
+
+    salt_file = None
+    file_salt = ""
+    if data_dir:
+        salt_file = data_dir / "auth_salt"
+        if salt_file.exists():
+            try:
+                file_salt = salt_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                file_salt = ""
+    if file_salt and file_salt != "embeddr-local":
+        os.environ["EMBEDDR_AUTH_SALT"] = file_salt
+        return
+
+    generated_salt = secrets.token_urlsafe(32)
+    os.environ["EMBEDDR_AUTH_SALT"] = generated_salt
+    if salt_file:
+        try:
+            salt_file.parent.mkdir(parents=True, exist_ok=True)
+            salt_file.write_text(generated_salt, encoding="utf-8")
+        except Exception:
+            pass
 
 
 def _load_cli_plugins() -> None:
@@ -110,6 +179,7 @@ def callback(
     # 1. Explicit override always wins
     if data_dir:
         os.environ["EMBEDDR_DATA_DIR"] = data_dir
+        _ensure_secured_auth_salt(Path(data_dir).expanduser().resolve())
         refresh_settings()
         get_engine.cache_clear()
         _load_cli_plugins()
@@ -117,6 +187,8 @@ def callback(
 
     # 2. Env var already set (shell, systemd, etc.)
     if os.environ.get("EMBEDDR_DATA_DIR"):
+        _ensure_secured_auth_salt(
+            Path(os.environ["EMBEDDR_DATA_DIR"]).expanduser().resolve())
         refresh_settings()
         get_engine.cache_clear()
         _load_cli_plugins()
@@ -164,7 +236,8 @@ def callback(
         # Determine plugins directory
         if "paths" in config and "plugins_dir" in config["paths"]:
             custom_plugins_dir = project_root / config["paths"]["plugins_dir"]
-            os.environ["EMBEDDR_PLUGINS_DIR"] = str(custom_plugins_dir)
+            os.environ.setdefault("EMBEDDR_PLUGINS_DIR",
+                                  str(custom_plugins_dir))
 
         # Database configuration (optional)
         db_config = config.get("database", {}) if isinstance(
@@ -178,6 +251,9 @@ def callback(
         if db_url:
             os.environ["DATABASE_URL"] = str(db_url)
 
+        _ensure_secured_auth_salt(
+            Path(os.environ["EMBEDDR_DATA_DIR"]).expanduser().resolve(), config)
+
         refresh_settings()
         get_engine.cache_clear()
         _load_cli_plugins()
@@ -188,6 +264,7 @@ def callback(
 
     if default.exists():
         os.environ["EMBEDDR_DATA_DIR"] = str(default)
+        _ensure_secured_auth_salt(default)
         refresh_settings()
         get_engine.cache_clear()
         _load_cli_plugins()
@@ -202,6 +279,7 @@ def callback(
         ):
             default.mkdir(parents=True, exist_ok=True)
             os.environ["EMBEDDR_DATA_DIR"] = str(default)
+            _ensure_secured_auth_salt(default)
             refresh_settings()
             get_engine.cache_clear()
             _load_cli_plugins()

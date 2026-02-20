@@ -36,7 +36,7 @@ LEGACY_WORKFLOW_TYPES = {"action:comfy.workflow"}
 
 
 def _require_operator_scope(auth) -> Optional[UUID]:
-    if not auth or auth.is_open or auth.is_admin:
+    if not auth or auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
         return None
     if not auth.operator_id:
         raise HTTPException(status_code=403, detail="Operator scope required")

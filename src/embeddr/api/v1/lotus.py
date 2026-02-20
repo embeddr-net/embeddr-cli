@@ -16,6 +16,7 @@ from embeddr_core.models.lotus import LotusResult as CoreLotusResult
 
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 from uuid import uuid4
 
 from embeddr_core.models.lotus import LotusCapability, LotusKind
@@ -30,11 +31,27 @@ from embeddr_core.models.artifact_execution import ArtifactExecution
 from embeddr.core.plugin_loader import get_all_plugin_instances, get_lotus_registry
 from embeddr.api.security import get_auth_context
 from embeddr.services import auth_service
+from embeddr.core.execution_spine import ExecutionSpine
 import logging
 
 logger = logging.getLogger("embeddr.api.lotus")
 
 router = APIRouter()
+
+
+def _resolve_wait_timeout_seconds(inputs: Dict[str, Any]) -> float:
+    raw_timeout = (
+        inputs.get("wait_timeout_seconds")
+        or inputs.get("timeout_seconds")
+        or inputs.get("timeout")
+    )
+    if raw_timeout is None:
+        return 300.0
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        return 300.0
+    return timeout if timeout > 0 else 300.0
 
 
 # ----------------------------
@@ -68,6 +85,8 @@ class LotusDispatchResponse(BaseModel):
     status: Optional[str] = None
     navigate_to: Optional[str] = None
     message: Optional[str] = None
+    outputs: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class LotusCapabilityOut(BaseModel):
@@ -132,7 +151,7 @@ def lotus_query(
     core_results: List[CoreLotusResult] = reg.query(q, limit=limit)
 
     def allowed(cap_id: str) -> bool:
-        if auth.is_open or auth.is_admin:
+        if auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
             return True
         if auth.can("lotus:list") or auth.can("lotus:*"):
             return True
@@ -166,7 +185,7 @@ def lotus_list(
     items = reg.list(kind=kind, slot=slot, plugin=plugin)
 
     def allowed(cap_id: str) -> bool:
-        if auth.is_open or auth.is_admin:
+        if auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
             return True
         if auth.can("lotus:list") or auth.can("lotus:*"):
             return True
@@ -257,7 +276,7 @@ async def lotus_dispatch(
 
     cap = get_lotus_registry().get(payload.result_id)
     if cap:
-        if not (auth.is_open or auth.is_admin):
+        if not (auth.is_open or auth.is_admin or getattr(auth, "is_root", False)):
             allowed = auth.can("lotus:dispatch") or auth.can("lotus:*")
             allowed = allowed or auth.can(
                 auth_service.lotus_permission_for_capability(cap.id))
@@ -285,9 +304,44 @@ async def lotus_dispatch(
             inputs=inputs,
             session=session,
             capability=cap,
+            auth=auth,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    should_wait = bool(inputs.get("wait_for_completion"))
+    execution_id = out.get("execution_id") if isinstance(out, dict) else None
+    if should_wait and execution_id:
+        timeout = _resolve_wait_timeout_seconds(inputs)
+        try:
+            result = await ExecutionSpine.wait_for_job_async(
+                UUID(str(execution_id)), timeout=timeout,
+            )
+            final_status = result.status or "unknown"
+            out = {
+                "ok": final_status != "failed",
+                "kind": LotusKind.action,
+                "execution_id": str(execution_id),
+                "status": final_status,
+                "message": "completed" if final_status == "completed" else final_status,
+                "outputs": result.outputs or {},
+                "error": result.error,
+            }
+        except TimeoutError:
+            out = {
+                "ok": True,
+                "kind": LotusKind.action,
+                "execution_id": str(execution_id),
+                "status": "timeout",
+                "message": f"Timed out waiting for completion after {timeout:.1f}s",
+            }
+        except Exception as exc:
+            logger.warning(
+                "Failed waiting for completion result_id=%s execution_id=%s: %s",
+                payload.result_id,
+                execution_id,
+                exc,
+            )
 
     return LotusDispatchResponse(**out)
 

@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import logging
 import sys
 import types
@@ -26,7 +25,7 @@ from embeddr.core.event_bus import SimpleEventBus, _EVENT_BUS
 from embeddr.core.execution_spine import ExecutionSpine
 from embeddr_core.services.config_service import resolve_plugin_config_for_plugin
 from embeddr.core.plugin_context_helpers import LotusContext
-from embeddr.core.config import get_data_dir
+from embeddr.core.plugin_discovery import iter_plugin_dirs, load_disabled_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +124,20 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
             # We mount static assets at /plugins/{name}/static (public)
             bundle_base = (
                 source_path.name if source_path else p.name).replace("_", "-")
-            bundle_name = f"{bundle_base}.umd.js"
-            if not (dist_dir / bundle_name).exists():
-                bundle_name = "index.umd.js"
-            plugin_data["url"] = (
-                f"/plugins/{p.name}/static/dist/{bundle_name}"
-            )
+            preferred_bundle = dist_dir / f"{bundle_base}.umd.js"
+            fallback_bundle = dist_dir / "index.umd.js"
+
+            bundle_name: Optional[str] = None
+            if preferred_bundle.exists():
+                bundle_name = preferred_bundle.name
+            elif fallback_bundle.exists():
+                bundle_name = fallback_bundle.name
+
+            if bundle_name:
+                plugin_data["url"] = (
+                    f"/plugins/{p.name}/static/dist/{bundle_name}"
+                )
+
             css_path = dist_dir / "style.css"
             if css_path.exists():
                 plugin_data["css_url"] = (
@@ -164,28 +171,7 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
     logger.debug(f"Scanning for Python plugins in {plugins_dir}...")
     import typer
 
-    def _load_disabled_plugins() -> set[str]:
-        disabled: set[str] = set()
-        raw = os.environ.get("EMBEDDR_DISABLED_PLUGINS", "").strip()
-        if raw:
-            disabled.update({item.strip()
-                            for item in raw.split(",") if item.strip()})
-
-        data_root = Path(os.environ.get("EMBEDDR_DATA_DIR") or get_data_dir())
-        disabled_path = data_root / "disabled_plugins.json"
-        if disabled_path.exists():
-            try:
-                payload = json.loads(disabled_path.read_text(encoding="utf-8"))
-                items = payload.get("disabled_plugins") if isinstance(
-                    payload, dict) else None
-                if isinstance(items, list):
-                    disabled.update({str(item).strip()
-                                    for item in items if str(item).strip()})
-            except Exception:
-                pass
-        return disabled
-
-    disabled_plugins = _load_disabled_plugins()
+    disabled_plugins = load_disabled_plugins()
 
     def _maybe_install_requirements(p_dir: Path) -> None:
         if str(os.environ.get("EMBEDDR_PLUGINS_AUTO_INSTALL", "")).lower() not in (
@@ -456,39 +442,8 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
                 exc_info=True,
             )
 
-    # Main scan loop
-    for item in plugins_dir.iterdir():
-        if item.is_dir():
-            # Categories that contain multiple plugins
-            categories = [
-                "core",
-                "editors",
-                "examples",
-                "experimental",
-                "features",
-                "integrations",
-                "development",
-                "pages",
-                "private",
-                "plugins",
-                "private_plugins",
-                "services",
-                "storage",
-                "tools",
-                "transports",
-                "types",
-                "widgets",
-                "effects",
-            ]
-            if item.name in categories:
-                # Recurse one level into folders
-                if item.exists():
-                    for sub in item.iterdir():
-                        if sub.is_dir():
-                            process_plugin_dir(sub)
-            else:
-                # Direct plugin directory
-                process_plugin_dir(item)
+    for plugin_dir in iter_plugin_dirs(plugins_dir):
+        process_plugin_dir(plugin_dir)
 
 
 _INITIALIZED = False
@@ -596,6 +551,30 @@ def _register_lotus_async_handlers() -> None:
                         "lotus",
                         LotusContext(context=context),
                     )
+
+                auth_payload = {}
+                if isinstance(getattr(context, "inputs", None), dict):
+                    auth_payload = context.inputs.get("__embeddr_auth") or {}
+
+                if isinstance(auth_payload, dict) and auth_payload:
+                    if not hasattr(context, "user_id"):
+                        setattr(context, "user_id",
+                                auth_payload.get("user_id"))
+                    if not hasattr(context, "operator_id"):
+                        setattr(context, "operator_id",
+                                auth_payload.get("operator_id"))
+                    if not hasattr(context, "is_admin"):
+                        setattr(context, "is_admin", bool(
+                            auth_payload.get("is_admin", False)))
+                    if not hasattr(context, "is_root"):
+                        setattr(context, "is_root", bool(
+                            auth_payload.get("is_root", False)))
+                    if not hasattr(context, "is_open"):
+                        setattr(context, "is_open", bool(
+                            auth_payload.get("is_open", False)))
+                    if not hasattr(context, "permissions"):
+                        setattr(context, "permissions", set(
+                            auth_payload.get("permissions") or []))
 
                 # Pass context as the 4th arg.
                 # We rely on plugin.execute handling DuckTyped context (inputs, log, etc)

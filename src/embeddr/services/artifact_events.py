@@ -23,6 +23,8 @@ def publish_artifact_created(artifact: Artifact, source: str) -> None:
             "uri": artifact.uri,
             "type_name": artifact.type_name,
             "metadata_json": artifact.metadata_json,
+            "owner_user_id": str(artifact.owner_user_id) if getattr(artifact, "owner_user_id", None) else None,
+            "owner_operator_id": str(artifact.owner_operator_id) if getattr(artifact, "owner_operator_id", None) else None,
             "created_at": created_at,
         }
         _EVENT_BUS.publish(

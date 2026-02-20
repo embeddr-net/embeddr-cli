@@ -23,18 +23,18 @@ async def websocket_endpoint(
             logger.warning("WebSocket auth failed: Missing API key")
             return
         with Session(get_engine()) as session:
-            api_key_obj = auth_service.lookup_api_key(session, api_key)
-            if not api_key_obj:
+            auth_context = auth_service.resolve_auth_context(session, api_key)
+            if not auth_context:
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                logger.warning("WebSocket auth failed: Invalid API key")
+                logger.warning("WebSocket auth failed: Invalid credential")
                 return
-            auth_context = auth_service.build_auth_context(
-                session, api_key_obj, api_key
-            )
 
     client_id = await manager.connect(
         websocket,
         user_id=str(auth_context.user_id) if auth_context else None,
+        operator_id=str(auth_context.operator_id)
+        if auth_context and auth_context.operator_id
+        else None,
         username=auth_context.username if auth_context else None,
         api_key_id=str(auth_context.api_key_id)
         if auth_context and auth_context.api_key_id

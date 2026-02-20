@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -7,9 +9,19 @@ from embeddr.core.plugin_loader import get_lotus_registry
 from embeddr_core.models.lotus import LotusCapability, LotusKind
 
 
+logger = logging.getLogger("embeddr.resources.adapter-registry")
+
+
+def _trace_enabled() -> bool:
+    return os.environ.get("EMBEDDR_RESOURCE_TRACE") == "1" or os.environ.get("EMBEDDR_LOTUS_TRACE") == "1"
+
+
 def _cap_exposes_api(cap: LotusCapability) -> bool:
-    data = cap.data or {}
-    expose = data.get("expose") or {}
+    action = getattr(cap, "action", None)
+    expose = (getattr(action, "expose", None) or {}) if action else {}
+    if not expose:
+        data = cap.data or {}
+        expose = data.get("expose") or {}
     return bool(expose.get("api", False))
 
 
@@ -114,6 +126,23 @@ def select_resource_adapter(
         if _cap_exposes_api(c)
     ]
 
+    if _trace_enabled():
+        logger.warning(
+            "[ResourceTrace] select_resource_adapter artifact_id=%s url=%s adapter_id=%s candidates=%s",
+            artifact_id,
+            url,
+            adapter_id,
+            [
+                {
+                    "id": c.id,
+                    "plugin": c.plugin,
+                    "kind": str(c.kind),
+                    "slot": c.slot,
+                }
+                for c in caps
+            ],
+        )
+
     if artifact_id:
         for cap in caps:
             match = _adapter_match(cap)
@@ -125,11 +154,30 @@ def select_resource_adapter(
         for cap in caps:
             match = _adapter_match(cap)
             max_prefix, max_contains = _score_url_match(url, match)
+            if _trace_enabled():
+                logger.warning(
+                    "[ResourceTrace] adapter score id=%s plugin=%s prefix=%s contains=%s match=%s",
+                    cap.id,
+                    cap.plugin,
+                    max_prefix,
+                    max_contains,
+                    match,
+                )
             if max_prefix > 0 or max_contains > 0:
                 scored.append((max_prefix, max_contains, cap))
 
         if scored:
             scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+            if _trace_enabled():
+                logger.warning(
+                    "[ResourceTrace] selected adapter id=%s plugin=%s score=%s",
+                    scored[0][2].id,
+                    scored[0][2].plugin,
+                    (scored[0][0], scored[0][1]),
+                )
             return scored[0][2]
+
+    if _trace_enabled():
+        logger.warning("[ResourceTrace] no adapter selected")
 
     return None

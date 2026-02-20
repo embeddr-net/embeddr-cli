@@ -3,11 +3,14 @@ from embeddr_core.plugin_interface import EmbeddrEvent
 from embeddr.db.session import create_db_and_tables, get_engine
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import warnings
 import asyncio
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
+from typing import Dict, Set
 
 import typer
 import uvicorn
@@ -33,6 +36,7 @@ from embeddr.core.plugin_loader import (
 )
 from embeddr.core.execution_spine import ExecutionSpine
 from embeddr.services.socket_manager import manager
+from embeddr.runtime.route_registry import build_route_registrations
 
 # Import and load local FS scanner plugin manually for now until dynamic loading is robust
 # This ensures it's available on startup
@@ -43,8 +47,11 @@ import importlib.util
 
 # Add embeddr-core to path if it exists as a sibling
 # From src/embeddr/commands/serve.py, parents[4] is the 'public' directory
+ROOT_DIR = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_FRONTEND_DIR = PACKAGE_DIR / "web"
+DEFAULT_WEB_SOURCE_DIR = ROOT_DIR.parent / "embeddr-frontend"
+DEFAULT_WEB_DIST_DIR = DEFAULT_WEB_SOURCE_DIR / "dist"
 
 # core_path = Path(__file__).resolve().parents[4] / "embeddr-core" / "src"
 # if core_path.exists():
@@ -70,7 +77,6 @@ warnings.filterwarnings(
 
 # Define the path to the frontend build directory
 # Root is parents[3] (embeddr-local-api)
-ROOT_DIR = Path(__file__).resolve().parents[3]
 FRONTEND_DIR = Path(os.environ.get(
     "EMBEDDR_FRONTEND_DIR", DEFAULT_FRONTEND_DIR))
 
@@ -238,22 +244,125 @@ async def lifespan(app: FastAPI):
     from embeddr.services.ingestion_service import ingestion_service
     await ingestion_service.start()
 
-    # Bridge EventBus to WebSocket Manager
-    def broadcast_to_frontend(event: EmbeddrEvent):
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(manager.broadcast_event(
-                event.event_type, event.payload, source=event.source))
-        except RuntimeError:
-            pass
-
-    # NOTE: Currently disabled to reduce noise, we subscribe to specific events below
-    # _EVENT_BUS.subscribe("*", broadcast_to_frontend)
-
     # Transport tool registration is handled by transport plugins
 
     # --- Event Bus <-> WebSocket Bridge ---
     loop = asyncio.get_running_loop()
+
+    def _as_set(value):
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            return {str(v) for v in value if v}
+        return {str(value)}
+
+    def _load_execution_scope(execution_id: str):
+        try:
+            from uuid import UUID
+            from embeddr_core.models.artifact_execution import ArtifactExecution
+
+            execution_uuid = UUID(str(execution_id))
+            with Session(get_engine()) as session:
+                ex = session.get(ArtifactExecution, execution_uuid)
+                if not ex:
+                    return {}
+                tags = ex.tags or {}
+                return {
+                    "client_ids": _as_set(tags.get("target_client_id") or tags.get("client_id")),
+                    "operator_ids": _as_set(ex.operator_id),
+                    "api_key_ids": _as_set(ex.api_key_id),
+                }
+        except Exception:
+            return {}
+
+    def _load_artifact_scope(artifact_id: str):
+        try:
+            from uuid import UUID
+            from embeddr_core.models.artifact import Artifact
+
+            artifact_uuid = UUID(str(artifact_id))
+            with Session(get_engine()) as session:
+                artifact = session.get(Artifact, artifact_uuid)
+                if not artifact:
+                    return {}
+                return {
+                    "user_ids": _as_set(artifact.owner_user_id),
+                    "operator_ids": _as_set(artifact.owner_operator_id),
+                }
+        except Exception:
+            return {}
+
+    def _derive_audience(event_type: str, payload):
+        if not isinstance(payload, dict):
+            return None
+
+        client_ids: Set[str] = set()
+        user_ids: Set[str] = set()
+        operator_ids: Set[str] = set()
+        api_key_ids: Set[str] = set()
+
+        client_ids.update(
+            _as_set(payload.get("target_client_id")
+                    or payload.get("target_client_ids"))
+        )
+        user_ids.update(
+            _as_set(
+                payload.get("target_user_id")
+                or payload.get("target_user_ids")
+                or payload.get("owner_user_id")
+                or payload.get("user_id")
+            )
+        )
+        operator_ids.update(
+            _as_set(
+                payload.get("target_operator_id")
+                or payload.get("target_operator_ids")
+                or payload.get("owner_operator_id")
+                or payload.get("operator_id")
+            )
+        )
+        api_key_ids.update(
+            _as_set(
+                payload.get("target_api_key_id")
+                or payload.get("target_api_key_ids")
+                or payload.get("api_key_id")
+            )
+        )
+
+        auth_payload = payload.get("__embeddr_auth") or payload.get("auth")
+        if isinstance(auth_payload, dict):
+            user_ids.update(_as_set(auth_payload.get("user_id")))
+            operator_ids.update(
+                _as_set(auth_payload.get("operator_id"))
+            )
+
+        execution_id = payload.get("id") or payload.get("execution_id")
+        if event_type.startswith("execution.") and execution_id:
+            ex_scope = _load_execution_scope(str(execution_id))
+            client_ids.update(ex_scope.get("client_ids", set()))
+            operator_ids.update(ex_scope.get("operator_ids", set()))
+            api_key_ids.update(ex_scope.get("api_key_ids", set()))
+
+        artifact_id = payload.get("id") or payload.get("artifact_id")
+        if event_type.startswith("artifact.") and artifact_id:
+            artifact_scope = _load_artifact_scope(str(artifact_id))
+            user_ids.update(artifact_scope.get("user_ids", set()))
+            operator_ids.update(
+                artifact_scope.get("operator_ids", set())
+            )
+
+        audience: Dict[str, Set[str]] = {
+            "client_ids": client_ids,
+            "user_ids": user_ids,
+            "operator_ids": operator_ids,
+            "api_key_ids": api_key_ids,
+        }
+        serialized_audience: Dict[str, list[str]] = {
+            key: sorted(values)
+            for key, values in audience.items()
+            if values
+        }
+        return serialized_audience or None
 
     def bridge_event_to_ws(event):
         try:
@@ -272,6 +381,7 @@ async def lifespan(app: FastAPI):
                     if isinstance(payload, dict) and payload.get("data"):
                         # Keep structured payload to preserve endpoint metadata.
                         payload = payload
+            audience = _derive_audience(raw_event_type, payload)
             # We wrap the broadcast in a task on the main loop
             asyncio.run_coroutine_threadsafe(
                 # manager.broadcast_event(
@@ -283,7 +393,8 @@ async def lifespan(app: FastAPI):
                     # Maps to "plugin:event_type" in frontend
                     event_type,
                     payload,
-                    source=event.source
+                    source=event.source,
+                    audience=audience,
                 ),
                 loop
             )
@@ -704,64 +815,7 @@ def create_app(
     app.include_router(routes.router, prefix="/api/v1",
                        dependencies=api_dependencies)
 
-    # Include V2 Routes
-    from embeddr.api.v1 import artifacts as artifacts_v2
-    from embeddr.api.v1 import plugins as plugins_v2
-    from embeddr.api.v1 import system as system_v2
-    from embeddr.api.v1 import system_public as system_public_v2
-    from embeddr.api.v1 import collections as collections_v2
-    from embeddr.api.v1 import executions as executions_v2
-    from embeddr.api.v1 import workflows as workflows_v2
-    from embeddr.api.v1 import config as config_v2
-    from embeddr.api.v1 import maintenance as maintenance_v2
-    # from embeddr.api1v2 import projections as projections_v2 # Moved to Plugin
-    from embeddr.api.v1 import actions as actions_v2
-    from embeddr.api.v1 import lotus as lotus_v2
-    from embeddr.api.v1 import lotus_invoke_routes
-    from embeddr.api.v1 import config_api as lotus_config
-    from embeddr.api.v1 import resources as resources_v2
-    from embeddr.api.v1 import security as security_router
-    from embeddr.api.v1 import themes as themes_v2
-    from embeddr.api.v1 import workers as workers_v1
-    from embeddr.api.v1 import panels as panels_v1
-
-    route_registrations = [
-        (artifacts_v2.router, "/api/v1/artifacts", ["artifacts"], api_dependencies),
-        (artifacts_v2.router, "/api/artifacts", ["artifacts"], api_dependencies),
-        (plugins_v2.router, "/api/v1/plugins", ["plugins"], api_dependencies),
-        (plugins_v2.router, "/api/plugins", ["plugins"], api_dependencies),
-        (system_v2.router, "/api/v1/system", ["system"], api_dependencies),
-        (system_v2.router, "/api/system", ["system"], api_dependencies),
-        (system_public_v2.router, "/api/v1", ["system"], []),
-        (system_public_v2.router, "/api", ["system"], []),
-        (collections_v2.router, "/api/v1/collections", ["collections"], api_dependencies),
-        (collections_v2.router, "/api/collections", ["collections"], api_dependencies),
-        (executions_v2.router, "/api/v1/executions", ["executions"], api_dependencies),
-        (executions_v2.router, "/api/executions", ["executions"], api_dependencies),
-        (workflows_v2.router, "/api/v1/workflows", ["workflows"], api_dependencies),
-        (workflows_v2.router, "/api/workflows", ["workflows"], api_dependencies),
-        (config_v2.router, "/api/v1/config", ["config"], api_dependencies),
-        (config_v2.router, "/api/config", ["config"], api_dependencies),
-        (maintenance_v2.router, "/api/v1/maintenance", ["maintenance"], api_dependencies),
-        (maintenance_v2.router, "/api/maintenance", ["maintenance"], api_dependencies),
-        (actions_v2.router, "/api/v1/actions", ["actions"], api_dependencies),
-        (actions_v2.router, "/api/actions", ["actions"], api_dependencies),
-        (resources_v2.router, "/api/v1/resources", ["resources"], api_dependencies),
-        (resources_v2.router, "/api/resources", ["resources"], api_dependencies),
-        (security_router.router, "/api/v1/security", ["security"], []),
-        (security_router.router, "/api/security", ["security"], []),
-        (themes_v2.router, "/api/v1/themes", ["themes"], []),
-        (themes_v2.router, "/api/themes", ["themes"], []),
-        (workers_v1.router, "/api/v1/workers", ["workers"], []),
-        (panels_v1.router, "/api/v1/panels", ["panels"], api_dependencies),
-        (panels_v1.router, "/api/panels", ["panels"], api_dependencies),
-        (lotus_v2.router, "/api/v1/lotus", ["lotus"], api_dependencies),
-        (lotus_v2.router, "/api/lotus", ["lotus"], api_dependencies),
-        (lotus_config.router, "/api/v1/lotus", ["lotus", "config"], api_dependencies),
-        (lotus_config.router, "/api/lotus", ["lotus", "config"], api_dependencies),
-        (lotus_invoke_routes.router, "/api/v1/lotus", ["lotus"], api_dependencies),
-        (lotus_invoke_routes.router, "/api/lotus", ["lotus"], api_dependencies),
-    ]
+    route_registrations = build_route_registrations(api_dependencies)
 
     for router_obj, prefix, tags, dependencies in route_registrations:
         _register_endpoints(
@@ -783,16 +837,51 @@ def create_app(
 
 # 1. Environment / CLI Plugin Dir (Highest Priority)
         # This allows users to override dev plugins with their own or dist-plugins
-        if os.environ.get("EMBEDDR_PLUGIN_DIR"):
-            plugin_paths.append(Path(os.environ.get("EMBEDDR_PLUGIN_DIR")))
+        env_plugin_dir_legacy = (os.environ.get(
+            "EMBEDDR_PLUGIN_DIR") or "").strip()
+        if env_plugin_dir_legacy:
+            plugin_paths.append(Path(env_plugin_dir_legacy))
 
-        env_plugin_dir = os.environ.get(
-            "EMBEDDR_PLUGINS_DIR") or os.environ.get("EMBEDDR_PLUGIN_DIR")
+        env_plugin_dir = (
+            os.environ.get("EMBEDDR_PLUGINS_DIR")
+            or os.environ.get("EMBEDDR_PLUGIN_DIR")
+            or ""
+        ).strip()
         if env_plugin_dir:
             # Avoid duplicate if same as above (though simplistic check)
             p = Path(env_plugin_dir)
             if not any(existing == p for existing in plugin_paths):
                 plugin_paths.append(p)
+
+        if not plugin_paths:
+            data_dir = get_data_dir()
+            fallback_candidates = [
+                data_dir / "plugins-pack",
+                data_dir / "plugins",
+            ]
+            for candidate in fallback_candidates:
+                if candidate.exists() and not any(existing == candidate for existing in plugin_paths):
+                    plugin_paths.append(candidate)
+
+        typer.secho(
+            f"   Plugin source env (EMBEDDR_PLUGINS_DIR): {(os.environ.get('EMBEDDR_PLUGINS_DIR') or '').strip() or '<unset>'}",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+        typer.secho(
+            f"   Plugin source env (EMBEDDR_PLUGIN_DIR): {(os.environ.get('EMBEDDR_PLUGIN_DIR') or '').strip() or '<unset>'}",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
+        if plugin_paths:
+            for resolved_path in plugin_paths:
+                typer.secho(
+                    f"   Plugin path candidate: {resolved_path}",
+                    fg=typer.colors.BRIGHT_BLACK,
+                )
+        else:
+            typer.secho(
+                "   No plugin path candidates discovered.",
+                fg=typer.colors.YELLOW,
+            )
 
         # 2. Dev Workspace "embeddr-plugins" (Relative to this file)
         # Only load when explicitly enabled.
@@ -952,18 +1041,32 @@ def create_app(
         typer.secho("🚫 Plugins disabled by flag.", fg=typer.colors.YELLOW)
         logger.info("Plugins disabled by EMBEDDR_NO_PLUGINS")
 
-    # Serve Theme Packs from workspace
+    # Serve Theme Packs
     try:
         cli_root = Path(__file__).resolve().parents[3]
         repo_root = cli_root.parent
-        themes_root = repo_root / "embeddr-themes" / "themes"
-        if themes_root.exists():
+        configured_themes_dir = (os.environ.get(
+            "EMBEDDR_THEMES_DIR") or "").strip()
+        themes_candidates = []
+        if configured_themes_dir:
+            themes_candidates.append(Path(configured_themes_dir))
+        themes_candidates.extend([
+            get_data_dir() / "themes",
+            repo_root / "embeddr-themes" / "themes",
+        ])
+
+        themes_root = next(
+            (candidate for candidate in themes_candidates if candidate.exists()), None)
+        if themes_root is not None:
             app.mount(
                 "/themes",
                 StaticFiles(directory=str(themes_root)),
                 name="themes",
             )
             logger.info("Mounted themes at /themes -> %s", themes_root)
+        else:
+            logger.warning(
+                "No themes directory found. Checked: %s", themes_candidates)
     except Exception as exc:
         logger.error("Failed to mount theme packs: %s", exc)
 
@@ -1005,6 +1108,87 @@ def create_app(
 
 
 def register(app: typer.Typer):
+    @app.command("prepare-frontend")
+    def prepare_frontend(
+        source_dir: Path = typer.Option(
+            DEFAULT_WEB_SOURCE_DIR,
+            help="Path to the embeddr-frontend project",
+        ),
+        dist_dir: Path = typer.Option(
+            None,
+            help="Path to built frontend output (defaults to <source_dir>/dist)",
+        ),
+        target_dir: Path = typer.Option(
+            DEFAULT_FRONTEND_DIR,
+            help="Where to copy frontend assets for embeddr serve",
+        ),
+        build: bool = typer.Option(
+            True,
+            "--build/--no-build",
+            help="Run pnpm build in source_dir before copy",
+        ),
+        confirm: bool = typer.Option(
+            False,
+            "--confirm",
+            help="Confirm destructive copy (target directory will be replaced)",
+        ),
+    ):
+        src_root = source_dir.expanduser().resolve()
+        if not src_root.exists():
+            typer.secho(
+                f"Frontend source directory not found: {src_root}",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=1)
+
+        if build:
+            try:
+                subprocess.run(["pnpm", "build"],
+                               cwd=str(src_root), check=True)
+            except subprocess.CalledProcessError as exc:
+                typer.secho(
+                    f"Failed to build frontend in {src_root}: {exc}",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+            except FileNotFoundError:
+                typer.secho(
+                    "pnpm not found. Install pnpm or use --no-build.",
+                    fg=typer.colors.RED,
+                )
+                raise typer.Exit(code=1)
+
+        resolved_dist = (
+            dist_dir.expanduser().resolve()
+            if dist_dir
+            else (src_root / "dist").resolve()
+        )
+        index_path = resolved_dist / "index.html"
+        if not index_path.exists():
+            typer.secho(
+                f"Built frontend index not found: {index_path}",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=1)
+
+        resolved_target = target_dir.expanduser().resolve()
+        if not confirm:
+            typer.secho(
+                "This operation replaces the target frontend directory. Re-run with --confirm.",
+                fg=typer.colors.YELLOW,
+            )
+            typer.echo(f"Target: {resolved_target}")
+            raise typer.Exit(code=1)
+
+        if resolved_target.exists():
+            shutil.rmtree(resolved_target)
+        resolved_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(resolved_dist, resolved_target)
+
+        typer.secho("Frontend prepared successfully.", fg=typer.colors.GREEN)
+        typer.echo(f"Source dist: {resolved_dist}")
+        typer.echo(f"Target dir: {resolved_target}")
+
     @app.command()
     def serve(
         host: str = typer.Option("127.0.0.1", help="The host to bind to."),

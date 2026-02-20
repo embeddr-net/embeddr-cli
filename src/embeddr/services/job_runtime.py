@@ -209,13 +209,20 @@ class JobRuntime:
                 tags = tags.split(",")
 
             for tag in tags:
-                if isinstance(tag, str) and tag.strip().startswith("sys_job_id:"):
-                    from uuid import UUID
-                    try:
-                        parent_execution_id = UUID(
-                            tag.strip().split(":", 1)[1])
-                    except ValueError:
-                        pass
+                if not isinstance(tag, str):
+                    continue
+                normalized = tag.strip()
+                if not (
+                    normalized.startswith("comfy_job_id:")
+                    or normalized.startswith("sys_job_id:")
+                ):
+                    continue
+                from uuid import UUID
+                try:
+                    parent_execution_id = UUID(normalized.split(":", 1)[1])
+                    break
+                except ValueError:
+                    pass
         except Exception:
             pass
 

@@ -1,7 +1,7 @@
 from sqlalchemy.orm import aliased
 import logging
 from sqlalchemy import literal
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Any, Dict, List, Optional, Set
 from uuid import UUID, uuid5, NAMESPACE_URL
 import os
@@ -23,6 +23,12 @@ from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact_relation import ArtifactRelation
 from embeddr_core.models.tag import ArtifactTagLink
 from embeddr_core.models.collection import CollectionItem
+from embeddr_core.models.user_account import UserAccount
+from embeddr_core.models.operator import Operator
+from embeddr_core.relations import (
+    STRUCTURAL_CHILD_TO_PARENT,
+    STRUCTURAL_PARENT_TO_CHILD,
+)
 from embeddr_core.services.vector_store import VectorStoreService
 from embeddr_core.services.embedding import get_text_embedding, get_loaded_model_name
 from pydantic import BaseModel
@@ -360,6 +366,7 @@ class ArtifactUpdate(BaseModel):
     uri: Optional[str] = None  # Added support for updating URI
     type_name: Optional[str] = None
     base_type_name: Optional[str] = None
+    visibility: Optional[str] = None
 
 
 class RelationCreate(BaseModel):
@@ -404,7 +411,7 @@ def get_session():
 
 
 def _require_operator_scope(auth) -> Optional[UUID]:
-    if not auth or auth.is_open or auth.is_admin:
+    if not auth or auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
         return None
     if not auth.operator_id:
         logger.warning(
@@ -415,35 +422,177 @@ def _require_operator_scope(auth) -> Optional[UUID]:
     return auth.operator_id
 
 
-def _apply_owner_filter(query, auth):
-    operator_id = _require_operator_scope(auth)
-    if operator_id:
-        return query.where(Artifact.owner_operator_id == operator_id)
+def _visibility_from_metadata(metadata_json: Optional[Dict[str, Any]]) -> str:
+    if isinstance(metadata_json, dict):
+        raw = metadata_json.get("visibility")
+        if isinstance(raw, str):
+            value = raw.strip().lower()
+            if value in {"public", "private"}:
+                return value
+    return "private"
+
+
+def _artifact_visibility(artifact: Artifact) -> str:
+    return _visibility_from_metadata(artifact.metadata_json)
+
+
+def _public_visibility_expr():
+    meta_text = func.lower(cast(Artifact.metadata_json, String))
+    return or_(
+        meta_text.contains('"visibility":"public"'),
+        meta_text.contains('"visibility": "public"'),
+    )
+
+
+def _owner_match_expr(auth):
+    user_id = getattr(auth, "user_id", None) if auth else None
+    if user_id:
+        return Artifact.owner_user_id == user_id
+    return literal(False)
+
+
+def _is_owner_of_artifact(artifact: Artifact, auth) -> bool:
+    if not auth:
+        return True
+    if getattr(auth, "is_open", False) or getattr(auth, "is_admin", False) or getattr(auth, "is_root", False):
+        return True
+
+    user_id = getattr(auth, "user_id", None)
+    if not user_id:
+        return False
+    if artifact.owner_user_id != user_id:
+        return False
+    return True
+
+
+def _can_read_artifact(artifact: Artifact, auth) -> bool:
+    if _is_owner_of_artifact(artifact, auth):
+        return True
+    return _artifact_visibility(artifact) == "public"
+
+
+def _serialize_owner_user(
+    session: Session,
+    owner_user_id: Optional[UUID],
+) -> Optional[Dict[str, Any]]:
+    if not owner_user_id:
+        return None
+    owner_user = session.get(UserAccount, owner_user_id)
+    if not owner_user:
+        return None
+    return {
+        "id": str(owner_user.id),
+        "username": owner_user.username,
+        "display_name": owner_user.display_name,
+        "avatar_url": owner_user.avatar_url,
+    }
+
+
+def _serialize_owner_operator(
+    session: Session,
+    owner_operator_id: Optional[UUID],
+) -> Optional[Dict[str, Any]]:
+    if not owner_operator_id:
+        return None
+    owner_operator = session.get(Operator, owner_operator_id)
+    if not owner_operator:
+        return None
+    return {
+        "id": str(owner_operator.id),
+        "name": owner_operator.name,
+        "display_name": owner_operator.display_name,
+        "avatar_url": owner_operator.avatar_url,
+    }
+
+
+def _artifact_to_response(
+    session: Session,
+    artifact: Artifact,
+    *,
+    include_owner_profiles: bool = False,
+) -> Dict[str, Any]:
+    payload = artifact.model_dump()
+    payload["visibility"] = _artifact_visibility(artifact)
+
+    if include_owner_profiles:
+        payload["owner_user"] = _serialize_owner_user(
+            session, artifact.owner_user_id)
+        payload["owner_operator"] = _serialize_owner_operator(
+            session, artifact.owner_operator_id)
+
+    return payload
+
+
+def _apply_text_search(query, count_query, q: Optional[str]):
+    needle = (q or "").strip().lower()
+    if not needle:
+        return query, count_query
+
+    text_filter = or_(
+        func.lower(cast(Artifact.id, String)).contains(needle),
+        func.lower(cast(Artifact.uri, String)).contains(needle),
+        func.lower(cast(Artifact.type_name, String)).contains(needle),
+        func.lower(cast(Artifact.base_type_name, String)).contains(needle),
+        func.lower(cast(Artifact.metadata_json, String)).contains(needle),
+    )
+    return query.where(text_filter), count_query.where(text_filter)
+
+
+def _apply_visibility_filter(query, count_query, visibility: Optional[str]):
+    visibility_value = (visibility or "").strip().lower()
+    if not visibility_value or visibility_value == "all":
+        return query, count_query
+
+    is_public = _public_visibility_expr()
+    if visibility_value == "public":
+        return query.where(is_public), count_query.where(is_public)
+    if visibility_value == "private":
+        return query.where(~is_public), count_query.where(~is_public)
+    return query, count_query
+
+
+def _apply_owner_filter(query, auth, access_scope: str = "instance"):
+    scope = (access_scope or "instance").strip().lower()
+
+    if scope == "personal":
+        query = query.where(_owner_match_expr(auth))
+        return query
+
+    if auth and not auth.is_open and not auth.is_admin and not getattr(auth, "is_root", False):
+        query = query.where(
+            or_(_owner_match_expr(auth), _public_visibility_expr()))
     return query
 
 
 def _filter_allowed_ids(session: Session, ids: List[UUID], auth) -> Set[UUID]:
-    operator_id = _require_operator_scope(auth)
-    if not operator_id:
+    if not auth or auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
         return set(ids)
-    rows = session.exec(
-        select(Artifact.id).where(
-            Artifact.id.in_(ids),
-            Artifact.owner_operator_id == operator_id,
-        )
-    ).all()
+
+    allowed_query = select(Artifact.id).where(Artifact.id.in_(ids))
+    allowed_query = allowed_query.where(
+        or_(_owner_match_expr(auth), _public_visibility_expr())
+    )
+
+    rows = session.exec(allowed_query).all()
     return set(rows)
 
 
 def _ensure_artifact_access(
-    session: Session, artifact_uuid: UUID, auth
+    session: Session,
+    artifact_uuid: UUID,
+    auth,
+    *,
+    for_write: bool = False,
 ) -> Artifact:
     artifact = _get_artifact_or_repair(session, artifact_uuid)
     if not artifact:
         raise HTTPException(status_code=404, detail="Artifact not found")
-    operator_id = _require_operator_scope(auth)
-    if operator_id and artifact.owner_operator_id != operator_id:
-        raise HTTPException(status_code=404, detail="Artifact not found")
+    if for_write:
+        if not _is_owner_of_artifact(artifact, auth):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+    else:
+        if not _can_read_artifact(artifact, auth):
+            raise HTTPException(status_code=404, detail="Artifact not found")
     return artifact
 
 
@@ -555,7 +704,7 @@ def upload_artifact_bytes(
         artifact = session.get(Artifact, ingest.artifact_id)
         if not artifact:
             raise HTTPException(404, "Artifact not found")
-        _ensure_artifact_access(session, artifact.id, auth)
+        _ensure_artifact_access(session, artifact.id, auth, for_write=True)
 
         # Capture needed data values to pass to helper outside session
         artifact_id_val = artifact.id
@@ -649,7 +798,7 @@ def add_relation(
     auth=Depends(get_auth_context),
 ):
     """Create a relationship between artifacts."""
-    _ensure_artifact_access(session, artifact_id, auth)
+    _ensure_artifact_access(session, artifact_id, auth, for_write=True)
     _ensure_artifact_access(session, rel.target_id, auth)
     # Check if exists to avoid dupes?
     existing = session.exec(select(ArtifactRelation).where(
@@ -713,13 +862,25 @@ def update_artifact(
     auth=Depends(get_auth_context),
 ):
     """Update an existing artifact."""
-    artifact = _ensure_artifact_access(session, artifact_id, auth)
+    artifact = _ensure_artifact_access(
+        session, artifact_id, auth, for_write=True)
 
     if art_update.metadata_json is not None:
         # Deep merge or shallow merge? Shallow merge for now.
         # Ensure we copy the existing dict so SA tracking picks it up
         current = dict(artifact.metadata_json or {})
         current.update(art_update.metadata_json)
+        artifact.metadata_json = current
+
+    if art_update.visibility is not None:
+        visibility_value = art_update.visibility.strip().lower()
+        if visibility_value not in {"public", "private"}:
+            raise HTTPException(
+                status_code=400,
+                detail="visibility must be 'public' or 'private'",
+            )
+        current = dict(artifact.metadata_json or {})
+        current["visibility"] = visibility_value
         artifact.metadata_json = current
 
     if art_update.override_capabilities is not None:
@@ -744,6 +905,8 @@ def update_artifact(
             source="api/v2/artifacts",
             payload={
                 "id": str(artifact.id),
+                "owner_user_id": str(artifact.owner_user_id) if artifact.owner_user_id else None,
+                "owner_operator_id": str(artifact.owner_operator_id) if artifact.owner_operator_id else None,
                 "changes": art_update.dict(exclude_unset=True)
             }
         ))
@@ -758,22 +921,21 @@ def search_artifacts(
     offset: int = 0,
     type_name: Optional[str] = None,
     type_prefix: Optional[str] = None,
+    visibility: Optional[str] = Query(None),
+    access_scope: str = Query("instance"),
+    sort: str = "new",
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
-    """Search artifacts by URI or metadata."""
+    """Search artifacts by ID/URI/type/metadata with visibility support."""
 
-    query = _apply_owner_filter(select(Artifact), auth)
-    count_query = _apply_owner_filter(select(func.count(Artifact.id)), auth)
+    query = _apply_owner_filter(select(Artifact), auth, access_scope)
+    count_query = _apply_owner_filter(
+        select(func.count(Artifact.id)), auth, access_scope)
 
-    # Text Search Filter
-    if q and len(q) > 0:
-        filter_condition = or_(
-            col(Artifact.uri).contains(q),
-            cast(Artifact.metadata_json, String).contains(q)
-        )
-        query = query.where(filter_condition)
-        count_query = count_query.where(filter_condition)
+    query, count_query = _apply_text_search(query, count_query, q)
+    query, count_query = _apply_visibility_filter(
+        query, count_query, visibility)
 
     if type_name:
         query = query.where(Artifact.type_name == type_name)
@@ -783,6 +945,14 @@ def search_artifacts(
         query = query.where(Artifact.type_name.startswith(type_prefix))
         count_query = count_query.where(
             Artifact.type_name.startswith(type_prefix))
+
+    sort_value = (sort or "new").lower().strip()
+    if sort_value == "random":
+        query = query.order_by(func.random())
+    elif sort_value == "old":
+        query = query.order_by(Artifact.created_at.asc())
+    else:
+        query = query.order_by(Artifact.created_at.desc())
 
     total = session.exec(count_query).one()
 
@@ -955,11 +1125,11 @@ def bulk_operations(
 
         # Lineage (as descendant)
         session.exec(delete(ArtifactLineage).where(
-            ArtifactLineage.artifact_id.in_(scoped_ids)))
+            ArtifactLineage.child_id.in_(scoped_ids)))
 
         # Lineage (as ancestor) - this breaks history for descendants, but if ancestor is gone...
         session.exec(delete(ArtifactLineage).where(
-            ArtifactLineage.ancestor_id.in_(scoped_ids)))
+            ArtifactLineage.parent_id.in_(scoped_ids)))
 
         count = 0
         for item in items:
@@ -991,9 +1161,9 @@ def bulk_operations(
             select(ArtifactRelation).where(
                 or_(
                     (ArtifactRelation.target_id.in_(ids) &
-                     ArtifactRelation.relation_type.in_(["contains", "group"])),
+                     ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)),
                     (ArtifactRelation.source_id.in_(ids) &
-                     ArtifactRelation.relation_type.in_(["contained_in", "member_of"]))
+                     ArtifactRelation.relation_type.in_(STRUCTURAL_CHILD_TO_PARENT))
                 )
             )
         ).all()
@@ -1040,7 +1210,10 @@ def bulk_operations(
 def list_artifacts(
     limit: int = 50,
     offset: int = 0,
+    q: Optional[str] = None,
+    access_scope: str = Query("instance"),
     type_name: Optional[str] = None,
+    visibility: Optional[str] = Query(None),
     media_type: Optional[str] = None,
     collection_id: Optional[UUID] = None,
     library_id: Optional[UUID] = None,
@@ -1059,8 +1232,9 @@ def list_artifacts(
 ):
     """List all artifacts with optional filtering."""
     # Count query
-    count_query = _apply_owner_filter(select(func.count(Artifact.id)), auth)
-    query = _apply_owner_filter(select(Artifact), auth)
+    count_query = _apply_owner_filter(
+        select(func.count(Artifact.id)), auth, access_scope)
+    query = _apply_owner_filter(select(Artifact), auth, access_scope)
 
     if ids:
         query = query.where(Artifact.id.in_(ids))
@@ -1079,7 +1253,7 @@ def list_artifacts(
             # For now, we assume deep hierarchies use "contains".
             base_stmt = select(ArtifactRelation.target_id).where(
                 ArtifactRelation.source_id == target_id,
-                ArtifactRelation.relation_type.in_(["contains", "group"])
+                ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
             )
 
             cte = base_stmt.cte("descendants", recursive=True)
@@ -1088,7 +1262,7 @@ def list_artifacts(
             ar_alias = aliased(ArtifactRelation)
             recursive_part = select(ar_alias.target_id).join(
                 cte, ar_alias.source_id == cte.c.target_id
-            ).where(ar_alias.relation_type.in_(["contains", "group"]))
+            ).where(ar_alias.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD))
 
             cte = cte.union_all(recursive_part)
 
@@ -1097,8 +1271,7 @@ def list_artifacts(
             # to capture uploaded files at this level even if they don't continue the chain.
             subq_up = select(ArtifactRelation.source_id).where(
                 ArtifactRelation.target_id == target_id,
-                ArtifactRelation.relation_type.in_(
-                    ["contained_in", "member_of"])
+                ArtifactRelation.relation_type.in_(STRUCTURAL_CHILD_TO_PARENT)
             )
 
             query = query.where(
@@ -1118,13 +1291,12 @@ def list_artifacts(
             # Case 1: Parent --[contains/group]--> Child
             subq_down = select(ArtifactRelation.target_id).where(
                 ArtifactRelation.source_id == target_id,
-                ArtifactRelation.relation_type.in_(["contains", "group"])
+                ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
             )
             # Case 2: Child --[contained_in/member_of]--> Parent
             subq_up = select(ArtifactRelation.source_id).where(
                 ArtifactRelation.target_id == target_id,
-                ArtifactRelation.relation_type.in_(
-                    ["contained_in", "member_of"])
+                ArtifactRelation.relation_type.in_(STRUCTURAL_CHILD_TO_PARENT)
             )
 
             query = query.where(
@@ -1147,10 +1319,10 @@ def list_artifacts(
         # 2. Not a source of "contained_in"
 
         subq_is_contained = select(ArtifactRelation.target_id).where(
-            ArtifactRelation.relation_type.in_(["contains", "group"])
+            ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
         )
         subq_is_inside = select(ArtifactRelation.source_id).where(
-            ArtifactRelation.relation_type.in_(["contained_in", "member_of"])
+            ArtifactRelation.relation_type.in_(STRUCTURAL_CHILD_TO_PARENT)
         )
 
         query = query.where(Artifact.id.not_in(subq_is_contained))\
@@ -1185,6 +1357,10 @@ def list_artifacts(
             )
             query = query.where(cond)
             count_query = count_query.where(cond)
+
+    query, count_query = _apply_text_search(query, count_query, q)
+    query, count_query = _apply_visibility_filter(
+        query, count_query, visibility)
 
     # Naive tag filtering on metadata_json
     if tags:
@@ -1315,16 +1491,21 @@ def _get_artifact_or_repair(session: Session, artifact_uuid: UUID) -> Optional[A
         return session.get(Artifact, artifact_uuid)
 
 
-@router.get("/{artifact_id}", response_model=Artifact)
+@router.get("/{artifact_id}")
 def get_artifact(
     artifact_id: str,
+    include_owner_profiles: bool = Query(False),
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
     """Retrieve a single artifact."""
     artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
     artifact = _ensure_artifact_access(session, artifact_uuid, auth)
-    return artifact
+    return _artifact_to_response(
+        session,
+        artifact,
+        include_owner_profiles=include_owner_profiles,
+    )
 
 
 @router.get("/{artifact_id}/content")
@@ -1618,7 +1799,8 @@ def delete_artifact(
     auth=Depends(get_auth_context),
 ):
     """Delete an artifact and all directly related data."""
-    artifact = _ensure_artifact_access(session, artifact_id, auth)
+    artifact = _ensure_artifact_access(
+        session, artifact_id, auth, for_write=True)
 
     # Clean up all related entities (no cascade configured on models)
     session.exec(delete(ArtifactEmbedding).where(
@@ -1636,8 +1818,8 @@ def delete_artifact(
         )))
     session.exec(delete(ArtifactLineage).where(
         or_(
-            ArtifactLineage.artifact_id == artifact_id,
-            ArtifactLineage.ancestor_id == artifact_id,
+            ArtifactLineage.child_id == artifact_id,
+            ArtifactLineage.parent_id == artifact_id,
         )))
     session.exec(delete(ArtifactBlob).where(
         ArtifactBlob.artifact_id == artifact_id))
@@ -1645,8 +1827,12 @@ def delete_artifact(
         ArtifactIngestModel.artifact_id == artifact_id))
     session.exec(delete(ArtifactTagLink).where(
         ArtifactTagLink.artifact_id == artifact_id))
-    session.exec(delete(CollectionItem).where(
-        CollectionItem.artifact_id == artifact_id))
+    try:
+        session.exec(delete(CollectionItem).where(
+            CollectionItem.artifact_id == artifact_id))
+    except OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
 
     session.delete(artifact)
     session.commit()
@@ -1655,7 +1841,11 @@ def delete_artifact(
         _EVENT_BUS.publish(EmbeddrEvent(
             event_type="artifact.deleted",
             source="api/v1/artifacts",
-            payload={"id": str(artifact_id)}
+            payload={
+                "id": str(artifact_id),
+                "owner_user_id": str(artifact.owner_user_id) if artifact.owner_user_id else None,
+                "owner_operator_id": str(artifact.owner_operator_id) if artifact.owner_operator_id else None,
+            }
         ))
 
     return {"ok": True}
@@ -1694,8 +1884,8 @@ def get_artifact_delete_impact(
     ).one()
     counts["lineage"] = session.exec(
         select(func.count()).where(or_(
-            ArtifactLineage.artifact_id == artifact_id,
-            ArtifactLineage.ancestor_id == artifact_id,
+            ArtifactLineage.child_id == artifact_id,
+            ArtifactLineage.parent_id == artifact_id,
         ))
     ).one()
     counts["blobs"] = session.exec(
@@ -1704,9 +1894,16 @@ def get_artifact_delete_impact(
     counts["tags"] = session.exec(
         select(func.count()).where(ArtifactTagLink.artifact_id == artifact_id)
     ).one()
-    counts["collections"] = session.exec(
-        select(func.count()).where(CollectionItem.artifact_id == artifact_id)
-    ).one()
+    try:
+        counts["collections"] = session.exec(
+            select(func.count()).where(
+                CollectionItem.artifact_id == artifact_id)
+        ).one()
+    except OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            counts["collections"] = 0
+        else:
+            raise
 
     return {"artifact_id": str(artifact_id), "counts": counts}
 

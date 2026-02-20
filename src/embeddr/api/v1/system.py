@@ -24,6 +24,12 @@ from embeddr.services.blob_registry import (
     get_default_provider_name,
     get_default_resolver_name,
 )
+from embeddr_core.relations import (
+    RELATION_TYPE_DEFS,
+    STRUCTURAL_CHILD_TO_PARENT,
+    STRUCTURAL_PARENT_TO_CHILD,
+    STRUCTURAL_RELATION_TYPES,
+)
 from embeddr.services.socket_manager import manager
 from sqlmodel import Session, select, func, col
 from embeddr.db.session import get_engine, backup_database, get_session
@@ -32,6 +38,7 @@ from embeddr_core.models.plugin_config import PluginConfig
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_blob import ArtifactBlob
 from embeddr.core.config import settings, is_dev_mode
+from embeddr.services import auth_service
 from embeddr.api.security import (
     COOKIE_NAME,
     get_auth_context,
@@ -84,12 +91,60 @@ class ArtifactRegistryResponse(BaseModel):
     sample_size: int
     total_artifacts: int
     sampled: bool
+    relation_ontology: "RelationOntologyResponse"
+
+
+class RelationTypeDefResponse(BaseModel):
+    name: str
+    family: str
+    direction: str
+    inverse: Optional[str] = None
+    transitive: bool
+    structural: bool
+
+
+class RelationOntologyResponse(BaseModel):
+    families: Dict[str, List[str]]
+    types: List[RelationTypeDefResponse]
+    structural_parent_to_child: List[str]
+    structural_child_to_parent: List[str]
+    structural_all: List[str]
 
 
 class ArtifactTypeCountsResponse(BaseModel):
     type_counts: Dict[str, int]
     base_type_counts: Dict[str, int]
     total_artifacts: int
+
+
+def _relation_ontology_snapshot() -> RelationOntologyResponse:
+    relation_types = [
+        RelationTypeDefResponse(
+            name=rel.name,
+            family=rel.family,
+            direction=rel.direction,
+            inverse=rel.inverse,
+            transitive=rel.transitive,
+            structural=rel.structural,
+        )
+        for rel in RELATION_TYPE_DEFS.values()
+    ]
+    relation_types.sort(key=lambda rel: rel.name)
+
+    families: Dict[str, List[str]] = {}
+    for rel in relation_types:
+        families.setdefault(rel.family, []).append(rel.name)
+
+    for names in families.values():
+        names.sort()
+
+    return RelationOntologyResponse(
+        families=families,
+        types=relation_types,
+        structural_parent_to_child=list(STRUCTURAL_PARENT_TO_CHILD),
+        structural_child_to_parent=list(STRUCTURAL_CHILD_TO_PARENT),
+        structural_all=list(STRUCTURAL_RELATION_TYPES),
+    )
 
 
 def _load_instance_profile(session: Session) -> Dict[str, Any]:
@@ -128,21 +183,41 @@ def set_auth_session(
     response: Response,
     payload: AuthSessionRequest = Body(default=AuthSessionRequest()),
     auth_context=Depends(get_auth_context),
+    session: Session = Depends(get_session),
 ):
     if not check_auth_enabled():
         return {"ok": True, "enabled": False}
 
     if payload.clear:
+        raw_cookie = request.cookies.get(COOKIE_NAME)
+        if raw_cookie and raw_cookie.startswith(auth_service.SESSION_TOKEN_PREFIX):
+            auth_session = auth_service.lookup_auth_session(
+                session, raw_cookie)
+            if auth_session:
+                auth_service.revoke_auth_session(session, auth_session)
         response.delete_cookie(COOKIE_NAME, path="/")
         return {"ok": True, "cleared": True}
 
-    cookie_value = auth_context.raw_key
+    if not auth_context.authenticated or not auth_context.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    auth_session, session_token = auth_service.create_auth_session(
+        session,
+        user_id=auth_context.user_id,
+        operator_id=auth_context.operator_id,
+        api_key_id=auth_context.api_key_id,
+        session_name="browser-session",
+        auth_method="session",
+        user_agent=request.headers.get("user-agent"),
+        ip_address=(request.client.host if request.client else None),
+    )
+
     secure = request.url.scheme == "https"
     samesite = "none" if secure else "lax"
 
     response.set_cookie(
         COOKIE_NAME,
-        cookie_value,
+        session_token,
         httponly=True,
         secure=secure,
         samesite=samesite,
@@ -151,6 +226,8 @@ def set_auth_session(
     return {
         "ok": True,
         "cookie": COOKIE_NAME,
+        "session_id": str(auth_session.id),
+        "expires_at": auth_session.expires_at.isoformat() if auth_session.expires_at else None,
         "samesite": samesite,
         "secure": secure,
     }
@@ -346,7 +423,15 @@ def get_artifact_registry(
         else total_artifacts,
         total_artifacts=total_artifacts,
         sampled=sampled,
+        relation_ontology=_relation_ontology_snapshot(),
     )
+
+
+@router.get("/relation-ontology", response_model=RelationOntologyResponse)
+def get_relation_ontology(
+    auth=Depends(require_permission("system:read")),
+):
+    return _relation_ontology_snapshot()
 
 
 @router.get("/artifact-type-counts", response_model=ArtifactTypeCountsResponse)

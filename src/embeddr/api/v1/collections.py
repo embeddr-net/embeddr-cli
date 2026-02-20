@@ -8,6 +8,7 @@ from embeddr.db.session import get_session
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.artifact_type import ArtifactType
 from embeddr_core.models.artifact_relation import ArtifactRelation
+from embeddr_core.relations import STRUCTURAL_PARENT_TO_CHILD
 from embeddr_core.services.scanner_registry import scanner_registry
 # Ensure default scanners are registered
 import embeddr_core.services.scanner  # noqa: F401
@@ -169,7 +170,7 @@ def list_collections(
         # 1. Base case: Immediate children
         hierarchy = select(ArtifactRelation.target_id).where(
             ArtifactRelation.source_id == r.id,
-            ArtifactRelation.relation_type.in_(["contains", "group"])
+            ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
         ).cte(recursive=True)
 
         # 2. Recursive step: Children of children
@@ -179,7 +180,7 @@ def list_collections(
         hierarchy = hierarchy.union_all(
             select(child_relation.target_id)
             .join(parent_hierarchy, child_relation.source_id == parent_hierarchy.c.target_id)
-            .where(child_relation.relation_type.in_(["contains", "group"]))
+            .where(child_relation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD))
         )
 
         # 3. Count matching artifacts found in the hierarchy
@@ -365,7 +366,7 @@ def add_collection(
 
     count = session.query(ArtifactRelation).filter(
         ArtifactRelation.source_id == root_id,
-        ArtifactRelation.relation_type == "contains"
+        ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
     ).count()
 
     return CollectionResponse(
@@ -436,7 +437,7 @@ def update_collection(
 
     count = session.query(ArtifactRelation).filter(
         ArtifactRelation.source_id == root_uuid,
-        ArtifactRelation.relation_type == "contains"
+        ArtifactRelation.relation_type.in_(STRUCTURAL_PARENT_TO_CHILD)
     ).count()
 
     return CollectionResponse(

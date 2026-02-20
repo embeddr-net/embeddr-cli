@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -335,6 +336,50 @@ def list_local_themes() -> List[RegistryItem]:
 _PLUGINS_INTROSPECTED = False
 _EMBEDDR_SERVER_PROCESS: Optional[subprocess.Popen] = None
 _EMBEDDR_SERVER_META: Dict[str, Any] = {}
+_SELECTED_WORKSPACE_ROOT: Optional[Path] = None
+
+
+def _default_workspace_root() -> Path:
+    return Path(os.environ.get("PWD") or Path.cwd()).resolve()
+
+
+def _workspace_root_or_selected() -> Path:
+    if _SELECTED_WORKSPACE_ROOT and (_SELECTED_WORKSPACE_ROOT / CONFIG_FILENAME).exists():
+        return _SELECTED_WORKSPACE_ROOT
+    return _default_workspace_root()
+
+
+def set_selected_workspace(*, workspace_path: str) -> Dict[str, Any]:
+    global _SELECTED_WORKSPACE_ROOT
+    target = Path(workspace_path).expanduser().resolve()
+    if not target.exists() or not target.is_dir():
+        return {
+            "ok": False,
+            "message": "Workspace path is not a directory",
+            "workspace_path": None,
+        }
+    if not (target / CONFIG_FILENAME).exists():
+        return {
+            "ok": False,
+            "message": "embeddr.toml not found in workspace path",
+            "workspace_path": None,
+        }
+    _SELECTED_WORKSPACE_ROOT = target
+    return {
+        "ok": True,
+        "message": None,
+        "workspace_path": str(target),
+    }
+
+
+def get_selected_workspace() -> Dict[str, Any]:
+    current = _workspace_root_or_selected()
+    selected = _SELECTED_WORKSPACE_ROOT.resolve() if _SELECTED_WORKSPACE_ROOT else None
+    return {
+        "ok": True,
+        "selected_workspace": str(selected) if selected else None,
+        "active_workspace": str(current),
+    }
 
 
 def _ensure_plugins_introspected() -> None:
@@ -586,12 +631,13 @@ def get_system_check() -> Dict[str, Any]:
 
 
 def get_nelumbo_context() -> Dict[str, Any]:
-    project_root = Path(os.environ.get("PWD") or Path.cwd()).resolve()
+    project_root = _workspace_root_or_selected()
     if not (project_root / CONFIG_FILENAME).exists():
         return {
             "workspace_detected": False,
             "project_root": None,
             "api_base_url": None,
+            "selected_workspace": str(_SELECTED_WORKSPACE_ROOT) if _SELECTED_WORKSPACE_ROOT else None,
         }
 
     config = load_project_config(project_root)
@@ -606,6 +652,115 @@ def get_nelumbo_context() -> Dict[str, Any]:
         "workspace_detected": True,
         "project_root": str(project_root),
         "api_base_url": api_base_url,
+        "selected_workspace": str(_SELECTED_WORKSPACE_ROOT) if _SELECTED_WORKSPACE_ROOT else None,
+    }
+
+
+def discover_workspaces(*, search_root: Optional[str] = None, max_depth: int = 4) -> Dict[str, Any]:
+    root = Path(search_root).expanduser().resolve() if search_root else Path(
+        os.environ.get("PWD") or Path.cwd()
+    ).resolve()
+
+    if not root.exists() or not root.is_dir():
+        return {
+            "ok": False,
+            "root": str(root),
+            "count": 0,
+            "workspaces": [],
+            "message": "Search root is not a directory",
+        }
+
+    skip_dirs = {
+        ".git",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        "dist",
+        "build",
+    }
+
+    workspaces: List[Dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    def add_workspace(path: Path) -> None:
+        normalized = str(path.resolve())
+        if normalized in seen_paths:
+            return
+        seen_paths.add(normalized)
+
+        config = load_project_config(path)
+        project_cfg = config.get(
+            "project", {}) if isinstance(config, dict) else {}
+        auth_cfg = config.get("auth", {}) if isinstance(config, dict) else {}
+        server_cfg = config.get("server", {}) if isinstance(
+            config, dict) else {}
+
+        name = (
+            str(project_cfg.get("name")).strip()
+            if isinstance(project_cfg, dict) and project_cfg.get("name")
+            else path.name
+        )
+        auth_mode = (
+            str(auth_cfg.get("mode")).strip().lower()
+            if isinstance(auth_cfg, dict) and auth_cfg.get("mode")
+            else "open"
+        )
+        host = (
+            str(server_cfg.get("host", "127.0.0.1"))
+            if isinstance(server_cfg, dict)
+            else "127.0.0.1"
+        )
+        port = (
+            int(server_cfg.get("port", 8003))
+            if isinstance(server_cfg, dict)
+            else 8003
+        )
+        resolved_host = "127.0.0.1" if host == "0.0.0.0" else host
+
+        workspaces.append(
+            {
+                "name": name,
+                "path": normalized,
+                "auth_mode": auth_mode,
+                "api_base_url": f"http://{resolved_host}:{port}/api/v1",
+                "is_selected": bool(_SELECTED_WORKSPACE_ROOT and Path(normalized) == _SELECTED_WORKSPACE_ROOT),
+            }
+        )
+
+    if (root / CONFIG_FILENAME).exists():
+        add_workspace(root)
+
+    queue: List[tuple[Path, int]] = [(root, 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(current.iterdir())
+        except Exception:
+            continue
+
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if entry.name in skip_dirs:
+                continue
+            if entry.name.startswith("."):
+                continue
+
+            if (entry / CONFIG_FILENAME).exists():
+                add_workspace(entry)
+
+            queue.append((entry, depth + 1))
+
+    workspaces.sort(key=lambda item: (
+        item.get("name") or "", item.get("path") or ""))
+    return {
+        "ok": True,
+        "root": str(root),
+        "count": len(workspaces),
+        "workspaces": workspaces,
+        "message": None,
     }
 
 
@@ -626,6 +781,11 @@ def get_embeddr_server_status() -> Dict[str, Any]:
 
 def get_embeddr_server_logs(*, lines: int = 200) -> Dict[str, Any]:
     log_path = _EMBEDDR_SERVER_META.get("log_path")
+    if not log_path:
+        workspace_root = _workspace_root_or_selected()
+        candidate = workspace_root / ".embeddr" / "logs" / "embeddr-server.log"
+        if candidate.exists():
+            log_path = str(candidate)
     if not log_path:
         return {
             "ok": False,
@@ -668,6 +828,7 @@ def start_embeddr_server(
     port: int,
     data_dir: Optional[str],
     plugins_dir: Optional[str],
+    workspace_path: Optional[str],
     enable_docs: bool,
     allow_dev_origins: bool,
     confirm: bool,
@@ -678,7 +839,11 @@ def start_embeddr_server(
     if get_embeddr_server_status().get("running"):
         return {"running": True, "message": "Embeddr server already running"}
 
-    project_root = Path(os.environ.get("PWD") or Path.cwd()).resolve()
+    project_root = (
+        Path(workspace_path).expanduser().resolve()
+        if workspace_path
+        else _workspace_root_or_selected()
+    )
     if not (project_root / CONFIG_FILENAME).exists():
         return {"running": False, "message": "No workspace detected"}
 
@@ -688,6 +853,28 @@ def start_embeddr_server(
         Path(resolved_data_dir) / "plugins")
     env["EMBEDDR_DATA_DIR"] = resolved_data_dir
     env["EMBEDDR_PLUGINS_DIR"] = resolved_plugins_dir
+
+    # Ensure secured auth mode has a stable salt for the child process.
+    if not env.get("EMBEDDR_AUTH_SALT", "").strip():
+        config = load_project_config(project_root)
+        auth_cfg = config.get("auth", {}) if isinstance(config, dict) else {}
+        cfg_salt = (
+            str(auth_cfg.get("salt", "")).strip()
+            if isinstance(auth_cfg, dict)
+            else ""
+        )
+        if cfg_salt and cfg_salt != "embeddr-local":
+            env["EMBEDDR_AUTH_SALT"] = cfg_salt
+        else:
+            salt_file = Path(
+                resolved_data_dir).expanduser().resolve() / "auth_salt"
+            if salt_file.exists():
+                try:
+                    file_salt = salt_file.read_text(encoding="utf-8").strip()
+                    if file_salt and file_salt != "embeddr-local":
+                        env["EMBEDDR_AUTH_SALT"] = file_salt
+                except Exception:
+                    pass
 
     cmd = [
         sys.executable,
@@ -726,6 +913,7 @@ def start_embeddr_server(
             "base_url": f"http://{host}:{port}",
             "started_at": int(time.time()),
             "log_path": str(log_path),
+            "workspace_path": str(project_root),
         }
     )
 
@@ -850,7 +1038,7 @@ def _install_workspace_plugins(
 
 
 def list_workspace_plugins() -> Dict[str, Any]:
-    project_root = Path(os.environ.get("PWD") or Path.cwd()).resolve()
+    project_root = _workspace_root_or_selected()
     if not (project_root / CONFIG_FILENAME).exists():
         return {
             "ok": False,
@@ -885,7 +1073,7 @@ def list_workspace_plugins() -> Dict[str, Any]:
 
 
 def list_workspace_disabled_plugins() -> Dict[str, Any]:
-    project_root = Path(os.environ.get("PWD") or Path.cwd()).resolve()
+    project_root = _workspace_root_or_selected()
     if not (project_root / CONFIG_FILENAME).exists():
         return {
             "ok": False,
@@ -940,7 +1128,7 @@ def set_workspace_disabled_plugins_destructive(
             "data_dir": None,
         }
 
-    project_root = Path(os.environ.get("PWD") or Path.cwd()).resolve()
+    project_root = _workspace_root_or_selected()
     if not (project_root / CONFIG_FILENAME).exists():
         return {
             "ok": False,
@@ -1131,14 +1319,23 @@ def create_workspace_destructive(
     target_dir = target_dir.expanduser().resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    normalized_auth_mode = (auth_mode or "open").strip().lower()
+    generated_auth_salt = (
+        secrets.token_urlsafe(32) if normalized_auth_mode in {
+            "single", "multi", "db"} else None
+    )
+
     create_default_config(
         target_dir,
         name=name,
-        auth_mode=auth_mode,
+        auth_mode=normalized_auth_mode,
         data_dir=".embeddr",
         plugins_dir=".embeddr/plugins",
         database_provider=database_provider or "sqlite",
         database_url=database_url,
+        auth_default_operator_name=operator_name,
+        auth_default_admin_username=admin_username,
+        auth_salt=generated_auth_salt,
     )
 
     data_dir = (target_dir / ".embeddr").resolve()
@@ -1161,6 +1358,7 @@ def create_workspace_destructive(
             "plugins_dir": str(plugins_dir),
         },
         "auth_mode": auth_mode,
+        "auth_salt_generated": bool(generated_auth_salt),
         "database": {
             "provider": database_provider or "sqlite",
             "url": database_url,

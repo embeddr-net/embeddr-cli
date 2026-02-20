@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def get_data_dir() -> Path:
@@ -59,17 +59,18 @@ def is_dev_mode() -> bool:
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        case_sensitive=True,
+        env_file=".env",
+        extra="ignore",
+    )
+
     DATA_DIR: Path = Field(default_factory=get_data_dir)
     DATABASE_URL: str = Field(default_factory=get_db_url)
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
     DB_POOL_TIMEOUT: int = 60
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)
-
-    class Config:
-        case_sensitive = True
-        env_file = ".env"
-        extra = "ignore"
 
 
 @lru_cache()
