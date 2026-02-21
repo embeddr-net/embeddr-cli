@@ -89,7 +89,8 @@ def cap_is_query_like(cap: LotusCapability) -> bool:
     if cap.kind == LotusKind.feature:
         return True
 
-    tags = {str(tag).strip().lower() for tag in (cap.tags or []) if str(tag).strip()}
+    tags = {str(tag).strip().lower()
+            for tag in (cap.tags or []) if str(tag).strip()}
     if tags.intersection({"search", "query", "read", "lookup", "list", "get"}):
         return True
 
