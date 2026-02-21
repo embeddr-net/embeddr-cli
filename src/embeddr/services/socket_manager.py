@@ -81,6 +81,8 @@ class ConnectionManager:
         operator_id: Optional[str] = None,
         username: Optional[str] = None,
         api_key_id: Optional[str] = None,
+        is_admin: bool = False,
+        is_root: bool = False,
     ) -> str:
         await websocket.accept()
         client_id = str(uuid.uuid4())
@@ -94,15 +96,23 @@ class ConnectionManager:
             meta["username"] = username
         if api_key_id:
             meta["api_key_id"] = api_key_id
+        meta["is_admin"] = bool(is_admin)
+        meta["is_root"] = bool(is_root)
         self.client_meta[client_id] = meta
         if user_id:
             self.user_clients.setdefault(user_id, set()).add(client_id)
         logger.info("WS client connected %s meta=%s", client_id, meta)
 
         # Notify others (and self) about the new connection
+        audience: Optional[Dict[str, Any]] = None
+        if operator_id:
+            audience = {"operator_id": operator_id}
+        elif user_id:
+            audience = {"user_id": user_id}
         asyncio.create_task(self.broadcast_event(
             "client_connected",
-            {"client_id": client_id, "total": len(self.active_connections)}
+            {"client_id": client_id, "total": len(self.active_connections)},
+            audience=audience,
         ))
 
         return client_id
@@ -119,10 +129,16 @@ class ConnectionManager:
                         del self.user_clients[user_id]
 
                 # Notify about disconnection
+                audience: Optional[Dict[str, Any]] = None
+                if meta.get("operator_id"):
+                    audience = {"operator_id": meta.get("operator_id")}
+                elif user_id:
+                    audience = {"user_id": user_id}
                 asyncio.create_task(self.broadcast_event(
                     "client_disconnected",
                     {"client_id": client_id, "total": len(
-                        self.active_connections)}
+                        self.active_connections)},
+                    audience=audience,
                 ))
                 break
 
