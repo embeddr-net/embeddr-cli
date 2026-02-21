@@ -175,3 +175,13 @@ uv run embeddr serve --reload
 
 [license-image]: https://img.shields.io/github/license/embeddr-net/embeddr-cli?style=flat-square&logoColor=%232f2f2f&labelColor=%232f2f2f&color=%234f4f4f
 [license-url]: https://pypi.org/project/embeddr-cli
+
+## License
+
+Copyright 2026 Embeddr Labs and Contributors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this project except in compliance with the License.
+You may obtain a copy of the License at:
+
+<http://www.apache.org/licenses/LICENSE-2.0>
