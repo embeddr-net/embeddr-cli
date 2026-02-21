@@ -1,4 +1,5 @@
 # Python-generated files
+*_cache/
 __pycache__/
 *.py[oc]
 build/
@@ -12,12 +13,3 @@ wheels/
 
 # Local API frontend build
 src/embeddr/web/*
-
-*_cache/
-
-# Private ignore
-test_*/
-data*/
-examples/
-workspace_clean/
-workspace_*/
