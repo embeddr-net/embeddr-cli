@@ -23,6 +23,7 @@ from sqlmodel import Session, select
 from embeddr.api import routes
 from embeddr.api import websocket as websocket_routes
 from embeddr.api.security import get_api_key, check_auth_enabled
+from embeddr.api.transport_security import AuthenticatedTransportApp
 from embeddr.services import auth_service
 from embeddr_core.models.user_account import UserAccount
 from embeddr.core.logging_utils import setup_logging
@@ -34,6 +35,7 @@ from embeddr.core.plugin_loader import (
     initialize_all_plugins,
     startup_all_plugins,
 )
+from embeddr.core.plugin_asset_paths import resolve_plugin_static_layout
 from embeddr.core.execution_spine import ExecutionSpine
 from embeddr.services.socket_manager import manager
 from embeddr.runtime.route_registry import build_route_registrations
@@ -382,6 +384,16 @@ async def lifespan(app: FastAPI):
                         # Keep structured payload to preserve endpoint metadata.
                         payload = payload
             audience = _derive_audience(raw_event_type, payload)
+            auth_mode = auth_service.get_auth_mode()
+            is_sensitive_scope = raw_event_type.startswith(
+                "execution.") or raw_event_type.startswith("artifact.")
+            if auth_mode != "open" and is_sensitive_scope and not audience:
+                logger.warning(
+                    "Dropping unscoped WS event in secured mode type=%s source=%s",
+                    raw_event_type,
+                    event.source,
+                )
+                return
             # We wrap the broadcast in a task on the main loop
             asyncio.run_coroutine_threadsafe(
                 # manager.broadcast_event(
@@ -581,12 +593,10 @@ async def lifespan(app: FastAPI):
         typer.secho("   • None", fg=typer.colors.BRIGHT_BLACK)
     else:
         for plugin in transports:
-            info = None
-            if hasattr(plugin, "get_transport_info"):
-                try:
-                    info = plugin.get_transport_info()
-                except Exception:
-                    info = None
+            try:
+                info = plugin.get_transport_info() or {}
+            except Exception:
+                info = {}
             if not info and hasattr(plugin, "transport_info"):
                 info = getattr(plugin, "transport_info")
 
@@ -628,17 +638,16 @@ async def lifespan(app: FastAPI):
     # Transport lifespans (plugin-provided)
     async with AsyncExitStack() as stack:
         for plugin in get_all_plugin_instances():
-            if hasattr(plugin, "get_transport_lifespan"):
-                try:
-                    ctx = plugin.get_transport_lifespan()
-                    if ctx is not None:
-                        await stack.enter_async_context(ctx)
-                except Exception as e:
-                    logger.error(
-                        "Failed to enter transport lifespan for %s: %s",
-                        plugin.name,
-                        e,
-                    )
+            try:
+                ctx = plugin.get_transport_lifespan()
+                if ctx is not None:
+                    await stack.enter_async_context(ctx)
+            except Exception as e:
+                logger.error(
+                    "Failed to enter transport lifespan for %s: %s",
+                    plugin.name,
+                    e,
+                )
 
         yield
 
@@ -921,81 +930,45 @@ def create_app(
         # This ensures the correct directory (Source vs Dist) is served for each plugin
         mounted_plugins: set[str] = set()
 
-        def _resolve_dist_root(plugin_name: str) -> "Path | None":
-            """Find a plugin's built output in the dist directory.
-
-            Searches ``dist/{plugin_name}`` (legacy flat layout) first, then
-            ``dist/{prefix}/{plugin_name}`` for any subdirectory *prefix* that
-            the SDK build may have produced (e.g. ``plugins``, ``services``).
-            """
-            cli_root = Path(__file__).resolve().parents[3]
-            repo_root = cli_root.parent
-            dist_base = repo_root / "embeddr-plugins" / "dist"
-
-            # Legacy: dist/<plugin_name>
-            flat = dist_base / plugin_name
-            if flat.exists():
-                return flat
-
-            # New: dist/<prefix>/<plugin_name>
-            if dist_base.exists():
-                for prefix_dir in sorted(dist_base.iterdir()):
-                    if not prefix_dir.is_dir():
-                        continue
-                    candidate = prefix_dir / plugin_name
-                    if candidate.exists():
-                        return candidate
-
-            return None
-
         def _mount_plugin_static(plugin_name: str, source_path: Path) -> None:
             if plugin_name in mounted_plugins:
                 return
             try:
-                dist_root = _resolve_dist_root(plugin_name)
-                static_root = dist_root if dist_root and dist_root.exists() else source_path
-                public_root = static_root
-                if dist_root:
-                    public_web_root = dist_root / "web" / "dist"
-                    if public_web_root.exists():
-                        public_root = public_web_root
-                public_assets_root = None
-                if dist_root:
-                    dist_assets_root = dist_root / "assets"
-                    if dist_assets_root.exists():
-                        public_assets_root = dist_assets_root
-                if not public_assets_root:
-                    source_assets_root = source_path / "assets"
-                    if source_assets_root.exists():
-                        public_assets_root = source_assets_root
+                layout = resolve_plugin_static_layout(plugin_name, source_path)
 
                 mount_path = f"/api/v1/plugins/{plugin_name}/static"
                 alt_mount_path = f"/api/plugins/{plugin_name}/static"
                 public_mount_path = f"/plugins/{plugin_name}/static"
                 typer.secho(
-                    f"   Mounting {plugin_name} assets: {mount_path} -> {static_root}",
+                    f"   Mounting {plugin_name} assets: {mount_path} -> {layout.static_root}",
                     fg=typer.colors.BRIGHT_BLACK,
                 )
                 app.mount(
                     mount_path,
-                    StaticFiles(directory=str(static_root)),
+                    StaticFiles(directory=str(layout.static_root)),
                     name=f"plugin_static_{plugin_name}",
                 )
                 app.mount(
                     alt_mount_path,
-                    StaticFiles(directory=str(static_root)),
+                    StaticFiles(directory=str(layout.static_root)),
                     name=f"plugin_static_alias_{plugin_name}",
                 )
                 app.mount(
                     public_mount_path,
-                    StaticFiles(directory=str(public_root)),
+                    StaticFiles(directory=str(layout.public_root)),
                     name=f"plugin_static_public_{plugin_name}",
                 )
-                if public_assets_root is not None:
+                if layout.public_dist_root is not None:
+                    app.mount(
+                        f"{public_mount_path}/dist",
+                        StaticFiles(directory=str(layout.public_dist_root)),
+                        name=f"plugin_static_public_dist_{plugin_name}",
+                    )
+                if layout.public_assets_root is not None:
                     public_assets_path = f"/plugins/{plugin_name}/assets"
                     app.mount(
                         public_assets_path,
-                        StaticFiles(directory=str(public_assets_root)),
+                        StaticFiles(directory=str(layout.public_assets_root)),
                         name=f"plugin_assets_public_{plugin_name}",
                     )
                 mounted_plugins.add(plugin_name)
@@ -1027,15 +1000,19 @@ def create_app(
         # Phase 3: Register transport routes (if provided)
         _log_section("Transports")
         for plugin in loaded_plugins:
-            if hasattr(plugin, "register_transport"):
-                try:
-                    plugin.register_transport(app)
-                except Exception as exc:
-                    logger.error(
-                        "Failed to register transport for %s: %s",
-                        plugin.name,
-                        exc,
-                    )
+            try:
+                transport_app = AuthenticatedTransportApp(
+                    app,
+                    transport_name=str(plugin.name),
+                    required_permissions=["lotus:dispatch"],
+                )
+                plugin.register_transport(transport_app)
+            except Exception as exc:
+                logger.error(
+                    "Failed to register transport for %s: %s",
+                    plugin.name,
+                    exc,
+                )
 
     else:
         typer.secho("🚫 Plugins disabled by flag.", fg=typer.colors.YELLOW)
