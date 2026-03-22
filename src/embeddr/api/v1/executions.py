@@ -1,8 +1,8 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from uuid import UUID
 from datetime import datetime
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlmodel import Session, select, desc
 from embeddr.db.session import get_session, get_engine
 from embeddr_core.models.artifact_execution import ArtifactExecution
@@ -10,7 +10,7 @@ from embeddr_core.models.artifact_execution_event import ArtifactExecutionEvent
 from embeddr_core.models.execution_artifact_link import ExecutionArtifactLink
 from embeddr.core.plugin_loader import get_plugin_instance, get_loaded_plugins
 from embeddr.core.execution_spine import ExecutionSpine, _notifier
-from embeddr.api.security import require_permission_for_request
+from embeddr.api.security import require_permission_for_request, get_auth_context
 from embeddr.auth.permissions import Permissions
 from pydantic import BaseModel
 import logging
@@ -59,7 +59,9 @@ class ExecutionCreate(BaseModel):
 @router.post("", response_model=ArtifactExecution)
 async def create_execution(
     req: ExecutionCreate,
-    session: Session = Depends(get_session)
+    request: Request,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
 ):
     """
     Creates and schedules an execution using the Spine.
@@ -70,15 +72,24 @@ async def create_execution(
         raise HTTPException(
             status_code=404, detail=f"Plugin {req.plugin_name} not found or not loaded")
 
+    # Extract auth context for execution ownership (enables WS event scoping)
+    operator_id = getattr(auth, "operator_id", None) if auth else None
+    api_key_id = str(getattr(auth, "api_key_id", None)) if getattr(auth, "api_key_id", None) else None
+    client_id = (request.headers.get("x-embeddr-client-id") or "").strip() or None
+    tags = {}
+    if client_id:
+        tags["target_client_id"] = client_id
+
     # Use ExecutionSpine to submit
-    # Note: We don't use background_tasks anymore, strictly DB queue
     execution = ExecutionSpine.submit_job(
         job_type=req.job_type,
         inputs=req.inputs,
         plugin_name=req.plugin_name,
-        # TODO: infer resource_class from Plugin Action definition
         resource_class="cpu",
-        priority=0
+        priority=0,
+        operator_id=operator_id,
+        api_key_id=api_key_id,
+        tags=tags if tags else None,
     )
 
     # Determine if we need to link primary artifact (Spine submit_job might not support this arg yet,
@@ -239,6 +250,79 @@ def cancel_execution(
     if not job:
         raise HTTPException(404, "Execution not found or not cancelable")
     return job
+
+
+class ExecutionNudge(BaseModel):
+    """Inject a steering message into a running LLM execution."""
+    message: str = ""
+    mode: Literal["steer", "goal_replace"] = "steer"
+    goal: Optional[str] = None
+
+
+@router.post("/{execution_id}/nudge")
+def nudge_execution(
+    execution_id: UUID,
+    req: ExecutionNudge,
+    session: Session = Depends(get_session),
+):
+    """Inject a steering/nudge message into a running execution.
+
+    The message is stored as an execution event with type 'llm.nudge'.
+    The LLM agent loop drains these between turns and injects them as
+    user interjections into the conversation context.
+    """
+    job = session.get(ArtifactExecution, execution_id)
+    if not job:
+        raise HTTPException(404, "Execution not found")
+    if job.status != "running":
+        raise HTTPException(400, f"Execution is {job.status}, not running. Cannot nudge.")
+
+    message_text = str(req.message or "").strip()
+    goal_text = str(req.goal or "").strip()
+    if req.mode == "goal_replace":
+        if not goal_text:
+            goal_text = message_text
+        if not goal_text:
+            raise HTTPException(400, "Goal replacement nudges require a goal.")
+    elif not message_text:
+        raise HTTPException(400, "Nudge message cannot be empty.")
+
+    payload = {
+        "content": message_text,
+        "mode": req.mode,
+    }
+    if goal_text:
+        payload["goal"] = goal_text
+
+    event = ArtifactExecutionEvent(
+        execution_id=execution_id,
+        event_type="llm.nudge",
+        message=goal_text or message_text,
+        payload=payload,
+    )
+    session.add(event)
+    session.commit()
+
+    from embeddr.core.event_bus import _EVENT_BUS
+    from embeddr_core.plugin_interface import EmbeddrEvent
+    _EVENT_BUS.publish(EmbeddrEvent(
+        event_type="execution.nudge",
+        source="api",
+        payload={
+            "id": str(execution_id),
+            "message": message_text,
+            "mode": req.mode,
+            "goal": goal_text or None,
+        },
+    ))
+
+    return {
+        "ok": True,
+        "message": "Nudge queued",
+        "execution_id": str(execution_id),
+        "mode": req.mode,
+        "goal": goal_text or None,
+    }
 
 
 @router.get("/{execution_id}/artifacts", response_model=List[ExecutionArtifactLink])

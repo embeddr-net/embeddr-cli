@@ -6,6 +6,7 @@ import inspect
 import asyncio
 import os
 import subprocess
+import json
 from pathlib import Path
 from typing import Optional, Any, List, Dict
 from embeddr_core.services.lotus_registry import LotusRegistry
@@ -79,6 +80,53 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
         panels = getattr(p, "panels", [])
         docks = getattr(p, "docks", [])
         config_renderers = getattr(p, "config_renderers", [])
+        source_path = getattr(p, "_source_path", None)
+
+        registry_meta: Dict[str, Any] = {}
+        manifest_path: Optional[Path] = None
+        if isinstance(source_path, str):
+            source_path = Path(source_path)
+        if isinstance(source_path, Path):
+            candidate = source_path if source_path.is_dir() else source_path.parent
+            if candidate.exists():
+                manifest_path = candidate / "embeddr.plugin.json"
+        if manifest_path and manifest_path.exists() and manifest_path.is_file():
+            try:
+                with manifest_path.open("r", encoding="utf-8") as f:
+                    manifest_data = json.load(f)
+                registry_data = manifest_data.get("registry")
+                if isinstance(registry_data, dict):
+                    registry_meta = registry_data
+            except Exception:
+                registry_meta = {}
+
+        display_name = registry_meta.get("name") if isinstance(registry_meta.get("name"), str) else None
+        if isinstance(display_name, str):
+            display_name = display_name.strip() or None
+
+        description = registry_meta.get("description") if isinstance(registry_meta.get("description"), str) else None
+        if isinstance(description, str):
+            description = description.strip() or None
+
+        author = registry_meta.get("author") if isinstance(registry_meta.get("author"), str) else None
+        if isinstance(author, str):
+            author = author.strip() or None
+
+        homepage_url = registry_meta.get("homepage_url") if isinstance(registry_meta.get("homepage_url"), str) else None
+        if isinstance(homepage_url, str):
+            homepage_url = homepage_url.strip() or None
+
+        repository_url = registry_meta.get("repository_url") if isinstance(registry_meta.get("repository_url"), str) else None
+        if isinstance(repository_url, str):
+            repository_url = repository_url.strip() or None
+
+        license_name = registry_meta.get("license") if isinstance(registry_meta.get("license"), str) else None
+        if isinstance(license_name, str):
+            license_name = license_name.strip() or None
+
+        tags = registry_meta.get("tags") if isinstance(registry_meta.get("tags"), list) else []
+        tags = [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+
         # Construct the frontend JS URL assuming standard build output.
         # Server mounts /plugins -> plugins directory.
         # Frontend expects 'url' field.
@@ -86,7 +134,14 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
         plugin_data = {
             "id": p.name,  # Frontend typically uses 'id'
             "name": p.name,
+            "display_name": display_name,
             "version": p.version,
+            "description": description,
+            "author": author,
+            "homepage_url": homepage_url,
+            "repository_url": repository_url,
+            "license": license_name,
+            "tags": tags,
             "intents": [i.value for i in p.intents],
             "actions": [a.model_dump() for a in p.actions],
             "frontend_actions": [a.model_dump() for a in getattr(p, "frontend_actions", [])],
@@ -102,7 +157,6 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
         }
 
         # Only add URL if the plugin actually has a dist (frontend build)
-        source_path = getattr(p, '_source_path', None)
         dist_dir = resolve_plugin_frontend_dist_dir(
             plugin_name=p.name,
             source_path=source_path,
@@ -359,6 +413,14 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
                             )
                             plugin_instance.register_api(plugin_router)
                             app.include_router(plugin_router)
+                            # Alias without /v1/ for clients using /api/plugins/ base URL
+                            alias_router = APIRouter(
+                                prefix=f"/api/plugins/{plugin_instance.name}",
+                                tags=[plugin_instance.name],
+                                dependencies=api_dependencies,
+                            )
+                            plugin_instance.register_api(alias_router)
+                            app.include_router(alias_router)
                             plugin_instance._api_registered = True
                             logger.debug(
                                 "  -> Registered API for %s at /api/v1/plugins/%s",
@@ -446,10 +508,20 @@ def initialize_all_plugins() -> None:
         "Initializing %d plugins...", len(_LOADED_PLUGINS))
 
     # After discovery and registration, initialize all plugins with the full capability registry
+    from embeddr.db.session import get_engine
+    from contextlib import contextmanager
+    from sqlmodel import Session
+
+    @contextmanager
+    def _make_session():
+        with Session(get_engine()) as s:
+            yield s
+
     context = PluginContext(
         bus=_EVENT_BUS,
         capability_registry=_PLUGIN_CAPABILITY_REGISTRY,
-        resources=resource_manager
+        resources=resource_manager,
+        db_session_factory=_make_session,
     )
 
     # Sort plugins so providers (search, storage, indexer) load before consumers
@@ -558,6 +630,11 @@ def _register_lotus_async_handlers() -> None:
                     if not hasattr(context, "permissions"):
                         setattr(context, "permissions", set(
                             auth_payload.get("permissions") or []))
+                    # Propagate the originating client ID so UI actions can
+                    # target events back to the specific client that invoked them.
+                    if not hasattr(context, "caller_client_id"):
+                        setattr(context, "caller_client_id",
+                                auth_payload.get("client_id") or None)
 
                 # Pass context as the 4th arg.
                 # We rely on plugin.execute handling DuckTyped context (inputs, log, etc)
@@ -599,10 +676,20 @@ def startup_all_plugins() -> None:
     """
     logger.info("Triggering on_startup for all plugins...")
     _reconcile_artifact_types()
+    from embeddr.db.session import get_engine
+    from contextlib import contextmanager
+    from sqlmodel import Session
+
+    @contextmanager
+    def _make_session():
+        with Session(get_engine()) as s:
+            yield s
+
     context = PluginContext(
         bus=_EVENT_BUS,
         capability_registry=_PLUGIN_CAPABILITY_REGISTRY,
-        resources=resource_manager
+        resources=resource_manager,
+        db_session_factory=_make_session,
     )
 
     # Sort plugins so providers (search, storage, indexer) load before consumers

@@ -236,4 +236,5 @@ def relink_absolute_uris(
 def _get_data_dir(override: Optional[str] = None) -> Optional[str]:
     if override:
         return override
-    return os.environ.get("EMBEDDR_DATA_DIR")
+    from embeddr.core.config import get_data_dir
+    return str(get_data_dir())

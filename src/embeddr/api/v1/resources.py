@@ -207,7 +207,7 @@ def _resolve_artifact_urls(session: Session, artifact_id: UUID, auth) -> Dict[st
             "storage_resolver": resolver.name if resolver else None,
         }
 
-    base = f"/api/v1/artifacts/{artifact_id}"
+    base = f"/api/artifacts/{artifact_id}"
     return {
         "ok": True,
         "id": str(artifact_id),

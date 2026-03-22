@@ -10,7 +10,8 @@ import warnings
 import asyncio
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
-from typing import Dict, Set
+from typing import Any, Dict, Sequence, Set, cast
+from enum import Enum
 
 import typer
 import uvicorn
@@ -338,7 +339,15 @@ async def lifespan(app: FastAPI):
                 _as_set(auth_payload.get("operator_id"))
             )
 
-        execution_id = payload.get("id") or payload.get("execution_id")
+        # Look for execution_id at top level or nested in data (e.g. LLM
+        # plugin emits execution.event with {data: {execution_id: ...}})
+        execution_id = (
+            payload.get("id")
+            or payload.get("execution_id")
+            or (isinstance(payload.get("data"), dict)
+                and (payload["data"].get("execution_id")
+                     or payload["data"].get("id")))
+        )
         if event_type.startswith("execution.") and execution_id:
             ex_scope = _load_execution_scope(str(execution_id))
             client_ids.update(ex_scope.get("client_ids", set()))
@@ -735,10 +744,25 @@ def toml_cors_origins() -> list[str]:
         return []
 
 
-def _register_endpoints(app: FastAPI, router, prefix: str, tags: list[str], dependencies: list = None):
+def _register_endpoints(
+    app: FastAPI,
+    router,
+    prefix: str,
+    tags: Sequence[str | Enum] | None,
+    dependencies: Sequence[Any] | None = None,
+):
     logger.info(f"Registering router: {prefix} with tags: {tags}")
-    app.include_router(router, prefix=prefix, tags=tags,
-                       dependencies=dependencies)
+    router_tags = cast(list[str | Enum] | None, list(tags) if tags is not None else None)
+    router_dependencies = cast(
+        list[Any] | None,
+        list(dependencies) if dependencies is not None else None,
+    )
+    app.include_router(
+        router,
+        prefix=prefix,
+        tags=router_tags,
+        dependencies=router_dependencies,
+    )
 
 
 def create_app(
@@ -990,9 +1014,9 @@ def create_app(
         # Also mount for loaded plugin instances (covers any custom source paths).
         loaded_plugins = get_all_plugin_instances()
         for plugin in loaded_plugins:
-            source_path = getattr(plugin, '_source_path', None)
-            if source_path and isinstance(source_path, Path) and source_path.exists():
-                _mount_plugin_static(plugin.name, source_path)
+            loaded_source_path = getattr(plugin, '_source_path', None)
+            if loaded_source_path and isinstance(loaded_source_path, Path) and loaded_source_path.exists():
+                _mount_plugin_static(plugin.name, loaded_source_path)
 
         # Initialize all discovered plugins
         initialize_all_plugins()
@@ -1024,15 +1048,15 @@ def create_app(
         repo_root = cli_root.parent
         configured_themes_dir = (os.environ.get(
             "EMBEDDR_THEMES_DIR") or "").strip()
-        themes_candidates = []
+        themes_candidates: list[Path] = []
         if configured_themes_dir:
             themes_candidates.append(Path(configured_themes_dir))
         themes_candidates.extend([
-            get_data_dir() / "themes",
+            Path(get_data_dir()) / "themes",
             repo_root / "embeddr-themes" / "themes",
         ])
 
-        themes_root = next(
+        themes_root: Path | None = next(
             (candidate for candidate in themes_candidates if candidate.exists()), None)
         if themes_root is not None:
             app.mount(

@@ -17,18 +17,20 @@ _LOGO_CANDIDATES = [
     "logo.svg",
     "logo.png",
     "logo.webp",
+    "logo.avif",
     "logo.jpg",
     "logo.jpeg",
     "logo.ico",
     "icon.svg",
     "icon.png",
     "icon.webp",
+    "icon.avif",
     "icon.jpg",
     "icon.jpeg",
     "icon.ico",
 ]
 
-_LOGO_EXTENSIONS = {".svg", ".png", ".webp", ".jpg", ".jpeg", ".ico"}
+_LOGO_EXTENSIONS = {".svg", ".png", ".webp", ".avif", ".jpg", ".jpeg", ".ico"}
 
 
 def _resolve_logo_url(plugin_name: str, source_path: Optional[Path]) -> Optional[str]:
@@ -190,7 +192,10 @@ def execute_plugin_action(
     if not instance:
         raise HTTPException(status_code=404, detail="Plugin not found")
 
-    # Verify action exists
+    # Verify action exists — check both the legacy PluginAction list
+    # AND the @action decorator registry (ActionPlugin).
+    # If neither knows the action, still attempt execution since many
+    # plugins route actions inside their execute() method directly.
     found = False
     if instance.actions:
         for act in instance.actions:
@@ -198,9 +203,16 @@ def execute_plugin_action(
                 found = True
                 break
 
+    # ActionPlugin stores @action-decorated methods in an internal registry
+    # that isn't exposed via the .actions property.
     if not found:
-        raise HTTPException(
-            status_code=404, detail=f"Action '{action_name}' not found on plugin '{plugin_id}'")
+        handler = getattr(instance, "_get_action_handler", None)
+        if callable(handler) and handler(action_name) is not None:
+            found = True
+
+    # Allow execution even if not in registry — the plugin's execute()
+    # method may handle routing internally and will raise NotImplementedError
+    # or return an error if the action is truly unsupported.
 
     try:
         # Use simple execution ID

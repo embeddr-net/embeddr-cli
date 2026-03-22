@@ -8,6 +8,7 @@ RouteRegistration = Tuple[Any, str, List[str], Sequence[Any]]
 
 def build_route_registrations(api_dependencies: Sequence[Any]) -> List[RouteRegistration]:
     from embeddr.api.v1 import actions as actions_v2
+    from embeddr.api.v1 import graph as graph_v1
     from embeddr.api.v1 import artifacts as artifacts_v2
     from embeddr.api.v1 import collections as collections_v2
     from embeddr.api.v1 import config as config_v2
@@ -33,6 +34,8 @@ def build_route_registrations(api_dependencies: Sequence[Any]) -> List[RouteRegi
          ["artifacts"], api_dependencies),
         (artifacts_v2.router, "/api/v1/artifacts",
          ["artifacts"], api_dependencies),
+        (graph_v1.router, "/api/graph", ["graph"], api_dependencies),
+        (graph_v1.router, "/api/v1/graph", ["graph"], api_dependencies),
         (plugins_v2.router, "/api/plugins", ["plugins"], api_dependencies),
         (plugins_v2.router, "/api/v1/plugins", ["plugins"], api_dependencies),
         (system_v2.router, "/api/system", ["system"], api_dependencies),

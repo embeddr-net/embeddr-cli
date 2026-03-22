@@ -281,12 +281,60 @@ class ExecutionSpine:
 
     # Resource Semaphores (Concurrency Limits)
     # Default limits, should be configurable
-    _resources = {
-        "cpu": asyncio.Semaphore(4),
-        "io": asyncio.Semaphore(16),
-        "gpu": asyncio.Semaphore(1),
-        "network": asyncio.Semaphore(8)
+    _resource_limits = {
+        "cpu": 4,
+        "io": 16,
+        "gpu": 1,
+        "network": 8,
     }
+    _resources = {
+        name: asyncio.Semaphore(limit)
+        for name, limit in _resource_limits.items()
+    }
+
+    @classmethod
+    def _normalize_resource_class(cls, resource_class: Optional[str]) -> str:
+        value = str(resource_class or "cpu").strip()
+        return value or "cpu"
+
+    @classmethod
+    def _resource_base_class(cls, resource_class: Optional[str]) -> str:
+        value = cls._normalize_resource_class(resource_class)
+        for separator in (":", "/", "@"):
+            if separator in value:
+                base = value.split(separator, 1)[0].strip()
+                return base or "cpu"
+        return value
+
+    @classmethod
+    def _resource_limit_for_class(cls, resource_class: Optional[str]) -> int:
+        base = cls._resource_base_class(resource_class)
+        limit = cls._resource_limits.get(base, 1)
+        try:
+            return max(1, int(limit))
+        except Exception:
+            return 1
+
+    @classmethod
+    def _ensure_resource_class(cls, resource_class: Optional[str]) -> str:
+        normalized = cls._normalize_resource_class(resource_class)
+        if normalized not in cls._resources:
+            cls._resources[normalized] = asyncio.Semaphore(
+                cls._resource_limit_for_class(normalized)
+            )
+        return normalized
+
+    @classmethod
+    def _prime_pending_resource_classes(cls) -> None:
+        engine = get_engine_isolated()
+        with Session(engine) as session:
+            pending_classes = session.exec(
+                select(ArtifactExecution.resource_class).where(
+                    ArtifactExecution.status == "pending"
+                )
+            ).all()
+        for resource_class in pending_classes:
+            cls._ensure_resource_class(resource_class)
 
     @classmethod
     def register_pipeline_step(cls,
@@ -459,6 +507,7 @@ class ExecutionSpine:
         """
         Public API to queue work.
         """
+        resource_class = cls._ensure_resource_class(resource_class)
         if session:
             # Use existing session
             return cls._create_job_in_session(
@@ -689,18 +738,24 @@ class ExecutionSpine:
         await self._recover_stale_jobs()
 
         while self._running:
+            # Clear before processing so submissions/completions that happen
+            # during the tick leave the event set for the subsequent wait.
+            self._job_submitted.clear()
             try:
-                await self._process_tick()
+                dispatched_any = await self._process_tick()
             except Exception as e:
                 logger.error(f"Error in spine tick: {e}")
                 # Don't crash the loop
                 await asyncio.sleep(5)
+                continue
 
-            # Wait for a new job submission signal OR a periodic sweep (10s).
-            # This replaces the old 0.5s unconditional sleep — the worker
-            # wakes *instantly* when submit_job() is called, and still does
-            # background sweeps for any edge-case orphans.
-            self._job_submitted.clear()
+            # If we dispatched work, immediately loop again and keep draining
+            # any remaining free capacity instead of idling.
+            if dispatched_any:
+                continue
+
+            # Wait for a new job submission/completion signal OR a periodic
+            # sweep (10s).
             try:
                 await asyncio.wait_for(self._job_submitted.wait(), timeout=10.0)
             except asyncio.TimeoutError:
@@ -746,23 +801,20 @@ class ExecutionSpine:
         except Exception as e:
             logger.error(f"Failed to recover stale jobs: {e}")
 
-    async def _process_tick(self):
-        """Single iteration of the scheduler."""
-        # 1. Check available resources
-        # Naive implementation: Check semaphores first?
-        # Better: Query DB for pending jobs, then check if we can run them.
+    async def _process_tick(self) -> bool:
+        """Single iteration of the scheduler. Returns True if any job was dispatched."""
+        self._prime_pending_resource_classes()
+        dispatched_any = False
+        for res_name, semaphore in list(self._resources.items()):
+            available_slots = max(0, int(getattr(semaphore, "_value", 0)))
+            for _ in range(available_slots):
+                dispatched = await self._try_dispatch_job(res_name, semaphore)
+                if not dispatched:
+                    break
+                dispatched_any = True
+        return dispatched_any
 
-        # We process one job per tick per free resource slot to keep it simple
-        for res_name, semaphore in self._resources.items():
-            if not semaphore.locked():
-                # We *might* have capacity. (locked() is not 100% reliable for "full", but good heuristic)
-                # Actually, with asyncio.Semaphore, we acquire() to consume.
-                # If we want to check without blocking, we check internal counter.
-                if semaphore._value > 0:
-                    # Try to fetch a job for this resource
-                    await self._try_dispatch_job(res_name, semaphore)
-
-    async def _try_dispatch_job(self, resource_class: str, semaphore: asyncio.Semaphore):
+    async def _try_dispatch_job(self, resource_class: str, semaphore: asyncio.Semaphore) -> bool:
         """Attempts to pick a pending job and run it — either via a remote worker or locally."""
 
         # 1. Fetch pending job logic (Atomicity is tricky here without SELECT FOR UPDATE SKIP LOCKED)
@@ -784,7 +836,7 @@ class ExecutionSpine:
 
             job = session.exec(stmt).first()
             if not job:
-                return
+                return False
 
             job_type = job.type
             job_inputs = job.inputs or {}
@@ -811,7 +863,7 @@ class ExecutionSpine:
                     job_id = job.id
                 except Exception:
                     session.rollback()
-                    return
+                    return False
 
                 # Fire off worker dispatch (doesn't consume local semaphore)
                 asyncio.create_task(
@@ -829,7 +881,7 @@ class ExecutionSpine:
                         "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
                     }
                 ))
-                return
+                return True
 
             # ── No worker available — run locally ──
             logger.info(
@@ -852,7 +904,7 @@ class ExecutionSpine:
             except Exception:
                 # Race condition, someone else grabbed it
                 session.rollback()
-                return
+                return False
 
         if job_id:
             # Broadcast start
@@ -877,6 +929,8 @@ class ExecutionSpine:
             # 2. Acquire resource and launch task
             await semaphore.acquire()
             asyncio.create_task(self._run_job_wrapper(job_id, resource_class))
+            return True
+        return False
 
     async def _dispatch_to_worker(
         self,
@@ -1024,6 +1078,8 @@ class ExecutionSpine:
                         session.commit()
             except Exception:
                 pass
+        finally:
+            self._job_submitted.set()
 
     # ── Worker input/output helpers ────────────────────────────────────
 
@@ -1283,6 +1339,66 @@ class ExecutionSpine:
         if data:
             return data
 
+        # ── Resolve via blob registry (handles S3 + any future providers) ──
+        # If the artifact has a blob backed by a non-local provider (e.g. S3),
+        # ask the blob registry for a presigned/public URL and HTTP-fetch it.
+        def _fetch_via_blob_registry(blob_obj: Any) -> Optional[bytes]:
+            if not blob_obj or (blob_obj.storage_backend or "").lower() == "local":
+                return None
+            try:
+                from embeddr.services.blob_refs import blob_ref_from_blob
+                from embeddr.services.blob_registry import resolve_blob as _resolve
+                import requests as _req
+
+                ref = blob_ref_from_blob(blob_obj, artifact_id=str(artifact.id))
+                resolved = _resolve(ref, "original")
+                url = resolved.get("url") if resolved.get("ok") else None
+                if not url:
+                    logger.debug(
+                        "_load_artifact_bytes: blob registry returned no URL "
+                        "for artifact %s (backend=%s)",
+                        artifact.id, blob_obj.storage_backend,
+                    )
+                    return None
+
+                logger.info(
+                    "_load_artifact_bytes: fetching via blob registry "
+                    "(backend=%s) for artifact %s",
+                    blob_obj.storage_backend, artifact.id,
+                )
+                resp = _req.get(url, timeout=120, stream=True)
+                resp.raise_for_status()
+                return resp.content
+            except Exception as e:
+                logger.warning(
+                    "_load_artifact_bytes: blob registry fetch failed for %s: %s",
+                    artifact.id, e,
+                )
+                return None
+
+        data = _fetch_via_blob_registry(blob)
+        if data:
+            return data
+
+        # If no blob but artifact.uri is s3://, create a synthetic blob
+        # and try the registry (covers artefacts stored before blob rows were
+        # mandatory, or those created by direct S3 upload).
+        if not blob and uri and uri.startswith("s3://"):
+            try:
+                synthetic = ArtifactBlob(
+                    artifact_id=artifact.id,
+                    storage_backend="s3",
+                    path=uri,
+                )
+                data = _fetch_via_blob_registry(synthetic)
+                if data:
+                    return data
+            except Exception as e:
+                logger.debug(
+                    "_load_artifact_bytes: synthetic S3 blob resolve failed "
+                    "for %s: %s", artifact.id, e,
+                )
+
         # Fetch from remote URL (imported/reference artifacts)
         if uri and (uri.startswith("http://") or uri.startswith("https://")):
             try:
@@ -1407,6 +1523,7 @@ class ExecutionSpine:
             await self._execute_job(job_id)
         finally:
             self._resources[resource_class].release()
+            self._job_submitted.set()
 
     async def _execute_job(self, job_id: UUID):
         """Actual execution logic."""
@@ -1469,6 +1586,16 @@ class ExecutionSpine:
                 session.add(job)
                 session.commit()
 
+                await self._run_post_middlewares(
+                    execution_id=job.id,
+                    status="completed",
+                    job_type=job.type,
+                    plugin_name=job.plugin_name,
+                    inputs=job.inputs,
+                    outputs=outputs if isinstance(outputs, dict) else {"result": outputs},
+                    error=None,
+                )
+
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.completed",
                     source="spine",
@@ -1517,6 +1644,16 @@ class ExecutionSpine:
                 job.error = str(e)
                 job.finished_at = datetime.now(UTC)
 
+                await self._run_post_middlewares(
+                    execution_id=job.id,
+                    status="failed",
+                    job_type=job.type,
+                    plugin_name=job.plugin_name,
+                    inputs=job.inputs,
+                    outputs=job.outputs if isinstance(job.outputs, dict) else {},
+                    error=str(e),
+                )
+
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.failed",
                     source="spine",
@@ -1539,3 +1676,35 @@ class ExecutionSpine:
 
             session.add(job)
             session.commit()
+
+    async def _run_post_middlewares(
+        self,
+        *,
+        execution_id: UUID,
+        status: str,
+        job_type: str,
+        plugin_name: str,
+        inputs: Dict[str, Any] | None,
+        outputs: Dict[str, Any] | None,
+        error: Optional[str],
+    ) -> None:
+        try:
+            from embeddr.api.v1.lotus_middleware import run_post_execution_middlewares
+
+            await asyncio.to_thread(
+                run_post_execution_middlewares,
+                execution_id=str(execution_id),
+                status=status,
+                job_type=job_type,
+                plugin_name=plugin_name,
+                inputs=inputs,
+                outputs=outputs,
+                error=error,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Post middleware run failed execution_id=%s status=%s error=%s",
+                execution_id,
+                status,
+                exc,
+            )

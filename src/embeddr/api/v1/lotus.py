@@ -285,6 +285,20 @@ async def lotus_dispatch(
 
     plugin_name = payload.data.get("plugin_name") or payload.data.get("plugin")
     action_name = payload.data.get("action_name") or payload.data.get("action")
+
+    # If we resolved the capability, prefer its authoritative action name
+    # over whatever the caller sent — the capability's action field matches
+    # the spine handler registration (e.g. "llm.respond" vs suffix "respond").
+    if cap and hasattr(cap, "action") and cap.action:
+        cap_action = getattr(cap.action, "action", None)
+        if cap_action:
+            action_name = cap_action
+        if not plugin_name:
+            cap_plugin = getattr(cap.action, "plugin",
+                                 None) or getattr(cap, "plugin", None)
+            if cap_plugin:
+                plugin_name = cap_plugin
+
     if not plugin_name or not action_name:
         raise HTTPException(
             status_code=400,

@@ -269,6 +269,15 @@ async def lotus_invoke(
         if not plugin:
             raise HTTPException(400, f"Plugin not found: {plugin_name}")
 
+        # Look up config capability for this plugin (same as lotus_prepare_inputs)
+        _config_cap_id = None
+        try:
+            _config_caps = reg.list(kind=LotusKind.config, plugin=plugin_name)
+            if _config_caps:
+                _config_cap_id = _config_caps[0].id
+        except Exception:
+            pass
+
         ctx = PluginContext(
             bus=_EVENT_BUS,
             capability_registry=_PLUGIN_CAPABILITY_REGISTRY,
@@ -276,6 +285,7 @@ async def lotus_invoke(
             config=resolve_plugin_config(
                 session=session,
                 plugin_name=plugin_name,
+                config_id=_config_cap_id,
             ),
             lotus=LotusContext(session=session),
             user_id=getattr(auth, "user_id", None),
@@ -302,11 +312,23 @@ async def lotus_invoke(
             )
 
         try:
-            inputs = lotus_prepare_inputs(
-                plugin_name=plugin_name,
+            precheck = lotus_dispatch_action(
+                result_id=cap_id,
                 inputs=inputs,
+                plugin_name=plugin_name,
+                action_name=action_name,
                 session=session,
+                capability=cap,
+                auth=auth,
+                caller_client_id=caller_client_id,
+                precheck_only=True,
             )
+
+            if precheck.get("status") != "allow":
+                return precheck
+
+            inputs = precheck.get("inputs") or inputs
+
             out = await asyncio.to_thread(
                 plugin.execute, action_name, None, inputs, context=ctx
             )

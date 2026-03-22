@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Any, Dict, List, Optional, Set
 from uuid import UUID, uuid5, NAMESPACE_URL
 import os
+from time import perf_counter
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Request
 from fastapi.responses import FileResponse, Response, RedirectResponse, StreamingResponse
@@ -23,6 +24,7 @@ from embeddr_core.models.artifact_lineage import ArtifactLineage
 from embeddr_core.models.artifact_relation import ArtifactRelation
 from embeddr_core.models.tag import ArtifactTagLink
 from embeddr_core.models.collection import CollectionItem
+from embeddr_core.models.artifact_type import ArtifactType
 from embeddr_core.models.user_account import UserAccount
 from embeddr_core.models.operator import Operator
 from embeddr_core.relations import (
@@ -31,7 +33,7 @@ from embeddr_core.relations import (
 )
 from embeddr_core.services.vector_store import VectorStoreService
 from embeddr_core.services.embedding import get_text_embedding, get_loaded_model_name
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydanticField
 from embeddr_core.plugin_interface import EmbeddrEvent
 from embeddr.core.plugin_loader import _EVENT_BUS
 from embeddr.services.ingestion_service import ingestion_service
@@ -45,6 +47,11 @@ from embeddr.services.uri_resolver import resolve_uri
 from embeddr_core.services.config_service import resolve_plugin_config
 from urllib.parse import urlparse
 import requests
+from embeddr.services.graph_query_service import (
+    GraphQueryFilters,
+    get_graph_taxonomy_payload,
+    run_graph_bfs,
+)
 
 router = APIRouter(
     dependencies=[
@@ -189,6 +196,54 @@ def _resolve_embedding_for_artifact(
         .where(ArtifactEmbedding.artifact_id == artifact_id)
         .order_by(ArtifactEmbedding.created_at.desc())
     ).first()
+
+
+def _collect_artifact_type_descendants(
+    session: Session,
+    roots: set[str],
+) -> set[str]:
+    roots = {str(root or "").strip() for root in roots if str(root or "").strip()}
+    if not roots:
+        return set()
+
+    rows = session.exec(select(ArtifactType)).all()
+    children: Dict[str, set[str]] = {}
+    for row in rows:
+        parent_name = str(row.parent_name or "").strip()
+        if not parent_name:
+            continue
+        children.setdefault(parent_name, set()).add(str(row.name))
+
+    resolved: set[str] = set()
+    stack = list(roots)
+    while stack:
+        current = stack.pop()
+        if current in resolved:
+            continue
+        resolved.add(current)
+        stack.extend(children.get(current, ()))
+    return resolved
+
+
+def _media_type_condition(session: Session, media_type: Optional[str]):
+    media_key = str(media_type or "").strip().lower()
+    if media_key == "image":
+        roots = {"image"}
+    elif media_key == "video":
+        roots = {"video"}
+    elif media_key == "document":
+        roots = {"document"}
+    elif media_key == "media":
+        roots = {"image", "video"}
+    else:
+        return None
+
+    related_types = _collect_artifact_type_descendants(session, roots) or set(roots)
+    values = sorted(related_types | roots)
+    return or_(
+        Artifact.type_name.in_(values),
+        Artifact.base_type_name.in_(values),
+    )
 
 
 def _build_similarity_items(
@@ -404,6 +459,29 @@ class IngestRequest(BaseModel):
     items: List[ArtifactIngestRequestItem]
 
 
+class GraphQueryFiltersInput(BaseModel):
+    relation_types_include: List[str] = PydanticField(default_factory=list)
+    relation_types_exclude: List[str] = PydanticField(default_factory=list)
+    relation_families_include: List[str] = PydanticField(default_factory=list)
+    source_namespaces_include: List[str] = PydanticField(default_factory=list)
+    source_namespaces_exclude: List[str] = PydanticField(default_factory=list)
+    artifact_types_include: List[str] = PydanticField(default_factory=list)
+    artifact_base_types_include: List[str] = PydanticField(default_factory=list)
+    include_legacy_stash_contains: bool = False
+
+
+class GraphQueryRequest(BaseModel):
+    seed_ids: List[UUID]
+    max_depth: int = 2
+    direction: str = "both"
+    include_lineage: bool = True
+    include_relations: bool = True
+    limit_nodes: int = 1500
+    limit_edges: int = 6000
+    include_overlay_counts: bool = True
+    filters: GraphQueryFiltersInput = PydanticField(default_factory=GraphQueryFiltersInput)
+
+
 def get_session():
     engine = get_engine()
     with Session(engine) as session:
@@ -521,6 +599,24 @@ def _artifact_to_response(
             session, artifact.owner_operator_id)
 
     return payload
+
+
+def _artifact_graph_label(artifact: Artifact) -> str:
+    metadata = artifact.metadata_json or {}
+    external = metadata.get("external") if isinstance(metadata, dict) else {}
+    if not isinstance(external, dict):
+        external = {}
+    candidate = (
+        external.get("display_name")
+        or metadata.get("name")
+        or metadata.get("title")
+        or metadata.get("label")
+        or metadata.get("filename")
+    )
+    label = str(candidate or "").strip()
+    if label:
+        return label
+    return str(artifact.id)[:8]
 
 
 def _apply_text_search(query, count_query, q: Optional[str]):
@@ -790,35 +886,31 @@ def upload_artifact_bytes(
         }
 
 
-@router.post("/{artifact_id}/relations", response_model=Dict[str, str])
+@router.post("/{artifact_id}/relations", response_model=Dict[str, str],
+             deprecated=True,
+             description="Deprecated: use POST /api/graph/relations instead.")
 def add_relation(
     artifact_id: UUID,
     rel: RelationCreate,
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
-    """Create a relationship between artifacts."""
-    _ensure_artifact_access(session, artifact_id, auth, for_write=True)
-    _ensure_artifact_access(session, rel.target_id, auth)
-    # Check if exists to avoid dupes?
-    existing = session.exec(select(ArtifactRelation).where(
-        ArtifactRelation.source_id == artifact_id,
-        ArtifactRelation.target_id == rel.target_id,
-        ArtifactRelation.relation_type == rel.relation_type
-    )).first()
+    """
+    Deprecated — use POST /api/graph/relations.
 
-    if existing:
-        return {"status": "exists", "id": f"{existing.source_id}:{existing.target_id}"}
-
-    new_rel = ArtifactRelation(
+    Creates a relation from artifact_id → rel.target_id.
+    Kept for backward compat; forwards to the graph router logic.
+    """
+    from embeddr.api.v1.graph import RelationCreate as GraphRelationCreate, create_relation as graph_create_relation
+    graph_rel = GraphRelationCreate(
         source_id=artifact_id,
         target_id=rel.target_id,
         relation_type=rel.relation_type,
-        metadata_json=rel.metadata_json
+        source_namespace="user",
+        metadata_json=rel.metadata_json or {},
     )
-    session.add(new_rel)
-    session.commit()
-    return {"status": "created", "id": f"{new_rel.source_id}:{new_rel.target_id}"}
+    result = graph_create_relation(graph_rel, session=session, auth=auth)
+    return {"status": "created", "id": str(result.id)}
 
 
 @router.post("", response_model=Artifact)
@@ -1341,20 +1433,8 @@ def list_artifacts(
             query = query.where(Artifact.type_name == type_name)
 
     if media_type:
-        # Map common media types to artifact types
-        if media_type == "image":
-            # Check both base_type_name and type_name to cover legacy/plugin created artifacts
-            cond = or_(
-                Artifact.base_type_name == "image",
-                Artifact.type_name == "image"
-            )
-            query = query.where(cond)
-            count_query = count_query.where(cond)
-        elif media_type == "video":
-            cond = or_(
-                Artifact.base_type_name == "video",
-                Artifact.type_name == "video"
-            )
+        cond = _media_type_condition(session, media_type)
+        if cond is not None:
             query = query.where(cond)
             count_query = count_query.where(cond)
 
@@ -1431,6 +1511,11 @@ def list_artifacts(
                 f'"instance": "{import_instance}"'),
             cast(Artifact.metadata_json, String).contains(
                 f'"instance":"{import_instance}"'),
+            # nynxz-stash stores the instance identifier as stash_instance_id
+            cast(Artifact.metadata_json, String).contains(
+                f'"stash_instance_id": "{import_instance}"'),
+            cast(Artifact.metadata_json, String).contains(
+                f'"stash_instance_id":"{import_instance}"'),
         )
         query = query.where(instance_condition)
         count_query = count_query.where(instance_condition)
@@ -1467,6 +1552,39 @@ def list_artifacts(
         limit=limit,
         offset=offset
     )
+
+
+@router.get("/graph/taxonomy", deprecated=True,
+            description="Deprecated: use GET /api/graph/taxonomy instead.")
+def get_artifact_graph_taxonomy(
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Deprecated — use GET /api/graph/taxonomy."""
+    from embeddr.api.v1.graph import graph_taxonomy
+    return graph_taxonomy(session=session, auth=auth)
+
+
+@router.post("/graph/query", deprecated=True,
+             description="Deprecated: use POST /api/graph/query instead.")
+def query_artifact_graph(
+    req: GraphQueryRequest,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Deprecated — use POST /api/graph/query."""
+    from embeddr.api.v1.graph import GraphQueryRequest as GQR, graph_query
+    graph_req = GQR(
+        seed_ids=req.seed_ids,
+        max_depth=req.max_depth,
+        direction=req.direction,
+        include_lineage=req.include_lineage,
+        include_relations=req.include_relations,
+        limit_nodes=req.limit_nodes,
+        limit_edges=req.limit_edges,
+        include_overlay_counts=req.include_overlay_counts,
+    )
+    return graph_query(graph_req, session=session, auth=auth)
 
 
 def _coerce_uuid(value: str, label: str) -> UUID:
@@ -1698,9 +1816,9 @@ def resolve_artifact(
             ).to_dict()
 
         url = (
-            f"/api/v1/artifacts/{artifact_uuid}/preview"
+            f"/api/artifacts/{artifact_uuid}/preview"
             if variant == "preview"
-            else f"/api/v1/artifacts/{artifact_uuid}/content"
+            else f"/api/artifacts/{artifact_uuid}/content"
         )
 
         return {
@@ -1715,9 +1833,9 @@ def resolve_artifact(
         }
 
     if variant == "preview":
-        url = f"/api/v1/artifacts/{artifact_uuid}/preview"
+        url = f"/api/artifacts/{artifact_uuid}/preview"
     else:
-        url = f"/api/v1/artifacts/{artifact_uuid}/content"
+        url = f"/api/artifacts/{artifact_uuid}/content"
 
     if variant == "preview":
         preview = session.exec(
@@ -1974,7 +2092,8 @@ def get_artifact_lineage(
     }
 
 
-@router.get("/{artifact_id}/subgraph")
+@router.get("/{artifact_id}/subgraph", deprecated=True,
+             description="Deprecated: use GET /api/graph/artifact/{id} instead.")
 def get_artifact_subgraph(
     artifact_id: UUID,
     max_depth: int = 3,
@@ -1983,129 +2102,29 @@ def get_artifact_subgraph(
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
-    """
-    Explore the artifact graph recursively from a root node.
-    Returns a unified set of nodes and edges found within max_depth.
-    """
-    _ensure_artifact_access(session, artifact_id, auth)
-    visited_nodes = {artifact_id}
-    edges = []
-
-    # We use a BFS approach here for simplicity with multiple edge types,
-    # but could be optimized further via Recursive CTE if performance is critical for deep trees.
-    frontier = {artifact_id}
-
-    for _ in range(max_depth):
-        if not frontier:
-            break
-
-        next_frontier = set()
-        frontier_list = list(frontier)
-        candidate_ids: set[UUID] = set()
-
-        # 1. Lineage
-        if include_lineage:
-            # Parents
-            parent_lineage = session.exec(
-                select(ArtifactLineage).where(
-                    ArtifactLineage.child_id.in_(frontier_list))
-            ).all()
-            for l in parent_lineage:
-                candidate_ids.update([l.parent_id, l.child_id])
-
-            # Children
-            child_lineage = session.exec(
-                select(ArtifactLineage).where(
-                    ArtifactLineage.parent_id.in_(frontier_list))
-            ).all()
-            for l in child_lineage:
-                candidate_ids.update([l.parent_id, l.child_id])
-
-        # 2. Relations
-        if include_relations:
-            relations = session.exec(
-                select(ArtifactRelation).where(
-                    (ArtifactRelation.source_id.in_(frontier_list)) |
-                    (ArtifactRelation.target_id.in_(frontier_list))
-                )
-            ).all()
-            for r in relations:
-                candidate_ids.update([r.source_id, r.target_id])
-
-        allowed_ids = _filter_allowed_ids(session, list(candidate_ids), auth)
-
-        if include_lineage:
-            for l in parent_lineage:
-                if l.parent_id in allowed_ids and l.child_id in allowed_ids:
-                    edges.append({
-                        "type": "lineage",
-                        "source": l.parent_id,
-                        "target": l.child_id,
-                    })
-                    if l.parent_id not in visited_nodes:
-                        visited_nodes.add(l.parent_id)
-                        next_frontier.add(l.parent_id)
-
-            for l in child_lineage:
-                if l.parent_id in allowed_ids and l.child_id in allowed_ids:
-                    edges.append({
-                        "type": "lineage",
-                        "source": l.parent_id,
-                        "target": l.child_id,
-                    })
-                    if l.child_id not in visited_nodes:
-                        visited_nodes.add(l.child_id)
-                        next_frontier.add(l.child_id)
-
-        if include_relations:
-            for r in relations:
-                if r.source_id in allowed_ids and r.target_id in allowed_ids:
-                    edges.append({
-                        "type": "relation",
-                        "label": r.relation_type,
-                        "source": r.source_id,
-                        "target": r.target_id,
-                    })
-                    if r.source_id not in visited_nodes:
-                        visited_nodes.add(r.source_id)
-                        next_frontier.add(r.source_id)
-                    if r.target_id not in visited_nodes:
-                        visited_nodes.add(r.target_id)
-                        next_frontier.add(r.target_id)
-
-        frontier = next_frontier
-
-    return {
-        "root_id": artifact_id,
-        "nodes": list(visited_nodes),
-        "edges": edges
-    }
+    """Deprecated — use GET /api/graph/artifact/{artifact_id}."""
+    from embeddr.api.v1.graph import artifact_subgraph
+    return artifact_subgraph(
+        artifact_id=artifact_id,
+        max_depth=max_depth,
+        include_lineage=include_lineage,
+        include_relations=include_relations,
+        direction="both",
+        session=session,
+        auth=auth,
+    )
 
 
-@router.get("/{artifact_id}/relations", response_model=List[ArtifactRelation])
+@router.get("/{artifact_id}/relations", deprecated=True,
+            description="Deprecated: use GET /api/graph/relations?source_id={id} instead.")
 def get_artifact_relations(
     artifact_id: UUID,
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
-    """Retrieve semantic relations for an artifact."""
-    _ensure_artifact_access(session, artifact_id, auth)
-    # Find where it is source OR target
-    query = select(ArtifactRelation).where(
-        (ArtifactRelation.source_id == artifact_id) |
-        (ArtifactRelation.target_id == artifact_id)
-    )
-    relations = session.exec(query).all()
-    allowed_ids = _filter_allowed_ids(
-        session,
-        list({r.source_id for r in relations} |
-             {r.target_id for r in relations}),
-        auth,
-    )
-    return [
-        r for r in relations
-        if r.source_id in allowed_ids and r.target_id in allowed_ids
-    ]
+    """Deprecated — use GET /api/graph/relations?source_id={artifact_id}."""
+    from embeddr.api.v1.graph import list_relations
+    return list_relations(source_id=artifact_id, session=session, auth=auth)
 
 
 @router.get("/{artifact_id}/preview")
@@ -2130,15 +2149,15 @@ def get_artifact_preview(
         # Fallback: If the artifact itself is an image, serve the original file
         artifact = _get_artifact_or_repair(session, artifact_uuid)
 
-        # Check if it looks like an image either by type or extension
-        is_image_type = artifact and (
-            artifact.base_type_name == "image" or
-            artifact.type_name == "image" or
+        # Check if it looks like media either by type or extension
+        is_media_type = artifact and (
+            artifact.base_type_name in {"image", "video"} or
+            artifact.type_name in {"image", "video"} or
             (artifact.metadata_json and artifact.metadata_json.get(
                 "extension", "").lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
         )
 
-        if is_image_type:
+        if is_media_type:
             blob = session.exec(
                 select(ArtifactBlob)
                 .where(ArtifactBlob.artifact_id == artifact_uuid)
@@ -2170,7 +2189,7 @@ def get_artifact_preview(
             if response:
                 return response
 
-        if is_image_type and artifact.uri:
+        if is_media_type and artifact.uri:
             fpath = resolve_uri(artifact.uri)
 
             if fpath and os.path.isfile(fpath):
