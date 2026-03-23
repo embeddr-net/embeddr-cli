@@ -42,6 +42,7 @@ def build_route_registrations(api_dependencies: Sequence[Any]) -> List[RouteRegi
         (system_v2.router, "/api/v1/system", ["system"], api_dependencies),
         (system_public_v2.router, "/api", ["system"], []),
         (system_public_v2.router, "/api/v1", ["system"], []),
+        (system_public_v2.wellknown_router, "", ["system"], []),
         (collections_v2.router, "/api/collections",
          ["collections"], api_dependencies),
         (collections_v2.router, "/api/v1/collections",

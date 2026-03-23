@@ -81,6 +81,13 @@ class Permissions:
     # ── Keys (self-service) ─────────────────────────────────────
     KEYS_CREATE_SELF = "keys:create:self"
 
+    # ── Service Clients ───────────────────────────────────────
+    SERVICE_CLIENTS_READ = "service-clients:read"
+    SERVICE_CLIENTS_WRITE = "service-clients:write"
+
+    # ── Auth Token ────────────────────────────────────────────
+    AUTH_TOKEN = "auth:token"
+
     # ── Lotus ───────────────────────────────────────────────────
     LOTUS_LIST = "lotus:list"
     LOTUS_DISPATCH = "lotus:dispatch"
@@ -132,9 +139,64 @@ class Permissions:
         }
 
     @classmethod
+    def service_permissions(cls) -> set[str]:
+        """Default permissions for service clients (read + write artifacts, execute)."""
+        return {
+            cls.ARTIFACTS_READ,
+            cls.ARTIFACTS_WRITE,
+            cls.COLLECTIONS_READ,
+            cls.EXECUTIONS_READ,
+            cls.EXECUTIONS_WRITE,
+            cls.PLUGINS_READ,
+            cls.SYSTEM_READ,
+            cls.LOTUS_LIST,
+            cls.LOTUS_DISPATCH,
+        }
+
+    @classmethod
     def all_permissions(cls) -> list[str]:
         """Return every defined permission constant (useful for docs/debug)."""
         return sorted(
             v for k, v in vars(cls).items()
             if isinstance(v, str) and not k.startswith("_") and k == k.upper()
         )
+
+
+# Human-readable descriptions for OAuth2 consent screen
+SCOPE_DESCRIPTIONS: dict[str, str] = {
+    "artifacts:read": "View your artifacts and media",
+    "artifacts:write": "Create, edit, and delete artifacts",
+    "collections:read": "View your collections",
+    "collections:write": "Create and edit collections",
+    "executions:read": "View execution history",
+    "executions:write": "Run actions and workflows",
+    "workflows:read": "View workflow definitions",
+    "workflows:write": "Create and edit workflows",
+    "config:read": "View configuration",
+    "config:write": "Change configuration",
+    "plugins:read": "View installed plugins",
+    "plugins:write": "Manage plugins",
+    "system:read": "View system information",
+    "system:write": "Change system settings",
+    "panels:read": "View panel sessions",
+    "panels:write": "Create and manage panels",
+    "resources:read": "View resources",
+    "resources:write": "Manage resources",
+    "maintenance:read": "View maintenance status",
+    "maintenance:write": "Run maintenance tasks",
+    "workers:read": "View worker status",
+    "workers:write": "Manage workers",
+    "actions:read": "View available actions",
+    "actions:write": "Dispatch actions",
+    "security:read": "View security settings",
+    "security:write": "Manage security settings",
+    "projections:read": "View embedding projections",
+    "themes:read": "View themes",
+    "lotus:list": "List available capabilities",
+    "lotus:dispatch": "Invoke capabilities",
+    "lotus:*": "Full capability access",
+    "keys:create:self": "Create personal API keys",
+    "service-clients:read": "View service clients",
+    "service-clients:write": "Manage service clients",
+    "*": "Full access to all features",
+}

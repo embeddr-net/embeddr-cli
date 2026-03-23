@@ -9,13 +9,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select, func
 
-from embeddr.api.security import COOKIE_NAME, get_auth_context
+from fastapi import Form
+
+from embeddr.api.security import COOKIE_NAME, get_auth_context, require_permission, set_auth_cookie, clear_auth_cookie
 from embeddr.db.session import get_session
 from embeddr.services import auth_service
 from embeddr_core.models.api_key import ApiKey, ApiKeyPermission
 from embeddr_core.models.auth_session import AuthSession
 from embeddr_core.models.role import Role, RolePermission
 from embeddr_core.models.operator import Operator
+from embeddr_core.models.service_client import ServiceClient
 from embeddr_core.models.user_account import UserAccount, UserRole
 
 router = APIRouter()
@@ -846,6 +849,49 @@ def update_profile(
     )
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: Optional[str] = None
+    new_password: str
+    confirm: bool = False
+
+
+@router.post("/me/password")
+def change_own_password(
+    payload: ChangePasswordRequest,
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    """Change own password. Required when must_change_password is set."""
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+    if not payload.confirm:
+        return {"status": "confirm", "message": "Set confirm=true to proceed."}
+
+    user = session.get(UserAccount, auth.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Verify current password if the user has one and isn't in forced-change mode
+    if user.password_hash and not getattr(user, "must_change_password", False):
+        if not payload.current_password:
+            raise HTTPException(status_code=400, detail="Current password required")
+        if not auth_service.verify_password(
+            payload.current_password, user.password_hash, user.password_salt or ""
+        ):
+            raise HTTPException(status_code=403, detail="Current password incorrect")
+
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    password_hash, password_salt = auth_service.hash_password(payload.new_password)
+    user.password_hash = password_hash
+    user.password_salt = password_salt
+    user.must_change_password = False
+    session.add(user)
+    session.commit()
+    return {"status": "ok", "message": "Password changed successfully."}
+
+
 @router.post("/users")
 def create_user(
     payload: UserCreateRequest,
@@ -1059,16 +1105,7 @@ def login_with_password(
         ip_address=_request_client_ip(request),
     )
 
-    secure = request.url.scheme == "https"
-    samesite = "none" if secure else "lax"
-    response.set_cookie(
-        COOKIE_NAME,
-        session_token,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
-    )
+    set_auth_cookie(response, request, session_token)
 
     return {
         "ok": True,
@@ -1128,15 +1165,7 @@ def logout(
             session.commit()
 
     # Clear the auth cookie regardless
-    secure = request.url.scheme == "https"
-    samesite = "none" if secure else "lax"
-    response.delete_cookie(
-        COOKIE_NAME,
-        path="/",
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-    )
+    clear_auth_cookie(response, request)
 
     return {"ok": True, "message": "Logged out successfully"}
 
@@ -1207,16 +1236,7 @@ def refresh_my_session(
         ip_address=_request_client_ip(request),
     )
 
-    secure = request.url.scheme == "https"
-    samesite = "none" if secure else "lax"
-    response.set_cookie(
-        COOKIE_NAME,
-        raw_token,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
-    )
+    set_auth_cookie(response, request, raw_token)
 
     return {
         "ok": True,
@@ -1274,15 +1294,7 @@ def logout_all_sessions(
     )
 
     if payload.include_current:
-        secure = request.url.scheme == "https"
-        samesite = "none" if secure else "lax"
-        response.delete_cookie(
-            COOKIE_NAME,
-            path="/",
-            httponly=True,
-            secure=secure,
-            samesite=samesite,
-        )
+        clear_auth_cookie(response, request)
 
     return {
         "ok": True,
@@ -1386,16 +1398,7 @@ def switch_client_session(
         ip_address=_request_client_ip(request),
     )
 
-    secure = request.url.scheme == "https"
-    samesite = "none" if secure else "lax"
-    response.set_cookie(
-        COOKIE_NAME,
-        raw_token,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
-    )
+    set_auth_cookie(response, request, raw_token)
 
     return {
         "ok": True,
@@ -1430,3 +1433,471 @@ def list_available_permissions(auth=Depends(get_auth_context)):
             "viewer": sorted(Permissions.viewer_permissions()),
         },
     }
+
+
+# ── OAuth2 Token Endpoint ─────────────────────────────────────────────
+
+@router.post("/auth/token")
+def token_endpoint(
+    grant_type: str = Form(...),
+    client_id: str = Form(...),
+    client_secret: Optional[str] = Form(default=None),
+    scope: Optional[str] = Form(default=None),
+    code: Optional[str] = Form(default=None),
+    redirect_uri: Optional[str] = Form(default=None),
+    code_verifier: Optional[str] = Form(default=None),
+    session: Session = Depends(get_session),
+):
+    """
+    OAuth2-compatible token endpoint.
+
+    Supports:
+    - `client_credentials` grant for service-to-service auth
+    - `authorization_code` grant for user-delegated auth with PKCE
+    """
+    if grant_type == "client_credentials":
+        return _handle_client_credentials(session, client_id, client_secret, scope)
+    elif grant_type == "authorization_code":
+        return _handle_authorization_code(
+            session, client_id, client_secret, code, redirect_uri, code_verifier,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported grant_type: {grant_type}. Supported: client_credentials, authorization_code",
+        )
+
+
+def _handle_client_credentials(session, client_id, client_secret, scope):
+    sc = auth_service.validate_client_credentials(session, client_id, client_secret)
+    if not sc:
+        raise HTTPException(status_code=401, detail="Invalid client credentials")
+
+    if "client_credentials" not in (sc.grant_types or []):
+        raise HTTPException(
+            status_code=400,
+            detail="client_credentials grant not allowed for this service client",
+        )
+
+    requested_scopes = scope.split() if scope else None
+    auth_session, raw_token = auth_service.create_service_session(
+        session, sc, requested_scopes
+    )
+
+    allowed = set(sc.allowed_scopes) if sc.allowed_scopes else set()
+    if requested_scopes and allowed:
+        granted = [s for s in requested_scopes if s in allowed or "*" in allowed]
+    elif requested_scopes:
+        granted = requested_scopes
+    else:
+        granted = list(allowed)
+
+    expires_in = int(
+        (auth_session.expires_at - auth_session.created_at).total_seconds()
+    ) if auth_session.expires_at else 3600
+
+    return {
+        "access_token": raw_token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "scope": " ".join(granted),
+    }
+
+
+def _handle_authorization_code(session, client_id, client_secret, code, redirect_uri, code_verifier):
+    import logging as _log
+    _logger = _log.getLogger("embeddr.api.security.token")
+    _logger.info(
+        "authorization_code exchange client_id=%s redirect_uri=%s code_prefix=%s has_verifier=%s has_secret=%s",
+        client_id, redirect_uri, code[:12] if code else None,
+        bool(code_verifier), bool(client_secret),
+    )
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' parameter")
+    if not redirect_uri:
+        raise HTTPException(status_code=400, detail="Missing 'redirect_uri' parameter")
+
+    try:
+        auth_session, raw_token = auth_service.exchange_authorization_code(
+            session,
+            raw_code=code,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+        )
+    except ValueError as e:
+        _logger.warning("authorization_code exchange failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    session.commit()
+
+    expires_in = int(
+        (auth_session.expires_at - auth_session.created_at).total_seconds()
+    ) if auth_session.expires_at else 3600
+
+    # Look up the auth code to get granted scopes
+    code_hash = auth_service.hash_authorization_code(code)
+    from embeddr_core.models.authorization_code import AuthorizationCode
+    auth_code = session.exec(
+        select(AuthorizationCode).where(AuthorizationCode.code_hash == code_hash)
+    ).first()
+    granted_scopes = auth_code.scopes if auth_code else []
+
+    return {
+        "access_token": raw_token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "scope": " ".join(granted_scopes),
+    }
+
+
+# ── Service Client CRUD ───────────────────────────────────────────────
+
+class ServiceClientCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    redirect_uris: List[str] = Field(default_factory=list)
+    allowed_scopes: List[str] = Field(default_factory=list)
+    grant_types: List[str] = Field(default_factory=lambda: ["client_credentials"])
+    confirm: bool = False
+
+
+class ServiceClientUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    redirect_uris: Optional[List[str]] = None
+    allowed_scopes: Optional[List[str]] = None
+    grant_types: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+    confirm: bool = False
+
+
+class ServiceClientResponse(BaseModel):
+    id: str
+    client_id: str
+    name: str
+    description: Optional[str] = None
+    operator_id: str
+    created_by_user_id: str
+    redirect_uris: List[str] = Field(default_factory=list)
+    allowed_scopes: List[str] = Field(default_factory=list)
+    grant_types: List[str] = Field(default_factory=list)
+    is_active: bool = True
+    created_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+
+
+def _sc_to_response(sc: ServiceClient) -> Dict:
+    return {
+        "id": str(sc.id),
+        "client_id": sc.client_id,
+        "name": sc.name,
+        "description": sc.description,
+        "operator_id": str(sc.operator_id),
+        "created_by_user_id": str(sc.created_by_user_id),
+        "redirect_uris": sc.redirect_uris or [],
+        "allowed_scopes": sc.allowed_scopes or [],
+        "grant_types": sc.grant_types or [],
+        "is_active": sc.is_active,
+        "created_at": sc.created_at.isoformat() if sc.created_at else None,
+        "last_used_at": sc.last_used_at.isoformat() if sc.last_used_at else None,
+    }
+
+
+@router.post(
+    "/service-clients",
+    status_code=201,
+    dependencies=[Depends(require_permission("security:write"))],
+)
+def create_service_client(
+    req: ServiceClientCreateRequest,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Register a new service client (OAuth2 application)."""
+    if not req.confirm:
+        return {
+            "status": "confirm",
+            "message": f"Create service client '{req.name}'? Set confirm=true to proceed.",
+        }
+
+    operator_id = auth.operator_id
+    if not operator_id:
+        raise HTTPException(status_code=400, detail="No operator context")
+
+    sc, raw_secret = auth_service.create_service_client(
+        session,
+        name=req.name,
+        description=req.description,
+        operator_id=operator_id,
+        created_by_user_id=auth.user_id,
+        redirect_uris=req.redirect_uris,
+        allowed_scopes=req.allowed_scopes,
+        grant_types=req.grant_types,
+    )
+
+    resp = _sc_to_response(sc)
+    resp["client_secret"] = raw_secret
+    resp["_warning"] = "Store the client_secret securely. It will not be shown again."
+    return resp
+
+
+@router.get(
+    "/service-clients",
+    dependencies=[Depends(require_permission("security:read"))],
+)
+def list_service_clients(
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """List service clients for the current operator, including active session counts."""
+    query = select(ServiceClient)
+    if auth.operator_id and not auth.is_privileged:
+        query = query.where(ServiceClient.operator_id == auth.operator_id)
+    clients = session.exec(query.order_by(ServiceClient.created_at.desc())).all()
+
+    items = []
+    for sc in clients:
+        resp = _sc_to_response(sc)
+        active_sessions = session.exec(
+            select(func.count(AuthSession.id)).where(
+                AuthSession.service_client_id == sc.id,
+                AuthSession.revoked_at.is_(None),
+            )
+        ).one()
+        resp["active_sessions"] = int(active_sessions or 0)
+        items.append(resp)
+
+    return {"items": items}
+
+
+@router.get(
+    "/service-clients/{sc_id}",
+    dependencies=[Depends(require_permission("security:read"))],
+)
+def get_service_client(
+    sc_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Get a service client by ID."""
+    sc = session.get(ServiceClient, sc_id)
+    if not sc:
+        raise HTTPException(status_code=404, detail="Service client not found")
+    if not auth.is_privileged and auth.operator_id and sc.operator_id != auth.operator_id:
+        raise HTTPException(status_code=404, detail="Service client not found")
+    return _sc_to_response(sc)
+
+
+@router.put(
+    "/service-clients/{sc_id}",
+    dependencies=[Depends(require_permission("security:write"))],
+)
+def update_service_client(
+    sc_id: UUID,
+    req: ServiceClientUpdateRequest,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Update a service client."""
+    sc = session.get(ServiceClient, sc_id)
+    if not sc:
+        raise HTTPException(status_code=404, detail="Service client not found")
+    if not auth.is_privileged and auth.operator_id and sc.operator_id != auth.operator_id:
+        raise HTTPException(status_code=404, detail="Service client not found")
+    if not req.confirm:
+        return {"status": "confirm", "message": "Set confirm=true to proceed."}
+
+    if req.name is not None:
+        sc.name = req.name
+    if req.description is not None:
+        sc.description = req.description
+    if req.redirect_uris is not None:
+        sc.redirect_uris = req.redirect_uris
+    if req.allowed_scopes is not None:
+        sc.allowed_scopes = req.allowed_scopes
+    if req.grant_types is not None:
+        sc.grant_types = req.grant_types
+    if req.is_active is not None:
+        sc.is_active = req.is_active
+
+    session.add(sc)
+    session.flush()
+    return _sc_to_response(sc)
+
+
+@router.delete(
+    "/service-clients/{sc_id}",
+    dependencies=[Depends(require_permission("security:write"))],
+)
+def delete_service_client(
+    sc_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Deactivate a service client and revoke all its sessions."""
+    sc = session.get(ServiceClient, sc_id)
+    if not sc:
+        raise HTTPException(status_code=404, detail="Service client not found")
+    if not auth.is_privileged and auth.operator_id and sc.operator_id != auth.operator_id:
+        raise HTTPException(status_code=404, detail="Service client not found")
+
+    sc.is_active = False
+    session.add(sc)
+
+    # Revoke all active sessions for this service client
+    active_sessions = session.exec(
+        select(AuthSession).where(
+            AuthSession.service_client_id == sc.id,
+            AuthSession.revoked_at.is_(None),
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    for s in active_sessions:
+        s.revoked_at = now
+        s.revoked_reason = "service_client_deactivated"
+        session.add(s)
+
+    session.flush()
+    return {"status": "ok", "message": f"Service client '{sc.name}' deactivated, {len(active_sessions)} sessions revoked."}
+
+
+# ── OAuth2 Authorization Code Flow ────────────────────────────────────
+
+class AuthorizeConsentRequest(BaseModel):
+    client_id: str
+    scope: str
+    redirect_uri: str
+    state: Optional[str] = None
+    code_challenge: Optional[str] = None
+    code_challenge_method: str = "S256"
+    approved: bool = False
+
+
+@router.get("/auth/authorize")
+def authorize_info(
+    client_id: str = Query(...),
+    scope: Optional[str] = Query(default=None),
+    redirect_uri: str = Query(...),
+    state: Optional[str] = Query(default=None),
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    """
+    OAuth2 authorization endpoint — returns info for the consent screen.
+
+    The frontend renders a consent page using this data. If the user is not
+    logged in, returns 401 so the frontend can redirect to /access.
+    """
+    if not auth.authenticated and not auth.is_open:
+        raise HTTPException(
+            status_code=401,
+            detail="login_required",
+        )
+
+    sc = session.exec(
+        select(ServiceClient).where(ServiceClient.client_id == client_id)
+    ).first()
+    if not sc:
+        raise HTTPException(status_code=400, detail="Unknown client_id")
+    if not sc.is_active:
+        raise HTTPException(status_code=400, detail="Service client is inactive")
+
+    if "authorization_code" not in (sc.grant_types or []):
+        raise HTTPException(
+            status_code=400,
+            detail="authorization_code grant not allowed for this service client",
+        )
+
+    # Validate redirect_uri
+    if sc.redirect_uris and redirect_uri not in sc.redirect_uris:
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+    # Resolve scopes
+    requested = scope.split() if scope else list(sc.allowed_scopes or [])
+    allowed = set(sc.allowed_scopes) if sc.allowed_scopes else set()
+    if allowed:
+        granted = [s for s in requested if s in allowed or "*" in allowed]
+    else:
+        granted = requested
+
+    from embeddr.auth.permissions import SCOPE_DESCRIPTIONS
+    scope_descs = {s: SCOPE_DESCRIPTIONS.get(s, s) for s in granted}
+
+    return {
+        "client_name": sc.name,
+        "client_description": sc.description,
+        "client_id": sc.client_id,
+        "requested_scopes": granted,
+        "scope_descriptions": scope_descs,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "user": {
+            "username": auth.username,
+            "display_name": auth.display_name,
+            "operator_name": auth.operator_name,
+        } if auth.authenticated else None,
+    }
+
+
+@router.post("/auth/authorize/consent")
+def authorize_consent(
+    req: AuthorizeConsentRequest,
+    auth=Depends(get_auth_context),
+    session: Session = Depends(get_session),
+):
+    """
+    User approves or denies the authorization request.
+
+    On approval: creates an authorization code and returns a redirect URL.
+    On denial: returns redirect URL with error=access_denied.
+    """
+    if not auth.user_id:
+        raise HTTPException(status_code=403, detail="No authenticated user")
+
+    sc = session.exec(
+        select(ServiceClient).where(ServiceClient.client_id == req.client_id)
+    ).first()
+    if not sc or not sc.is_active:
+        raise HTTPException(status_code=400, detail="Invalid or inactive service client")
+
+    if sc.redirect_uris and req.redirect_uri not in sc.redirect_uris:
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+    # Build redirect for denial
+    if not req.approved:
+        sep = "&" if "?" in req.redirect_uri else "?"
+        deny_url = f"{req.redirect_uri}{sep}error=access_denied"
+        if req.state:
+            deny_url += f"&state={req.state}"
+        return {"redirect_to": deny_url}
+
+    # Resolve scopes
+    requested = req.scope.split() if req.scope else list(sc.allowed_scopes or [])
+    allowed = set(sc.allowed_scopes) if sc.allowed_scopes else set()
+    if allowed:
+        granted = [s for s in requested if s in allowed or "*" in allowed]
+    else:
+        granted = requested
+
+    auth_code, raw_code = auth_service.create_authorization_code(
+        session,
+        service_client_id=sc.id,
+        user_id=auth.user_id,
+        operator_id=auth.operator_id,
+        scopes=granted,
+        redirect_uri=req.redirect_uri,
+        code_challenge=req.code_challenge,
+        code_challenge_method=req.code_challenge_method,
+        state=req.state,
+    )
+
+    session.commit()
+
+    sep = "&" if "?" in req.redirect_uri else "?"
+    redirect_url = f"{req.redirect_uri}{sep}code={raw_code}"
+    if req.state:
+        redirect_url += f"&state={req.state}"
+
+    return {"redirect_to": redirect_url}

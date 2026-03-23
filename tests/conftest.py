@@ -1,3 +1,4 @@
+import asyncio
 from sqlmodel.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 from fastapi.testclient import TestClient
@@ -70,8 +71,13 @@ def clean_spine_fixture(spine_engine):
 
     original_handlers = dict(ExecutionSpine._handlers)
     original_pipelines = dict(ExecutionSpine._pipelines)
+    original_resource_limits = dict(ExecutionSpine._resource_limits)
     ExecutionSpine._handlers.clear()
     ExecutionSpine._pipelines.clear()
+    ExecutionSpine._resources = {
+        name: asyncio.Semaphore(limit)
+        for name, limit in original_resource_limits.items()
+    }
 
     yield ExecutionSpine
 
@@ -79,6 +85,10 @@ def clean_spine_fixture(spine_engine):
     ExecutionSpine._handlers.update(original_handlers)
     ExecutionSpine._pipelines.clear()
     ExecutionSpine._pipelines.update(original_pipelines)
+    ExecutionSpine._resources = {
+        name: asyncio.Semaphore(limit)
+        for name, limit in original_resource_limits.items()
+    }
 
 
 # ---------------------------------------------------------------------------

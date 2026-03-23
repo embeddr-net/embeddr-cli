@@ -44,6 +44,8 @@ from embeddr.api.security import (
     get_auth_context,
     check_auth_enabled,
     require_permission,
+    set_auth_cookie,
+    clear_auth_cookie,
 )
 from embeddr.core.plugin_loader import get_lotus_registry
 from embeddr_core.models.lotus import LotusKind
@@ -195,7 +197,7 @@ def set_auth_session(
                 session, raw_cookie)
             if auth_session:
                 auth_service.revoke_auth_session(session, auth_session)
-        response.delete_cookie(COOKIE_NAME, path="/")
+        clear_auth_cookie(response, request)
         return {"ok": True, "cleared": True}
 
     if not auth_context.authenticated or not auth_context.user_id:
@@ -212,24 +214,12 @@ def set_auth_session(
         ip_address=(request.client.host if request.client else None),
     )
 
-    secure = request.url.scheme == "https"
-    samesite = "none" if secure else "lax"
-
-    response.set_cookie(
-        COOKIE_NAME,
-        session_token,
-        httponly=True,
-        secure=secure,
-        samesite=samesite,
-        path="/",
-    )
+    set_auth_cookie(response, request, session_token)
     return {
         "ok": True,
         "cookie": COOKIE_NAME,
         "session_id": str(auth_session.id),
         "expires_at": auth_session.expires_at.isoformat() if auth_session.expires_at else None,
-        "samesite": samesite,
-        "secure": secure,
     }
 
 

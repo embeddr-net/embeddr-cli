@@ -1,0 +1,1 @@
+import{aj as s,j as n,E as o}from"./index-CJhz25GO.js";const r=[["path",{d:"M21 12a9 9 0 1 1-6.219-8.56",key:"13zald"}]],i=s("loader-circle",r);function c({className:a,...e}){return n.jsx(i,{role:"status","aria-label":"Loading",className:o("size-4 animate-spin",a),...e})}export{c as S};

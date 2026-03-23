@@ -415,6 +415,261 @@ def create_auth_session(
     return auth_session, raw_token
 
 
+def create_authorization_code(
+    session: Session,
+    *,
+    service_client_id: UUID,
+    user_id: UUID,
+    operator_id: UUID,
+    scopes: List[str],
+    redirect_uri: str,
+    code_challenge: Optional[str] = None,
+    code_challenge_method: str = "S256",
+    state: Optional[str] = None,
+) -> tuple:
+    """Create an OAuth2 authorization code for the consent flow."""
+    from embeddr_core.models.authorization_code import AuthorizationCode
+
+    raw_code = f"eac_{secrets.token_urlsafe(32)}"
+    code_hash = hash_api_key(raw_code)
+    now = datetime.now(timezone.utc)
+
+    auth_code = AuthorizationCode(
+        code_hash=code_hash,
+        code_prefix=raw_code[:8],
+        service_client_id=service_client_id,
+        user_id=user_id,
+        operator_id=operator_id,
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        state=state,
+        created_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    session.add(auth_code)
+    return auth_code, raw_code
+
+
+def hash_authorization_code(raw_code: str) -> str:
+    """Hash an authorization code using the same scheme as API keys."""
+    return hash_api_key(raw_code)
+
+
+def exchange_authorization_code(
+    session: Session,
+    *,
+    raw_code: str,
+    client_id: str,
+    client_secret: Optional[str] = None,
+    redirect_uri: Optional[str] = None,
+    code_verifier: Optional[str] = None,
+) -> tuple:
+    """Exchange an authorization code for a session token (OAuth2 token endpoint)."""
+    from embeddr_core.models.authorization_code import AuthorizationCode
+    from embeddr_core.models.service_client import ServiceClient
+
+    code_hash = hash_authorization_code(raw_code)
+    auth_code = session.exec(
+        select(AuthorizationCode).where(AuthorizationCode.code_hash == code_hash)
+    ).first()
+
+    if not auth_code:
+        raise ValueError("Invalid authorization code")
+    if auth_code.used_at is not None:
+        raise ValueError("Authorization code already used")
+    if _is_datetime_expired(auth_code.expires_at):
+        raise ValueError("Authorization code expired")
+
+    # Validate client
+    sc = session.exec(
+        select(ServiceClient).where(ServiceClient.id == auth_code.service_client_id)
+    ).first()
+    if not sc or not sc.is_active:
+        raise ValueError("Invalid or inactive service client")
+    if sc.client_id != client_id:
+        raise ValueError(f"Client ID mismatch: expected {sc.client_id}, got {client_id}")
+
+    # For confidential clients, verify secret. Public clients skip this (use PKCE instead).
+    if not sc.is_public:
+        if not client_secret:
+            raise ValueError("Client secret required for confidential clients")
+        secret_hash = hash_api_key(client_secret)
+        if secret_hash != sc.client_secret_hash:
+            raise ValueError("Invalid client secret")
+
+    # PKCE verification (required for public clients, optional for confidential)
+    if auth_code.code_challenge and code_verifier:
+        import base64
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        if challenge != auth_code.code_challenge:
+            return None, None
+
+    # Mark code as used
+    auth_code.used_at = datetime.now(timezone.utc)
+    session.add(auth_code)
+
+    # Create session for the authorized user
+    auth_session, raw_token = create_auth_session(
+        session,
+        user_id=auth_code.user_id,
+        operator_id=auth_code.operator_id,
+        session_name=f"oauth:{sc.name}",
+        auth_method="authorization_code",
+    )
+
+    return auth_session, raw_token
+
+
+def validate_client_credentials(
+    session: Session, client_id: str, client_secret: str,
+) -> Optional["ServiceClient"]:
+    """Validate OAuth2 client credentials. Returns the ServiceClient if valid."""
+    from embeddr_core.models.service_client import ServiceClient
+
+    sc = session.exec(
+        select(ServiceClient).where(ServiceClient.client_id == client_id)
+    ).first()
+    if not sc or not sc.is_active:
+        return None
+
+    secret_hash = hash_api_key(client_secret)
+    if secret_hash != sc.client_secret_hash:
+        return None
+
+    sc.last_used_at = datetime.now(timezone.utc)
+    session.add(sc)
+    return sc
+
+
+def create_service_session(
+    session: Session,
+    sc: "ServiceClient",
+    requested_scopes: Optional[List[str]] = None,
+) -> tuple:
+    """Create a session for a service client (client_credentials grant)."""
+    # Find the user who created this service client
+    user = session.get(UserAccount, sc.created_by_user_id)
+    if not user:
+        raise ValueError("Service client has no associated user")
+
+    auth_session, raw_token = create_auth_session(
+        session,
+        user_id=user.id,
+        operator_id=sc.operator_id,
+        session_name=f"service:{sc.name}",
+        auth_method="client_credentials",
+    )
+    # Store service_client_id if the field exists
+    if hasattr(auth_session, "service_client_id"):
+        auth_session.service_client_id = sc.id
+        session.add(auth_session)
+        session.commit()
+
+    return auth_session, raw_token
+
+
+def create_service_client(
+    session: Session,
+    *,
+    name: str,
+    description: Optional[str] = None,
+    operator_id: UUID,
+    created_by_user_id: UUID,
+    redirect_uris: Optional[List[str]] = None,
+    allowed_scopes: Optional[List[str]] = None,
+    grant_types: Optional[List[str]] = None,
+) -> tuple:
+    """Create a new OAuth2 service client. Returns (ServiceClient, raw_secret)."""
+    from embeddr_core.models.service_client import ServiceClient
+
+    client_id = f"embeddr:{name.lower().replace(' ', '-')}"
+    raw_secret = f"esc_{secrets.token_urlsafe(32)}"
+    secret_hash = hash_api_key(raw_secret)
+
+    sc = ServiceClient(
+        client_id=client_id,
+        client_secret_hash=secret_hash,
+        client_secret_prefix=raw_secret[:8],
+        name=name,
+        description=description,
+        operator_id=operator_id,
+        created_by_user_id=created_by_user_id,
+        redirect_uris=redirect_uris or [],
+        allowed_scopes=allowed_scopes or [],
+        grant_types=grant_types or ["client_credentials"],
+        is_active=True,
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(sc)
+    session.commit()
+    session.refresh(sc)
+    return sc, raw_secret
+
+
+def ensure_first_party_clients(
+    session: Session,
+    *,
+    operator_id: UUID,
+    created_by_user_id: UUID,
+) -> Dict[str, str]:
+    """Ensure built-in first-party service clients exist. Returns status per client."""
+    from embeddr_core.models.service_client import ServiceClient
+
+    first_party = {
+        "embeddr:comfyui": {
+            "name": "ComfyUI",
+            "description": "Embeddr ComfyUI integration",
+            "redirect_uris": ["http://localhost:8188/embeddr/callback", "http://127.0.0.1:8188/embeddr/callback"],
+            "allowed_scopes": ["artifacts:read", "artifacts:write", "collections:read", "executions:read"],
+            "grant_types": ["authorization_code", "client_credentials"],
+        },
+        "embeddr:nelumbo": {
+            "name": "Nelumbo",
+            "description": "Embeddr admin panel",
+            "redirect_uris": [],
+            "allowed_scopes": ["*"],
+            "grant_types": ["authorization_code", "client_credentials"],
+        },
+    }
+
+    results: Dict[str, str] = {}
+    for client_id, cfg in first_party.items():
+        existing = session.exec(
+            select(ServiceClient).where(ServiceClient.client_id == client_id)
+        ).first()
+        if existing:
+            results[client_id] = "(already registered)"
+            continue
+
+        raw_secret = f"esc_{secrets.token_urlsafe(32)}"
+        secret_hash = hash_api_key(raw_secret)
+
+        sc = ServiceClient(
+            client_id=client_id,
+            client_secret_hash=secret_hash,
+            client_secret_prefix=raw_secret[:8],
+            name=cfg["name"],
+            description=cfg["description"],
+            operator_id=operator_id,
+            created_by_user_id=created_by_user_id,
+            redirect_uris=cfg["redirect_uris"],
+            allowed_scopes=cfg["allowed_scopes"],
+            grant_types=cfg["grant_types"],
+            is_public=True,  # First-party clients use PKCE, no secret needed
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(sc)
+        results[client_id] = raw_secret
+        logger.info("Registered first-party client: %s", client_id)
+
+    session.commit()
+    return results
+
+
 def lookup_auth_session(session: Session, raw_token: str) -> Optional[AuthSession]:
     token_hash = hash_session_token(raw_token)
     auth_session = session.exec(

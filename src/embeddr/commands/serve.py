@@ -26,6 +26,7 @@ from embeddr.api import websocket as websocket_routes
 from embeddr.api.security import get_api_key, check_auth_enabled
 from embeddr.api.transport_security import AuthenticatedTransportApp
 from embeddr.services import auth_service
+from embeddr_core.models.operator import Operator
 from embeddr_core.models.user_account import UserAccount
 from embeddr.core.logging_utils import setup_logging
 from embeddr.core.config import get_data_dir
@@ -119,10 +120,34 @@ def _bootstrap_default_admin() -> None:
             result_data = {
                 "root_username": result.root_user.username,
                 "root_key": result.root_key,
+                "root_password": result.root_password,
                 "user_operator": result.user_operator_name,
                 "user_username": result.user_username,
                 "user_key": result.user_key,
+                "user_password": result.user_password,
             }
+
+    # Ensure first-party service clients exist (if auth_service supports it)
+    if hasattr(auth_service, "ensure_first_party_clients"):
+        with Session(get_engine()) as session:
+            root_operator = session.exec(
+                select(Operator).where(Operator.is_root == True)
+            ).first()
+            root_user = session.exec(
+                select(UserAccount).where(UserAccount.is_admin == True)
+            ).first()
+            if root_operator and root_user:
+                fp_results = auth_service.ensure_first_party_clients(
+                    session, operator_id=root_operator.id,
+                    created_by_user_id=root_user.id,
+                )
+                session.commit()
+                new_clients = {k: v for k, v in fp_results.items() if v != "(already registered)"}
+                if new_clients:
+                    typer.secho(
+                        f"Registered {len(new_clients)} first-party service client(s).",
+                        fg=typer.colors.GREEN,
+                    )
 
     if not result_data:
         typer.secho(
@@ -143,8 +168,13 @@ def _bootstrap_default_admin() -> None:
         f"   Root Key: {result_data['root_key']}",
         fg=typer.colors.BRIGHT_YELLOW,
     )
+    if result_data.get("root_password"):
+        typer.secho(
+            f"   Root Password: {result_data['root_password']}",
+            fg=typer.colors.BRIGHT_YELLOW,
+        )
     typer.secho(
-        "   Store this key securely. It will not be shown again.",
+        "   Store these credentials securely. They will not be shown again.",
         fg=typer.colors.BRIGHT_BLACK,
     )
 
@@ -165,8 +195,13 @@ def _bootstrap_default_admin() -> None:
             f"   Client Key: {result_data['user_key']}",
             fg=typer.colors.BRIGHT_YELLOW,
         )
+        if result_data.get("user_password"):
+            typer.secho(
+                f"   Password: {result_data['user_password']}",
+                fg=typer.colors.BRIGHT_YELLOW,
+            )
         typer.secho(
-            "   Store this key securely. It will not be shown again.",
+            "   Store these credentials securely. They will not be shown again.",
             fg=typer.colors.BRIGHT_BLACK,
         )
 
@@ -236,6 +271,18 @@ async def lifespan(app: FastAPI):
     create_db_and_tables()
     _bootstrap_default_admin()
     _maybe_print_dev_admin_key()
+
+    # Clean up expired auth sessions on startup
+    try:
+        from embeddr.services import auth_service as _auth_svc
+        from embeddr.db.session import get_engine as _get_engine
+        from sqlmodel import Session as _Session
+        with _Session(_get_engine()) as _s:
+            cleaned = _auth_svc.cleanup_expired_sessions(_s)
+            if cleaned > 0:
+                logger.info("Cleaned up %d expired sessions on startup", cleaned)
+    except Exception as e:
+        logger.debug("Session cleanup skipped: %s", e)
 
     # Plugin loading is handled in create_app to ensure API registration works
     # Here we just trigger startup hooks
@@ -396,8 +443,16 @@ async def lifespan(app: FastAPI):
             auth_mode = auth_service.get_auth_mode()
             is_sensitive_scope = raw_event_type.startswith(
                 "execution.") or raw_event_type.startswith("artifact.")
-            if auth_mode != "open" and is_sensitive_scope and not audience:
-                logger.warning(
+
+            # Allow system/plugin events through even without audience scoping.
+            # ComfyUI monitor events, execution spine events, and plugin events
+            # don't carry per-user audience info but need to reach connected clients.
+            is_system_source = event.source in (
+                "comfyui", "spine", "embeddr-comfyui", "system",
+                "embeddr", "plugin", "ingestion",
+            )
+            if auth_mode != "open" and is_sensitive_scope and not audience and not is_system_source:
+                logger.debug(
                     "Dropping unscoped WS event in secured mode type=%s source=%s",
                     raw_event_type,
                     event.source,

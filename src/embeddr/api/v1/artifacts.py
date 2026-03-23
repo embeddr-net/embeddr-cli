@@ -524,9 +524,15 @@ def _public_visibility_expr():
 
 def _owner_match_expr(auth):
     user_id = getattr(auth, "user_id", None) if auth else None
+    operator_id = getattr(auth, "operator_id", None) if auth else None
+    conditions = []
     if user_id:
-        return Artifact.owner_user_id == user_id
-    return literal(False)
+        conditions.append(Artifact.owner_user_id == user_id)
+    if operator_id:
+        conditions.append(Artifact.owner_operator_id == operator_id)
+    if not conditions:
+        return literal(False)
+    return or_(*conditions) if len(conditions) > 1 else conditions[0]
 
 
 def _is_owner_of_artifact(artifact: Artifact, auth) -> bool:
@@ -535,10 +541,17 @@ def _is_owner_of_artifact(artifact: Artifact, auth) -> bool:
     if getattr(auth, "is_open", False) or getattr(auth, "is_admin", False) or getattr(auth, "is_root", False):
         return True
 
+    operator_id = getattr(auth, "operator_id", None)
     user_id = getattr(auth, "user_id", None)
+
+    # Cross-operator access is always denied (defense in depth)
+    if operator_id and artifact.owner_operator_id and artifact.owner_operator_id != operator_id:
+        return False
+
+    # Within same operator: check user ownership
     if not user_id:
         return False
-    if artifact.owner_user_id != user_id:
+    if artifact.owner_user_id and artifact.owner_user_id != user_id:
         return False
     return True
 
@@ -655,6 +668,7 @@ def _apply_owner_filter(query, auth, access_scope: str = "instance"):
         return query
 
     if auth and not auth.is_open and not auth.is_admin and not getattr(auth, "is_root", False):
+        # Operator-scoped: see own operator's artifacts + public artifacts
         query = query.where(
             or_(_owner_match_expr(auth), _public_visibility_expr()))
     return query

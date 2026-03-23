@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 from uuid import UUID
 
@@ -17,6 +18,7 @@ from embeddr.api.v1.lotus_middleware import (
     build_post_middleware_payload,
     evaluate_pre_dispatch_middlewares,
 )
+from embeddr.services import auth_service
 
 logger = logging.getLogger("embeddr.api.lotus")
 
@@ -37,18 +39,36 @@ def _materialize_wait_payload(value: Any, *, execution_id: str) -> Any:
 def _build_dispatch_auth_payload(
     auth: Any | None,
     caller_client_id: str | None = None,
+    session: Session | None = None,
 ) -> Dict[str, Any] | None:
     if auth is None:
         if caller_client_id:
             return {"client_id": caller_client_id}
         return None
 
+    # Generate a short-lived callback token for plugins to use when calling
+    # back to the Embeddr API — never expose the caller's raw credential.
+    callback_token = None
+    user_id = getattr(auth, "user_id", None)
+    operator_id = getattr(auth, "operator_id", None)
+    if session and user_id:
+        try:
+            _cb_session, callback_token = auth_service.create_auth_session(
+                session,
+                user_id=user_id,
+                operator_id=operator_id,
+                session_name="plugin-callback",
+                auth_method="plugin_callback",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        except Exception:
+            logger.warning("Failed to create plugin callback token", exc_info=True)
+
     payload = {
         "mode": getattr(auth, "mode", None),
-        "user_id": str(getattr(auth, "user_id", None)) if getattr(auth, "user_id", None) else None,
-        "operator_id": str(getattr(auth, "operator_id", None)) if getattr(auth, "operator_id", None) else None,
-        "api_key_id": str(getattr(auth, "api_key_id", None)) if getattr(auth, "api_key_id", None) else None,
-        "api_key": getattr(auth, "raw_key", None),
+        "user_id": str(user_id) if user_id else None,
+        "operator_id": str(operator_id) if operator_id else None,
+        "callback_token": callback_token,
         "is_admin": bool(getattr(auth, "is_admin", False)),
         "is_root": bool(getattr(auth, "is_root", False)),
         "is_open": bool(getattr(auth, "is_open", False)),
@@ -66,7 +86,7 @@ def _should_trace() -> bool:
 def _redact(value: Dict[str, Any]) -> Dict[str, Any]:
     redacted = {}
     for k, v in (value or {}).items():
-        if str(k).lower() in {"api_key", "apikey", "apiKey", "token", "authorization"}:
+        if str(k).lower() in {"api_key", "apikey", "apiKey", "token", "authorization", "callback_token"}:
             redacted[k] = "***"
         else:
             redacted[k] = v
@@ -174,7 +194,7 @@ def lotus_dispatch_action(
     if not isinstance(merged_inputs, dict):
         merged_inputs = inputs or {}
 
-    auth_payload = _build_dispatch_auth_payload(auth, caller_client_id)
+    auth_payload = _build_dispatch_auth_payload(auth, caller_client_id, session=session)
     if auth_payload:
         merged_inputs["__embeddr_auth"] = auth_payload
 

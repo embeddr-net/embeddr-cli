@@ -1,7 +1,8 @@
 from typing import Optional
 import os
 import logging
-from fastapi import Security, HTTPException, Request, Depends
+from datetime import timedelta
+from fastapi import Security, HTTPException, Request, Depends, Response
 from fastapi.security import APIKeyHeader, APIKeyQuery
 from starlette.status import HTTP_403_FORBIDDEN
 from sqlmodel import Session
@@ -121,6 +122,26 @@ async def get_auth_context(
                 ctx, "is_root", False), ctx.session_id,
             request.url.path if request else "unknown",
         )
+
+        # Enforce must_change_password — block most routes until password is changed
+        if getattr(ctx, "must_change_password", False) and request:
+            path = request.url.path.rstrip("/")
+            allowed_paths = {
+                "/api/v1/security/me/password",
+                "/api/security/me/password",
+                "/api/v1/security/profile",
+                "/api/security/profile",
+                "/api/v1/security/logout",
+                "/api/security/logout",
+                "/api/v1/security/auth/token",
+                "/api/security/auth/token",
+            }
+            if path not in allowed_paths:
+                raise HTTPException(
+                    status_code=HTTP_403_FORBIDDEN,
+                    detail="password_change_required",
+                )
+
         return ctx
 
 
@@ -169,3 +190,42 @@ def require_admin(auth=Depends(get_auth_context)):
             detail="Admin access required",
         )
     return auth
+
+
+# ── Cookie helpers ──────────────────────────────────────────────────
+
+SESSION_TTL_DAYS_DEFAULT = 30
+
+
+def _session_ttl_days() -> int:
+    try:
+        return int(os.environ.get("EMBEDDR_AUTH_SESSION_TTL_DAYS", str(SESSION_TTL_DAYS_DEFAULT)))
+    except (ValueError, TypeError):
+        return SESSION_TTL_DAYS_DEFAULT
+
+
+def set_auth_cookie(response: Response, request: Request, token: str) -> None:
+    secure = request.url.scheme == "https"
+    samesite = "none" if secure else "lax"
+    max_age = int(timedelta(days=_session_ttl_days()).total_seconds())
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        path="/",
+        max_age=max_age,
+    )
+
+
+def clear_auth_cookie(response: Response, request: Request) -> None:
+    secure = request.url.scheme == "https"
+    samesite = "none" if secure else "lax"
+    response.delete_cookie(
+        COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+    )

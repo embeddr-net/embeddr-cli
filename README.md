@@ -110,6 +110,13 @@ Extend Embeddr with custom functionality. Plugins can add new UI panels, backend
 
 Check out the [Plugin Examples](https://github.com/embeddr-net/plugin-examples) for templates and guides.
 
+## Automation
+
+Embeddr uses AutomationManager V2 by default. The legacy V1 manager is still present for migration/debug only.
+
+- Default (recommended): V2 only
+- Legacy V1 opt-in: set `EMBEDDR_ENABLE_AUTOMATION_V1=true`
+
 ## Screenshots
 
 ### Editor (Zen Mode)

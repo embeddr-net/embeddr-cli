@@ -568,6 +568,112 @@ class TestHandlerRegistration:
             updated = s2.get(ArtifactExecution, job.id)
             assert updated.status == "waiting"
 
+    async def test_process_tick_drains_available_resource_slots(
+        self,
+        clean_spine,
+        session,
+        spine_engine,
+    ):
+        """One tick should launch as many jobs as there are free slots."""
+
+        async def slow_echo(ctx):
+            await asyncio.sleep(0.05)
+            return {"ok": ctx.inputs.get("n")}
+
+        clean_spine.register_handler("test.bulk_cpu", slow_echo)
+
+        jobs = [
+            clean_spine.submit_job(
+                job_type="test.bulk_cpu",
+                inputs={"n": idx},
+                resource_class="cpu",
+                session=session,
+            )
+            for idx in range(3)
+        ]
+
+        spine = clean_spine()
+        await spine._process_tick()
+        await asyncio.sleep(0.2)
+
+        with Session(spine_engine) as s2:
+            refreshed = [s2.get(ArtifactExecution, job.id) for job in jobs]
+            assert all(job and job.status == "completed" for job in refreshed)
+
+    async def test_worker_loop_wakes_when_resource_slot_is_released(
+        self,
+        clean_spine,
+        session,
+        spine_engine,
+    ):
+        """A finished GPU job should wake the scheduler and start the next one immediately."""
+
+        async def short_gpu_job(ctx):
+            await asyncio.sleep(0.05)
+            return {"ok": True}
+
+        clean_spine.register_handler("test.gpu_queue", short_gpu_job)
+
+        jobs = [
+            clean_spine.submit_job(
+                job_type="test.gpu_queue",
+                inputs={"n": idx},
+                resource_class="gpu",
+                session=session,
+            )
+            for idx in range(2)
+        ]
+
+        spine = clean_spine()
+        worker_task = asyncio.create_task(spine.start_worker())
+        try:
+            await asyncio.sleep(0.35)
+
+            with Session(spine_engine) as s2:
+                refreshed = [s2.get(ArtifactExecution, job.id) for job in jobs]
+                assert all(job and job.status == "completed" for job in refreshed)
+        finally:
+            spine._running = False
+            spine._job_submitted.set()
+            await asyncio.wait_for(worker_task, timeout=1.0)
+
+    async def test_process_tick_dispatches_distinct_dynamic_resource_lanes(
+        self,
+        clean_spine,
+        session,
+        spine_engine,
+    ):
+        """Endpoint-scoped GPU lanes should run concurrently instead of sharing one global slot."""
+
+        async def short_job(ctx):
+            await asyncio.sleep(0.05)
+            return {"ok": ctx.inputs.get("endpoint")}
+
+        clean_spine.register_handler("test.comfy_endpoint_lane", short_job)
+
+        jobs = [
+            clean_spine.submit_job(
+                job_type="test.comfy_endpoint_lane",
+                inputs={"endpoint": "a"},
+                resource_class="gpu:comfy:endpoint-a",
+                session=session,
+            ),
+            clean_spine.submit_job(
+                job_type="test.comfy_endpoint_lane",
+                inputs={"endpoint": "b"},
+                resource_class="gpu:comfy:endpoint-b",
+                session=session,
+            ),
+        ]
+
+        spine = clean_spine()
+        await spine._process_tick()
+        await asyncio.sleep(0.2)
+
+        with Session(spine_engine) as s2:
+            refreshed = [s2.get(ArtifactExecution, job.id) for job in jobs]
+            assert all(job and job.status == "completed" for job in refreshed)
+
 
 # ---------------------------------------------------------------------------
 # Input redaction
