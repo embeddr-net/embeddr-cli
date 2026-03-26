@@ -27,6 +27,17 @@ logger = logging.getLogger("embeddr.spine")
 # ---------------------------------------------------------------------------
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled", "waiting"})
+_ACTIVE_STATUSES = ("pending", "running", "waiting")
+
+
+def _get_active_count(session: Session) -> int:
+    """Fast count of active executions for inclusion in lifecycle events."""
+    from sqlalchemy import func
+    return session.exec(
+        select(func.count()).select_from(ArtifactExecution).where(
+            ArtifactExecution.status.in_(_ACTIVE_STATUSES)
+        )
+    ).one()
 
 
 class _JobCompletionNotifier:
@@ -312,7 +323,7 @@ class ExecutionSpine:
         limit = cls._resource_limits.get(base, 1)
         try:
             return max(1, int(limit))
-        except Exception:
+        except (TypeError, ValueError):
             return 1
 
     @classmethod
@@ -501,7 +512,7 @@ class ExecutionSpine:
                    trigger: str = "user",
                    primary_artifact_id: Optional[UUID] = None,
                    operator_id: Optional[UUID] = None,
-                   api_key_id: Optional[str] = None,
+                   api_key_id: Optional[UUID] = None,
                    tags: Optional[Dict[str, str]] = None,
                    session: Optional[Session] = None) -> ArtifactExecution:
         """
@@ -625,7 +636,7 @@ class ExecutionSpine:
         trigger: str,
         primary_artifact_id: Optional[UUID],
         operator_id: Optional[UUID],
-        api_key_id: Optional[str],
+        api_key_id: Optional[UUID],
         tags: Optional[Dict[str, str]],
     ) -> ArtifactExecution:
 
@@ -683,6 +694,11 @@ class ExecutionSpine:
         session.add(event)
         session.commit()
 
+        try:
+            _active = _get_active_count(session)
+        except Exception:
+            _active = None
+
         _EVENT_BUS.publish(EmbeddrEvent(
             event_type="execution.created",
             source="spine",
@@ -692,7 +708,8 @@ class ExecutionSpine:
                 "status": "pending",
                 "plugin_name": job.plugin_name,
                 "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
-                "created_at": job.created_at.isoformat()
+                "created_at": job.created_at.isoformat(),
+                "active_count": _active,
             }
         ))
 
@@ -846,6 +863,7 @@ class ExecutionSpine:
                 from embeddr.services.worker_registry import worker_registry
                 worker = worker_registry.find_worker_for_capability(job_type)
             except Exception:
+                logger.debug("Worker registry lookup failed for %s", job_type, exc_info=True)
                 worker = None
 
             if worker:
@@ -862,6 +880,7 @@ class ExecutionSpine:
                     session.commit()
                     job_id = job.id
                 except Exception:
+                    logger.debug("Race condition on worker dispatch commit for job %s", job.id, exc_info=True)
                     session.rollback()
                     return False
 
@@ -903,6 +922,7 @@ class ExecutionSpine:
                 job_id = job.id
             except Exception:
                 # Race condition, someone else grabbed it
+                logger.debug("Race condition on job claim commit for job %s", job.id, exc_info=True)
                 session.rollback()
                 return False
 
@@ -1077,7 +1097,10 @@ class ExecutionSpine:
                         session.add(job)
                         session.commit()
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to mark execution %s as failed after dispatch error",
+                    job_id, exc_info=True,
+                )
         finally:
             self._job_submitted.set()
 
@@ -1312,8 +1335,8 @@ class ExecutionSpine:
                 try:
                     with open(resolved, "rb") as f:
                         return f.read()
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug("Failed to read file %s: %s", resolved, e)
             return None
 
         # ArtifactBlob stores a file *path*, not inline data
@@ -1596,6 +1619,10 @@ class ExecutionSpine:
                     error=None,
                 )
 
+                try:
+                    _active = _get_active_count(session)
+                except Exception:
+                    _active = None
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.completed",
                     source="spine",
@@ -1603,6 +1630,7 @@ class ExecutionSpine:
                         "id": str(job_id),
                         "status": "completed",
                         "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                        "active_count": _active,
                     }
                 ))
                 session.add(ArtifactExecutionEvent(
@@ -1654,6 +1682,10 @@ class ExecutionSpine:
                     error=str(e),
                 )
 
+                try:
+                    _active = _get_active_count(session)
+                except Exception:
+                    _active = None
                 _EVENT_BUS.publish(EmbeddrEvent(
                     event_type="execution.failed",
                     source="spine",
@@ -1662,6 +1694,7 @@ class ExecutionSpine:
                         "status": "failed",
                         "error": str(e),
                         "parent_execution_id": str(job.parent_execution_id) if job.parent_execution_id else None,
+                        "active_count": _active,
                     }
                 ))
                 session.add(ArtifactExecutionEvent(

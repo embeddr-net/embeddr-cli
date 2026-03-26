@@ -147,6 +147,34 @@ def get_plugin_static(
     return FileResponse(str(candidate))
 
 
+@router.get("/{plugin_id}/assets/{path:path}")
+def get_plugin_asset(
+    plugin_id: str,
+    path: str,
+):
+    """Serve plugin assets (logos, icons, images).
+
+    Mounted at /api/plugins/{id}/assets/ and /api/v1/plugins/{id}/assets/.
+    Also available at /plugins/{id}/assets/ via StaticFiles mount.
+    """
+    source_path = _find_plugin_source_path(plugin_id)
+    if not source_path or not source_path.exists():
+        raise HTTPException(status_code=404, detail="Plugin not found")
+
+    # Check assets dir in source root, then dist/assets
+    for assets_dir in [source_path / "assets", source_path / "dist" / "assets"]:
+        candidate = (assets_dir / path).resolve()
+        if (
+            assets_dir.exists()
+            and assets_dir in candidate.parents
+            and candidate.exists()
+            and candidate.is_file()
+        ):
+            return FileResponse(str(candidate))
+
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
 @router.get("/{plugin_id}/config")
 def get_plugin_config(
     plugin_id: str,

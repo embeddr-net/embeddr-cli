@@ -3,39 +3,60 @@
 <img height="120" src="https://embeddr.net/embeddr_logo_transparent.png">
 
 <h1>Embeddr CLI</h1>
-Your AI Image Lab for Search, Workflows, and Creative Control.
+
+Your personal creative workspace — search, organize, and orchestrate artifacts, media, and AI workflows.
+
+[![pypi version][pypi-image]][pypi-url]
+[![embeddr-core version][embeddr-core-image]][embeddr-core-url]
+[![license][license-image]][license-url]
+
 </div>
 
-![web preview](.github/assets/webui_3.png)
+---
+
+![Embeddr Zen Shell](.github/assets/zen_panels.png)
+
+## What is Embeddr?
+
+Embeddr is a local-first, plugin-extensible workspace for managing your creative data. Think of it as a personal operating layer for artifacts — images, documents, code, workflows — with semantic search, a relation graph, AI tool integration, and a plugin system that lets you extend everything.
+
+- **Artifact-centric** — everything is an artifact with typed metadata, relations, and lineage
+- **Plugin-extensible** — add UI panels, backend routes, new capabilities, and AI tools
+- **AI-native** — MCP server, LLM tool calling, Lotus agent integration
+- **Local-first** — runs on your machine, your data stays yours
 
 ## Installation
 
-### Using [uv](https://docs.astral.sh/uv/getting-started/installation/)
+### Using [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended)
 
 ```sh
-# Create a Virtual Environment
 mkdir embeddr && cd embeddr
 uv venv && source .venv/bin/activate
 
-# Install Torch - https://pytorch.org/get-started/locally/
-
-## EXAMPLES
-# - CPU ONLY
+# Install Torch — https://pytorch.org/get-started/locally/
+# CPU only:
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-# OR
-# - CUDA 13.0
+# Or CUDA 13.0:
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 # Install Embeddr
 uv pip install embeddr-cli
 ```
 
-## Usage
-
-Once installed to start Embeddr
+### Using pip
 
 ```sh
-> embeddr serve
+pip install embeddr-cli
+```
+
+## Quick Start
+
+```sh
+# Initialize a workspace
+embeddr init
+
+# Start the server
+embeddr serve
 
 ✨ Embeddr Local API has started!
    ---------------------------------------------
@@ -44,144 +65,218 @@ Once installed to start Embeddr
    Press Ctrl+C to stop server
 ```
 
+## CLI Reference
+
 ### `embeddr serve`
 
-```sh
---help          Shows help.
---mcp           Enables Model Context Protocol.
---docs          Enable API docs.
---host          The host to bind to. [default: 127.0.0.1]
---port          The port to bind to. [default: 8003]
---plugins-dir   Directory to serve plugins from.
+Start the Embeddr API server with the web UI.
+
 ```
+embeddr serve [OPTIONS]
+
+Options:
+  --host TEXT         Host to bind to [default: 127.0.0.1]
+  --port INTEGER      Port to bind to [default: 8003]
+  --plugins-dir TEXT   Directory to load plugins from
+  --mcp               Enable Model Context Protocol endpoint
+  --docs              Enable API documentation at /docs
+  --reload            Enable live reload for development
+  --no-plugins        Start without loading plugins
+  --verbose           Verbose logging
+
+Worker mode (distributed processing):
+  --worker            Run as a headless worker node
+  --main-url TEXT     URL of the main Embeddr instance
+  --worker-key TEXT   Authentication key for worker registration
+  --worker-name TEXT  Worker display name
+  --worker-tags TEXT  Comma-separated worker tags
+```
+
+### `embeddr init`
+
+Interactive setup wizard for a new workspace. Creates `embeddr.toml` project config, initializes the database, and walks you through auth and plugin configuration.
 
 ### `embeddr config`
 
-```sh
---init   Shows help.
---show   Shows the current configuration.
+```
+embeddr config init    # Create embeddr.toml in current directory
+embeddr config show    # Display current configuration and paths
+```
+
+### `embeddr lotus`
+
+Interact with the Lotus capability system from the command line.
+
+```
+embeddr lotus list [--kind action] [--plugin embeddr-llm] [--query "search"]
+embeddr lotus query "image generation"
+embeddr lotus inspect <capability_id>
+embeddr lotus invoke <capability_id> [--input key=value]
+```
+
+### Other Commands
+
+| Command | Description |
+|---------|-------------|
+| `embeddr db` | Database management (migrations, schema) |
+| `embeddr plugins` | Plugin lifecycle management |
+| `embeddr process` | Artifact processing (scan, embed, analyze) |
+| `embeddr inspect` | Query artifacts, metadata, and relations |
+| `embeddr tui` | Interactive terminal UI explorer |
+| `embeddr system` | System resources and ML model management |
+| `embeddr manage` | Account and API key operations |
+| `embeddr debug` | Inspect executions, sessions, auth state |
+
+### Global Options
+
+```
+--data-dir, -d TEXT   Override data directory (also: EMBEDDR_DATA_DIR env var)
 ```
 
 ## Integrations
 
-### [ComfyUI Extension](https://github.com/embeddr-net/embeddr-comfyui)
+### Model Context Protocol (MCP)
 
-`comfy node install embeddr-extension`
+Embeddr exposes an MCP endpoint so any MCP-compatible client can use your workspace as a tool server.
 
-![comfyui_example](https://github.com/embeddr-net/embeddr-comfyui/blob/main/.github/assets/example_1.webp?raw=true)
+```sh
+embeddr serve --mcp
+```
 
-[View Registry](https://registry.comfy.org/publishers/nynxz/nodes/embeddr-extension)
+#### mcp.json
 
-### mcp.json
 ```json
 {
   "mcpServers": {
     "embeddr": {
       "url": "http://localhost:8003/mcp/messages",
-      // Set a timeout for long image generations
-      "timeout": 120000 
-    },
-    ...
+      "timeout": 120000
+    }
   }
 }
 ```
-### [Mistral Vibe MCP](https://github.com/mistralai/mistral-vibe)
 
-- Run embeddr with `embeddr serve --mcp`
-- Add this to your `.vibe/config.toml`
-- `vibe`
+Works with Claude Desktop, [Mistral Vibe](https://github.com/mistralai/mistral-vibe), Cursor, and anything that supports the [Model Context Protocol](https://modelcontextprotocol.io).
 
-```toml
-[[mcp_servers]]
-name = "embeddr"
-transport = "http"
-url = "http://localhost:8003/mcp/messages"
+### [ComfyUI Extension](https://github.com/embeddr-net/embeddr-comfyui)
+
+Send ComfyUI workflow outputs directly to Embeddr with full lineage tracking.
+
+```
+comfy node install embeddr-extension
 ```
 
-> Anything that uses [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) will also work.
+![comfyui_example](https://github.com/embeddr-net/embeddr-comfyui/blob/main/.github/assets/example_1.webp?raw=true)
+
+[View on ComfyUI Registry](https://registry.comfy.org/publishers/nynxz/nodes/embeddr-extension)
+
+### [Lotus CLI](https://github.com/embeddr-net/lotus-cli)
+
+AI agent REPL that connects to your Embeddr workspace. Bring your own LLM provider.
+
+```sh
+pip install lotus-cli
+lotus connect
+lotus
+```
 
 ## Plugins
 
-Extend Embeddr with custom functionality. Plugins can add new UI panels, backend routes, and database models.
+Extend Embeddr with custom functionality. Plugins can add UI panels, backend routes, database models, and Lotus capabilities.
 
-1. **Download** or create a plugin.
-2. **Place** it in your plugins directory (default: `~/.local/share/embeddr/plugins`).
-3. **Restart** Embeddr.
+1. **Download** or create a plugin
+2. **Place** it in your plugins directory (default: `~/.local/share/embeddr/plugins`)
+3. **Restart** Embeddr
 
-Check out the [Plugin Examples](https://github.com/embeddr-net/plugin-examples) for templates and guides.
+Check out the [Plugin Development Guide](docs/PLUGIN_DEVELOPMENT.md) and [Plugin Examples](https://github.com/embeddr-net/plugin-examples).
 
-## Automation
+## Auth
 
-Embeddr uses AutomationManager V2 by default. The legacy V1 manager is still present for migration/debug only.
+Four authentication modes to match your deployment:
 
-- Default (recommended): V2 only
-- Legacy V1 opt-in: set `EMBEDDR_ENABLE_AUTOMATION_V1=true`
+| Mode | Description |
+|------|-------------|
+| `open` | No auth required (default for local dev) |
+| `single` | Single API key for all access |
+| `multi` | Multiple users with scoped API keys |
+| `db` | Full database-backed user accounts |
+
+Configure via `embeddr.toml` or `EMBEDDR_AUTH_MODE` env var.
 
 ## Screenshots
 
-### Editor (Zen Mode)
-With [Layer Editor Plugin](https://github.com/embeddr-net/plugin-examples)
+### Zen Shell — Full Workspace
 
-![web preview](.github/assets/webui_3.png)
+Panel-based workspace with image browser, media frame, ComfyUI runner, and generation settings.
 
-### Home Page
+![zen panels](.github/assets/zen_panels.png)
 
-![webui index](.github/assets/webui_1.webp)
+### Zen Mode — Floating Panels
 
-### Lineage Page
+Minimal floating panel layout with cosmic theme.
 
-![webui settings](.github/assets/lineage_large.png)
+![zen mode](.github/assets/zen_mode.png)
 
-### Settings Page
+### Editor — Generation Workflow
 
-![webui settings](.github/assets/webui_2.webp)
+Ink/manga style generation with layer editor plugin and lineage tracking.
 
+![zen editor](.github/assets/zen_editor.png)
 
+### Theming
+
+Fully themeable — dark, light, and custom color schemes.
+
+<p>
+<img src=".github/assets/theme_purple.png" width="49%" alt="Purple theme">
+<img src=".github/assets/theme_dark.png" width="49%" alt="Dark mecha theme">
+</p>
+
+### Lineage
+
+Artifact relation graph showing generation provenance.
+
+![lineage](.github/assets/lineage_large.png)
 
 ## Development
-
-Instructions to run a development version.
 
 ```sh
 git clone https://github.com/embeddr-net/embeddr-cli
 cd embeddr-cli
-uv venv
-uv pip install -e .
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 
-# Install Torch
+# Install Torch for your platform
 
-# Start Embeddr API with live reload
-uv run embeddr serve --reload 
+# Start with live reload
+embeddr serve --reload --docs
 ```
 
-> While releases do include the [frontend](https://github.com/embeddr-net/embeddr-frontend), this repo does not.
->
-> You can run a [development frontend](https://github.com/embeddr-net/embeddr-frontend?tab=readme-ov-file#Development) or download the [latest version](https://github.com/embeddr-net/embeddr-frontend/releases) and extract it into `embeddr-cli/src/web/`
+> Releases include the bundled [frontend](https://github.com/embeddr-net/embeddr-frontend). For development, run the [frontend dev server](https://github.com/embeddr-net/embeddr-frontend?tab=readme-ov-file#Development) or download the [latest release](https://github.com/embeddr-net/embeddr-frontend/releases) and extract it into `embeddr-cli/src/web/`.
 
 ## Packages
 
 [![pypi version][pypi-image]][pypi-url]
-[![embeddr-core version][embeddr-core-image]][embedd-core-url]
-[![embeddr-frontend][embeddr-frontend-image]][embedd-frontend-url]
-[![embeddr-react-ui version][embeddr-react-ui-image]][embedd-react-ui-url]
+[![embeddr-core version][embeddr-core-image]][embeddr-core-url]
+[![embeddr-frontend][embeddr-frontend-image]][embeddr-frontend-url]
+[![embeddr-react-ui version][embeddr-react-ui-image]][embeddr-react-ui-url]
 
 [![license][license-image]][license-url]
-
 
 [pypi-image]: https://img.shields.io/pypi/v/embeddr-cli?style=flat-square&&logo=Python&logoColor=%23ffd343&label=cli&labelColor=%232f2f2f&color=%234f4f4f
 [pypi-url]: https://pypi.org/project/embeddr-cli
 
 [embeddr-core-image]: https://img.shields.io/pypi/v/embeddr-core?style=flat-square&logo=Python&logoColor=%23ffd343&label=core&labelColor=%232f2f2f&color=%234f4f4f
-[embedd-core-url]: https://pypi.org/project/embeddr-core
+[embeddr-core-url]: https://pypi.org/project/embeddr-core
 
 [embeddr-react-ui-image]: https://img.shields.io/npm/v/%40embeddr%2Freact-ui?style=flat-square&logo=React&logoColor=%61DBFB&label=react-ui&labelColor=%232f2f2f&color=%234f4f4f
-[embedd-react-ui-url]: https://www.npmjs.com/package/@embeddr/react-ui
+[embeddr-react-ui-url]: https://www.npmjs.com/package/@embeddr/react-ui
 
 [embeddr-frontend-image]: https://img.shields.io/npm/v/%40embeddr%2Freact-ui?style=flat-square&logo=React&logoColor=%61DBFB&label=frontend&labelColor=%232f2f2f&color=%234f4f4f
-[embedd-frontend-url]: https://github.com/embeddr-net/embeddr-frontend
+[embeddr-frontend-url]: https://github.com/embeddr-net/embeddr-frontend
 
 [license-image]: https://img.shields.io/github/license/embeddr-net/embeddr-cli?style=flat-square&logoColor=%232f2f2f&labelColor=%232f2f2f&color=%234f4f4f
-[license-url]: https://pypi.org/project/embeddr-cli
+[license-url]: https://github.com/embeddr-net/embeddr-cli/blob/main/LICENSE
 
 ## License
 

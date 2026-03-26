@@ -17,7 +17,7 @@ import typer
 import uvicorn
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
@@ -57,10 +57,6 @@ DEFAULT_FRONTEND_DIR = PACKAGE_DIR / "web"
 DEFAULT_WEB_SOURCE_DIR = ROOT_DIR.parent / "embeddr-frontend"
 DEFAULT_WEB_DIST_DIR = DEFAULT_WEB_SOURCE_DIR / "dist"
 
-# core_path = Path(__file__).resolve().parents[4] / "embeddr-core" / "src"
-# if core_path.exists():
-#    sys.path.append(str(core_path))
-
 try:
     from embeddr_core.services.embedding import unload_model
 except ImportError:
@@ -70,7 +66,6 @@ except ImportError:
 
 
 logger = logging.getLogger("embeddr.local")
-# logger.info("Embeddr Local is starting up...") # Moved to startup event to avoid double logging on reload
 
 
 # Suppress websockets deprecation warnings
@@ -83,6 +78,72 @@ warnings.filterwarnings(
 # Root is parents[3] (embeddr-local-api)
 FRONTEND_DIR = Path(os.environ.get(
     "EMBEDDR_FRONTEND_DIR", DEFAULT_FRONTEND_DIR))
+
+
+def _build_cloud_defaults_script() -> str | None:
+    """Build an inline <script> that seeds localStorage with cloud defaults.
+
+    Returns None if not in cloud mode or no defaults are configured.
+    """
+    from embeddr.core.config import is_cloud_mode
+    if not is_cloud_mode():
+        return None
+
+    import json as _json
+
+    state: Dict[str, Any] = {}
+
+    theme_mode = os.environ.get("EMBEDDR_DEFAULT_THEME_MODE", "").strip()
+    if theme_mode:
+        state["themeMode"] = theme_mode
+    theme_light = os.environ.get("EMBEDDR_DEFAULT_THEME_LIGHT", "").strip()
+    if theme_light:
+        state["themePackLightId"] = theme_light
+    theme_dark = os.environ.get("EMBEDDR_DEFAULT_THEME_DARK", "").strip()
+    if theme_dark:
+        state["themePackDarkId"] = theme_dark
+
+    effects_raw = os.environ.get(
+        "EMBEDDR_DEFAULT_EFFECTS_ENABLED", "").strip().lower()
+    if effects_raw in ("1", "true", "yes"):
+        state["effectsEnabled"] = True
+    elif effects_raw in ("0", "false", "no"):
+        state["effectsEnabled"] = False
+
+    effects_list_raw = os.environ.get("EMBEDDR_DEFAULT_EFFECTS", "").strip()
+    if effects_list_raw:
+        enabled_effects = [
+            e.strip() for e in effects_list_raw.split(",") if e.strip()]
+        # Build effectToggles: listed effects are enabled, others default off.
+        # The Zustand store defaults unlisted effects to true via getEffectToggle,
+        # so we explicitly set only the ones we want on.
+        toggles: Dict[str, bool] = {}
+        for effect_id in enabled_effects:
+            toggles[effect_id] = True
+        state["effectToggles"] = toggles
+
+    if not state:
+        return None
+
+    payload = _json.dumps({"state": state, "version": 3})
+    return (
+        "<script>"
+        "if(!localStorage.getItem('embeddr-client-settings')){"
+        f"localStorage.setItem('embeddr-client-settings','{payload}')"
+        "}"
+        "</script>"
+    )
+
+
+# Cache the script once at startup (env vars don't change at runtime)
+_CLOUD_DEFAULTS_SCRIPT: str | None = None
+
+
+def _get_cloud_defaults_script() -> str | None:
+    global _CLOUD_DEFAULTS_SCRIPT
+    if _CLOUD_DEFAULTS_SCRIPT is None:
+        _CLOUD_DEFAULTS_SCRIPT = _build_cloud_defaults_script() or ""
+    return _CLOUD_DEFAULTS_SCRIPT or None
 
 
 def _log_section(title: str) -> None:
@@ -149,15 +210,23 @@ def _bootstrap_default_admin() -> None:
                         fg=typer.colors.GREEN,
                     )
 
+    from embeddr.core.config import is_cloud_mode
+
     if not result_data:
-        typer.secho(
-            "Default admin already exists; skipping bootstrap.",
-            fg=typer.colors.BRIGHT_BLACK,
-        )
+        if not is_cloud_mode():
+            typer.secho(
+                "Default admin already exists; skipping bootstrap.",
+                fg=typer.colors.BRIGHT_BLACK,
+            )
+        return
+
+    if is_cloud_mode():
+        # In cloud mode, log credentials for container logs (no interactive output)
+        logger.info("Bootstrapped admin: user=%s key=%s", result_data["root_username"], result_data["root_key"])
         return
 
     typer.secho(
-        "🚨 DESTRUCTIVE: Bootstrapped root operator",
+        "Bootstrapped root operator",
         fg=typer.colors.YELLOW,
     )
     typer.secho(
@@ -180,7 +249,7 @@ def _bootstrap_default_admin() -> None:
 
     if result_data.get("user_key"):
         typer.secho(
-            "🚨 DESTRUCTIVE: Bootstrapped single-user operator",
+            "Bootstrapped single-user operator",
             fg=typer.colors.YELLOW,
         )
         typer.secho(
@@ -293,6 +362,10 @@ async def lifespan(app: FastAPI):
     # Start Ingestion Service
     from embeddr.services.ingestion_service import ingestion_service
     await ingestion_service.start()
+
+    # Start ingest reactor — auto-processes new artifacts (thumbnails, embeddings)
+    from embeddr.services.ingest_reactor import start as start_ingest_reactor
+    start_ingest_reactor()
 
     # Transport tool registration is handled by transport plugins
 
@@ -424,268 +497,46 @@ async def lifespan(app: FastAPI):
 
     def bridge_event_to_ws(event):
         try:
-            raw_event_type = str(event.event_type or "")
-            if raw_event_type.startswith("ui:") or raw_event_type.startswith("ui."):
-                logger.debug("[UI EVENT] %s payload=%s",
-                             event.event_type, event.payload)
-            event_type = raw_event_type
+            event_type = str(event.event_type or "")
             payload = event.payload
 
-            if event.source == "comfyui":
-                if event_type.startswith("comfy."):
-                    event_type = event_type.split("comfy.", 1)[1]
-                if event_type == "artifact.preview":
-                    event_type = "preview"
-                    if isinstance(payload, dict) and payload.get("data"):
-                        # Keep structured payload to preserve endpoint metadata.
-                        payload = payload
-            audience = _derive_audience(raw_event_type, payload)
+            audience = _derive_audience(event_type, payload)
+
+            # In secured auth modes, drop events that touch sensitive scopes
+            # (execution.*, artifact.*) unless they have audience info or come
+            # from a trusted system source.
             auth_mode = auth_service.get_auth_mode()
-            is_sensitive_scope = raw_event_type.startswith(
-                "execution.") or raw_event_type.startswith("artifact.")
-
-            # Allow system/plugin events through even without audience scoping.
-            # ComfyUI monitor events, execution spine events, and plugin events
-            # don't carry per-user audience info but need to reach connected clients.
-            is_system_source = event.source in (
-                "comfyui", "spine", "embeddr-comfyui", "system",
-                "embeddr", "plugin", "ingestion",
-            )
-            if auth_mode != "open" and is_sensitive_scope and not audience and not is_system_source:
-                logger.debug(
-                    "Dropping unscoped WS event in secured mode type=%s source=%s",
-                    raw_event_type,
-                    event.source,
-                )
+            is_sensitive = event_type.startswith("execution.") or event_type.startswith("artifact.")
+            is_system = event.source in ("spine", "system", "embeddr", "plugin", "ingestion")
+            if auth_mode != "open" and is_sensitive and not audience and not is_system:
+                logger.debug("Dropping unscoped WS event type=%s source=%s", event_type, event.source)
                 return
-            # We wrap the broadcast in a task on the main loop
-            asyncio.run_coroutine_threadsafe(
-                # manager.broadcast_event(
-                #     # Maps to "plugin:event_type" in frontend
-                #     f"plugin:{event.event_type}",
-                #     event.model_dump()
-                # ),
-                manager.broadcast_event(
-                    # Maps to "plugin:event_type" in frontend
-                    event_type,
-                    payload,
-                    source=event.source,
-                    audience=audience,
-                ),
-                loop
-            )
 
-            if raw_event_type.startswith("execution."):
-                # Optional: Broadcast status update explicitly if needed
-                pass
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast_event(event_type, payload, source=event.source, audience=audience),
+                loop,
+            )
         except Exception as e:
-            logger.error(f"Bridge Error: {e}")
+            logger.error("Event bridge error: %s", e)
 
     # Subscribe to relevant events
-    # (In V3 we will add wildcard subscription)
     _EVENT_BUS.subscribe("*", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("embeddings.generated", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("artifact.created", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("scan.started", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("scan.completed", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("scan.failed", bridge_event_to_ws)
 
-    # # LOTUS
-    # # _EVENT_BUS.subscribe("ui:toast", bridge_event_to_ws)
-    # # _EVENT_BUS.subscribe("ui:navigate", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("ui:open_artifact", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("ui:open_gallery", bridge_event_to_ws)
-
-    # _EVENT_BUS.subscribe("execution.started", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("execution.completed", bridge_event_to_ws)
-    # _EVENT_BUS.subscribe("execution.failed", bridge_event_to_ws)
-
-    # Start ComfyUI WebSocket monitor
-    # REMOVED: Managed by embeddr-comfyui plugin
-    # asyncio.create_task(monitor_comfy_events())
-
-    # Legacy AutomationManager startup removed.
-
-    # Display Loaded Plugins Summary
-    from embeddr_core.plugin_interface import PluginIntent
-    loaded_plugins = get_all_plugin_instances()
-    if loaded_plugins:
-        typer.echo("\n   🧩 Loaded Plugins:")
-        typer.echo("   " + "-" * 45)
-        for plugin in sorted(loaded_plugins, key=lambda p: p.name):
-            try:
-                badges = []
-                # Check capabilities
-                has_ui = any(a.ui_component for a in plugin.actions)
-                if has_ui:
-                    badges.append("⚛️ UI")
-                if PluginIntent.REGISTER_API in plugin.intents:
-                    badges.append("🔌 API")
-                if PluginIntent.REGISTER_CLI in plugin.intents:
-                    badges.append("💻 CLI")
-
-                # Use ANSI colors for better look if typer supports it (it does)
-                name_str = typer.style(
-                    plugin.name, fg=typer.colors.WHITE, bold=True)
-                version_str = typer.style(
-                    f"v{plugin.version}", fg=typer.colors.BRIGHT_BLACK)
-                badges_str = "  ".join(badges)
-
-                typer.echo(
-                    f"   • {name_str:<25} {version_str:<10} {badges_str}")
-            except Exception as pe:
-                typer.secho(
-                    f"   ⚠️  Load Error in {plugin.name}: {pe}", fg=typer.colors.RED)
-                logger.error(f"Error summarising plugin {plugin.name}: {pe}")
+    # Render consolidated startup summary
+    from embeddr.core.startup_summary import build_startup_context, render_startup_summary
 
     try:
-        from sqlalchemy.engine.url import make_url
-        from embeddr.core.config import settings
-        from embeddr.db.adapters import get_adapter
-        from embeddr.db.session import get_engine
-        from embeddr.services.blob_registry import (
-            list_providers,
-            list_resolvers,
-            list_provider_resolvers,
-            get_default_provider_name,
-            get_default_resolver_name,
+        startup_ctx = build_startup_context(
+            host=host,
+            port=int(port),
+            docs_enabled=docs_enabled,
         )
-
-        providers = list_providers()
-        resolvers = list_resolvers()
-        provider_resolvers = list_provider_resolvers()
-        default_provider = get_default_provider_name()
-        default_resolver = get_default_resolver_name()
-
-        provider_override = os.environ.get("EMBEDDR_DB_PROVIDER")
-        adapter = get_adapter(settings.DATABASE_URL,
-                              provider=provider_override)
-        engine = get_engine()
-        try:
-            engine_url = engine.url
-        except Exception:
-            engine_url = make_url(settings.DATABASE_URL)
-
-        if engine_url.drivername == "sqlite":
-            store_label = f"sqlite ({engine_url.database})"
-        else:
-            try:
-                store_label = engine_url.render_as_string(hide_password=True)
-            except Exception:
-                store_label = settings.DATABASE_URL
-
-        typer.secho("\n   🧠 Core Capabilities (routed by Lotus):",
-                    fg=typer.colors.CYAN)
-        typer.echo("   " + "-" * 45)
-        if providers:
-            available_providers = ", ".join(sorted(providers.keys()))
-            typer.secho("   • artifacts.upload", fg=typer.colors.YELLOW)
-            typer.echo(
-                f"     - provider: {default_provider} (available: {available_providers})")
-        else:
-            typer.secho("   • artifacts.upload: none",
-                        fg=typer.colors.BRIGHT_BLACK)
-
-        typer.secho("   • artifacts.get", fg=typer.colors.YELLOW)
-        if provider_override:
-            typer.echo(
-                f"     - store: {adapter.name} ({store_label}) [provider={provider_override}]")
-        else:
-            typer.echo(f"     - store: {adapter.name} ({store_label})")
-
-        if resolvers:
-            available_resolvers = ", ".join(sorted(resolvers.keys()))
-            typer.secho("   • artifacts.resolve", fg=typer.colors.YELLOW)
-            typer.echo(
-                f"     - resolver: {default_resolver} (available: {available_resolvers})")
-        else:
-            typer.secho("   • artifacts.resolve: none",
-                        fg=typer.colors.BRIGHT_BLACK)
-
-        if providers or resolvers:
-            typer.secho("\n   🧱 Blob Capabilities:", fg=typer.colors.CYAN)
-            typer.echo("   " + "-" * 45)
-
-            if providers:
-                typer.secho("   • providers", fg=typer.colors.YELLOW)
-                for name in sorted(providers.keys()):
-                    suffix = " (default)" if name == default_provider else ""
-                    resolver_name = provider_resolvers.get(name)
-                    resolver_hint = f" -> {resolver_name}" if resolver_name else ""
-                    typer.echo(f"     - {name}{suffix}{resolver_hint}")
-            else:
-                typer.secho("   • providers: none",
-                            fg=typer.colors.BRIGHT_BLACK)
-
-            if resolvers:
-                typer.secho("   • resolvers", fg=typer.colors.YELLOW)
-                for name in sorted(resolvers.keys()):
-                    typer.echo(f"     - {name}")
-            else:
-                typer.secho("   • resolvers: none",
-                            fg=typer.colors.BRIGHT_BLACK)
+        render_startup_summary(startup_ctx)
     except Exception as e:
-        logger.warning("Failed to render storage capability summary: %s", e)
-
-    typer.secho("\n✨ Embeddr Local API has started!",
-                fg=typer.colors.GREEN, bold=True)
-    typer.echo("   " + "-" * 45)
-
-    typer.secho("   👤 User Endpoints:", fg=typer.colors.CYAN)
-    typer.secho(
-        f"   👉 Web UI:    http://{display_host}:{port}", fg=typer.colors.CYAN)
-    if docs_enabled:
-        typer.secho(
-            f"   📚 API Docs:  http://{display_host}:{port}/api/docs",
-            fg=typer.colors.MAGENTA,
-        )
-
-    typer.secho("   ⚙️  System Endpoints:", fg=typer.colors.CYAN)
-    typer.secho(
-        f"   • System Info:  http://{display_host}:{port}/api/v1/system/info",
-        fg=typer.colors.BRIGHT_BLACK,
-    )
-    typer.secho(
-        f"   • Route List:   http://{display_host}:{port}/api/v1/system/routes",
-        fg=typer.colors.BRIGHT_BLACK,
-    )
-
-    transports = [p for p in loaded_plugins if p.name.startswith(
-        "embeddr-transport-")]
-    typer.secho("   🔌 Transports:", fg=typer.colors.CYAN)
-    if not transports:
-        typer.secho("   • None", fg=typer.colors.BRIGHT_BLACK)
-    else:
-        for plugin in transports:
-            try:
-                info = plugin.get_transport_info() or {}
-            except Exception:
-                info = {}
-            if not info and hasattr(plugin, "transport_info"):
-                info = getattr(plugin, "transport_info")
-
-            title = (info or {}).get("title") or plugin.name
-            links = (info or {}).get("links") or []
-
-            typer.secho(f"   • {title}", fg=typer.colors.YELLOW)
-            for link in links:
-                label = link.get("label") or "Link"
-                path = link.get("path") or ""
-                if path:
-                    url = _format_transport_link(display_host, str(port), path)
-                    typer.secho(f"     - {label}: {url}",
-                                fg=typer.colors.BRIGHT_BLACK)
-
-    show_official_docs = True
-    if show_official_docs:
-        typer.secho(
-            f"   📚 Official Docs:  https://docs.embeddr.net",
-            fg=typer.colors.BLUE,
-        )
-
-    typer.echo("   " + "-" * 45)
-    typer.secho("   Press Ctrl+C to stop server\n",
-                fg=typer.colors.BRIGHT_BLACK)
+        logger.warning("Failed to render startup summary: %s", e)
+        # Minimal fallback
+        typer.secho(f"\n  Embeddr started on http://{display_host}:{port}\n",
+                    fg=typer.colors.GREEN)
 
     # Start Execution Spine Worker
     spine = ExecutionSpine()
@@ -772,13 +623,6 @@ def dynamic_origins() -> list[str]:
     return [f"http://{host}:{port}"]
 
 
-def aitoolkit_origins() -> list[str]:
-    logger.info("Loading AI Toolkit CORS origins...")
-    return [
-        "http://localhost:3001",  # AI Toolkit default
-    ]
-
-
 def toml_cors_origins() -> list[str]:
     """Read [cors] origins from embeddr.toml if present."""
     try:
@@ -824,11 +668,8 @@ def create_app(
     enable_docs: bool = False,
     no_plugins: bool = False,
 ) -> FastAPI:
-    _log_section("Config")
-    typer.secho(
-        f"Docs: {enable_docs}",
-        fg=typer.colors.BRIGHT_BLACK,
-    )
+    logger.debug("== Config ==")
+    logger.debug("Docs: %s", enable_docs)
     app = FastAPI(
         title="Embeddr Local",
         lifespan=lifespan,
@@ -837,7 +678,11 @@ def create_app(
         openapi_url="/api/openapi.json" if enable_docs else None,
     )
 
-    _log_section("CORS")
+    # Install standardized error response handlers (ErrorResponse envelope)
+    from embeddr.api.error_handler import install_error_handlers
+    install_error_handlers(app)
+
+    logger.debug("== CORS ==")
     port = os.environ.get("EMBEDDR_PORT", "8003")
     allowed_origins: set[str] = set(default_local_origins(port))
     allowed_origins |= set(parse_env_origins())
@@ -881,21 +726,18 @@ def create_app(
     cors_kwargs["allow_origins"] = list(allowed_origins)
 
     app.add_middleware(CORSMiddleware, **cors_kwargs)
-    typer.secho("🔐 Allowed CORS origins:", fg=typer.colors.CYAN)
-    for origin in allowed_origins:
-        typer.echo(f"   - {origin}")
+    logger.debug("Allowed CORS origins: %s", allowed_origins)
 
-    _log_section("Security")
+    logger.debug("== Security ==")
     is_auth_enabled = check_auth_enabled()
     if is_auth_enabled:
-        typer.secho("🔒 Authentication: ENABLED", fg=typer.colors.GREEN)
+        logger.debug("Authentication: ENABLED")
         api_dependencies = [Depends(get_api_key)]
     else:
-        typer.secho(
-            "🔓 Authentication: DISABLED (set EMBEDDR_API_KEY to enable)", fg=typer.colors.YELLOW)
+        logger.debug("Authentication: DISABLED")
         api_dependencies = []
 
-    _log_section("API Routes")
+    logger.debug("== API Routes ==")
     # Include WebSocket (Auth handled internally)
     app.include_router(websocket_routes.router)
 
@@ -913,11 +755,8 @@ def create_app(
             tags=tags,
             dependencies=dependencies,
         )
-    # app.include_router(projections_v2.router,
-    #                    prefix="/api/v2/projections", tags=["projections"])
-
     # Serve Plugins Directory
-    _log_section("Plugins")
+    logger.debug("== Plugins ==")
     if not no_plugins:
         plugin_paths = []
         allow_dev_plugins = os.environ.get(
@@ -951,20 +790,14 @@ def create_app(
                 if candidate.exists() and not any(existing == candidate for existing in plugin_paths):
                     plugin_paths.append(candidate)
 
-        typer.secho(
-            f"   Plugin source env (EMBEDDR_PLUGINS_DIR): {(os.environ.get('EMBEDDR_PLUGINS_DIR') or '').strip() or '<unset>'}",
-            fg=typer.colors.BRIGHT_BLACK,
-        )
-        typer.secho(
-            f"   Plugin source env (EMBEDDR_PLUGIN_DIR): {(os.environ.get('EMBEDDR_PLUGIN_DIR') or '').strip() or '<unset>'}",
-            fg=typer.colors.BRIGHT_BLACK,
+        logger.debug(
+            "Plugin source env EMBEDDR_PLUGINS_DIR=%s EMBEDDR_PLUGIN_DIR=%s",
+            (os.environ.get("EMBEDDR_PLUGINS_DIR") or "").strip() or "<unset>",
+            (os.environ.get("EMBEDDR_PLUGIN_DIR") or "").strip() or "<unset>",
         )
         if plugin_paths:
             for resolved_path in plugin_paths:
-                typer.secho(
-                    f"   Plugin path candidate: {resolved_path}",
-                    fg=typer.colors.BRIGHT_BLACK,
-                )
+                logger.debug("Plugin path candidate: %s", resolved_path)
         else:
             typer.secho(
                 "   No plugin path candidates discovered.",
@@ -1018,9 +851,9 @@ def create_app(
                 mount_path = f"/api/v1/plugins/{plugin_name}/static"
                 alt_mount_path = f"/api/plugins/{plugin_name}/static"
                 public_mount_path = f"/plugins/{plugin_name}/static"
-                typer.secho(
-                    f"   Mounting {plugin_name} assets: {mount_path} -> {layout.static_root}",
-                    fg=typer.colors.BRIGHT_BLACK,
+                logger.debug(
+                    "Mounting %s assets: %s -> %s",
+                    plugin_name, mount_path, layout.static_root,
                 )
                 app.mount(
                     mount_path,
@@ -1077,7 +910,7 @@ def create_app(
         initialize_all_plugins()
 
         # Phase 3: Register transport routes (if provided)
-        _log_section("Transports")
+        logger.debug("== Transports ==")
         for plugin in loaded_plugins:
             try:
                 transport_app = AuthenticatedTransportApp(
@@ -1133,6 +966,22 @@ def create_app(
             app.mount("/assets", StaticFiles(directory=assets_dir),
                       name="assets")
 
+        # Pre-read index.html and inject cloud defaults script if applicable.
+        # Cached once — avoids re-reading the file on every SPA navigation.
+        _index_html_path = os.path.join(FRONTEND_DIR, "index.html")
+        _cloud_script = _get_cloud_defaults_script()
+        _index_html_content: str | None = None
+        if _cloud_script:
+            try:
+                raw = Path(_index_html_path).read_text(encoding="utf-8")
+                _index_html_content = raw.replace(
+                    "</head>", f"{_cloud_script}</head>", 1)
+                logger.info(
+                    "Cloud defaults script injected into index.html")
+            except Exception as exc:
+                logger.warning(
+                    "Failed to inject cloud defaults: %s", exc)
+
         # Catch-all route for SPA (Single Page Application)
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
@@ -1148,8 +997,10 @@ def create_app(
             if full_path and os.path.exists(file_path) and os.path.isfile(file_path):
                 return FileResponse(file_path)
 
-            # Otherwise return index.html for React Router to handle
-            return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+            # Serve index.html — with cloud defaults injected if available
+            if _index_html_content is not None:
+                return HTMLResponse(content=_index_html_content)
+            return FileResponse(_index_html_path)
 
     else:
         logger.warning(
@@ -1270,6 +1121,8 @@ def register(app: typer.Typer):
             None, help="Human-readable name for this worker (defaults to hostname)."),
         worker_tags: str = typer.Option(
             None, help="Comma-separated capability tags (e.g., gpu,encoder,av1)."),
+        plugin_profile: str = typer.Option(
+            None, help="Named plugin profile from embeddr.toml (e.g., core, dev)."),
     ):
         """
         Start the Embeddr Local API server.
@@ -1300,6 +1153,8 @@ def register(app: typer.Typer):
         os.environ["EMBEDDR_ENABLE_DOCS"] = str(docs).lower()
         os.environ["EMBEDDR_ALLOW_DEV_ORIGINS"] = str(dev_origins).lower()
         os.environ["EMBEDDR_NO_PLUGINS"] = str(no_plugins).lower()
+        if plugin_profile:
+            os.environ["EMBEDDR_PLUGIN_PROFILE"] = plugin_profile
 
         # Worker mode env vars
         if worker:

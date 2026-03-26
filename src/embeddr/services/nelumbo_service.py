@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -14,6 +15,8 @@ from pathlib import Path
 import tempfile
 import zipfile
 from typing import Any, Dict, List, Optional, cast
+
+logger = logging.getLogger(__name__)
 
 from embeddr.core.project import CONFIG_FILENAME, create_default_config, load_project_config
 from embeddr.core.plugin_loader import (
@@ -147,6 +150,7 @@ def _fetch_registry_items(path: str) -> List[Dict[str, Any]]:
             data = response.json()
             return data if isinstance(data, list) else []
     except Exception:
+        logger.debug("Failed to fetch registry items at %s%s", base_url, path, exc_info=True)
         return []
 
 
@@ -294,8 +298,8 @@ def list_local_themes() -> List[RegistryItem]:
                 banner = data.get("banner") or data.get("bannerUrl")
                 if banner:
                     banner_url = f"/themes/{entry.name}/{banner}"
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError, ValueError) as e:
+                logger.debug("Failed to parse theme.json for %s: %s", entry.name, e)
         items.append(
             RegistryItem(
                 id=theme_id,
@@ -737,7 +741,8 @@ def discover_workspaces(*, search_root: Optional[str] = None, max_depth: int = 4
             continue
         try:
             entries = list(current.iterdir())
-        except Exception:
+        except OSError as e:
+            logger.debug("Cannot list directory %s: %s", current, e)
             continue
 
         for entry in entries:
@@ -873,8 +878,8 @@ def start_embeddr_server(
                     file_salt = salt_file.read_text(encoding="utf-8").strip()
                     if file_salt and file_salt != "embeddr-local":
                         env["EMBEDDR_AUTH_SALT"] = file_salt
-                except Exception:
-                    pass
+                except OSError as e:
+                    logger.debug("Failed to read auth salt file %s: %s", salt_file, e)
 
     cmd = [
         sys.executable,
@@ -930,7 +935,7 @@ def start_embeddr_server(
         try:
             log_handle.flush()
             content = log_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         if not root_key:
             m = re.search(r"Root Key:\s*(\S+)", content)
@@ -1031,7 +1036,8 @@ def _install_workspace_plugins(
         try:
             shutil.copytree(source_path, target_path, dirs_exist_ok=True)
             installed.append(plugin_id)
-        except Exception:
+        except OSError as e:
+            logger.warning("Failed to copy plugin %s to workspace: %s", plugin_id, e)
             missing.append(plugin_id)
 
     return {"installed": installed, "missing": missing}
@@ -1173,6 +1179,7 @@ def _download_registry_plugin_archive(
             archive_path.write_bytes(response.content)
             return archive_path
     except Exception:
+        logger.debug("Failed to download plugin archive for %s", plugin_id, exc_info=True)
         return None
 
 
@@ -1284,8 +1291,8 @@ def install_registry_plugins_destructive(
     finally:
         try:
             shutil.rmtree(temp_dir)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug("Failed to clean up temp dir %s: %s", temp_dir, e)
 
     ok = bool(installed or skipped) and not (missing and not installed)
     message = None
@@ -1426,7 +1433,8 @@ def test_database_connection(
             url_obj = make_url(resolved_url)
             if url_obj.database:
                 sqlite_path = Path(url_obj.database)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to parse SQLite URL %s: %s", resolved_url, e)
             sqlite_path = None
 
         if sqlite_path and not sqlite_path.exists():

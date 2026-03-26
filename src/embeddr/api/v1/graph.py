@@ -46,8 +46,64 @@ from embeddr.services.graph_query_service import (
     run_graph_bfs,
     get_graph_taxonomy_payload,
 )
+from embeddr_core.models.api_responses import OkResponse
 
 logger = logging.getLogger("embeddr.api.graph")
+
+
+# ---------------------------------------------------------------------------
+# Response models for graph endpoints
+# ---------------------------------------------------------------------------
+
+class GraphNodeResponse(BaseModel):
+    id: str
+    type_name: Optional[str] = None
+    base_type_name: Optional[str] = None
+    label: str
+    uri: Optional[str] = None
+    is_seed: bool = False
+    degree: Dict[str, int] = {}
+    overlays: Dict[str, int] = {}
+    metadata: Dict[str, Any] = {}
+
+
+class GraphEdgeResponse(BaseModel):
+    id: str
+    source_id: str
+    target_id: str
+    relation_type_raw: str
+    relation_type_canonical: Optional[str] = None
+    relation_family: Optional[str] = None
+    source_namespace: str = ""
+    is_lineage: bool = False
+
+
+class GraphQueryMeta(BaseModel):
+    nodes_returned: int = 0
+    edges_returned: int = 0
+    elapsed_ms: Optional[int] = None
+    truncated: Optional[bool] = None
+
+
+class GraphQueryResponse(BaseModel):
+    nodes: List[GraphNodeResponse]
+    edges: List[GraphEdgeResponse]
+    meta: GraphQueryMeta
+
+
+class RelationTypeInfoResponse(BaseModel):
+    name: str
+    family: str
+    inverse: Optional[str] = None
+    transitive: bool = False
+    structural: bool = False
+    description: Optional[str] = None
+    registered_by: Optional[str] = None
+
+
+class RelationTypeCreateResponse(BaseModel):
+    status: str
+    name: str
 router = APIRouter()
 
 
@@ -200,7 +256,7 @@ def _artifact_label(artifact: Artifact) -> str:
 # Taxonomy
 # ---------------------------------------------------------------------------
 
-@router.get("/taxonomy")
+@router.get("/taxonomy", response_model=Dict[str, Any])
 def graph_taxonomy(
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
@@ -217,7 +273,7 @@ def graph_taxonomy(
 # Graph traversal query
 # ---------------------------------------------------------------------------
 
-@router.post("/query")
+@router.post("/query", response_model=GraphQueryResponse)
 def graph_query(
     req: GraphQueryRequest,
     session: Session = Depends(get_session),
@@ -541,7 +597,7 @@ def delete_relation(
 # Relation type registry
 # ---------------------------------------------------------------------------
 
-@router.get("/relation-types")
+@router.get("/relation-types", response_model=List[RelationTypeInfoResponse])
 def list_relation_types(
     registered_by: Optional[str] = Query(default=None),
     family: Optional[str] = Query(default=None),
@@ -561,20 +617,20 @@ def list_relation_types(
     query = query.order_by(RelationTypeDef.family, RelationTypeDef.name)
     rows = session.exec(query).all()
     return [
-        {
-            "name": r.name,
-            "family": r.family,
-            "inverse": r.inverse,
-            "transitive": r.transitive,
-            "structural": r.structural,
-            "description": r.description,
-            "registered_by": r.registered_by,
-        }
+        RelationTypeInfoResponse(
+            name=r.name,
+            family=r.family,
+            inverse=r.inverse,
+            transitive=r.transitive,
+            structural=r.structural,
+            description=r.description,
+            registered_by=r.registered_by,
+        )
         for r in rows
     ]
 
 
-@router.post("/relation-types", status_code=201)
+@router.post("/relation-types", status_code=201, response_model=RelationTypeCreateResponse)
 def register_relation_type(
     spec: RelationTypeCreate,
     session: Session = Depends(get_session),
@@ -589,7 +645,7 @@ def register_relation_type(
 
     existing = session.get(RelationTypeDef, spec.name)
     if existing:
-        return {"status": "exists", "name": existing.name}
+        return RelationTypeCreateResponse(status="exists", name=existing.name)
 
     row = RelationTypeDef(
         name=spec.name,
@@ -602,4 +658,4 @@ def register_relation_type(
     )
     session.add(row)
     session.commit()
-    return {"status": "created", "name": row.name}
+    return RelationTypeCreateResponse(status="created", name=row.name)

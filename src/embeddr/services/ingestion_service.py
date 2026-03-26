@@ -217,7 +217,7 @@ class IngestionService:
                     if item.get('id'):
                         try:
                             uid = UUID(str(item.get('id')))
-                        except:
+                        except (ValueError, TypeError):
                             uid = uuid5(NAMESPACE_URL, u)
                     else:
                         uid = uuid5(NAMESPACE_URL, u)

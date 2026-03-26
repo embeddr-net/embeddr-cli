@@ -82,7 +82,7 @@ def get_umap_projection(
         if isinstance(vec, str):
             try:
                 vec = json.loads(vec)
-            except:
+            except (ValueError, TypeError, json.JSONDecodeError):
                 continue
 
         aid = str(art.id)
@@ -166,8 +166,6 @@ def get_umap_projection(
 
             if "image" in t:
                 color = "#FF5555"
-                if "comfy" in t:
-                    color = "#FF9999"
             elif "text" in t:
                 color = "#5555FF"
             elif "workflow" in t:

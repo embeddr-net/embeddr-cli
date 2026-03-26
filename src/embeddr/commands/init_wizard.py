@@ -22,41 +22,41 @@ from sqlmodel import Session
 
 DEFAULT_DIST_PLUGINS_DIR = (
     Path(__file__).resolve().parents[4] /
-    "embeddr-plugins" / "dist"
+    "embeddr-plugins" / "dist" / "plugins"
 )
 
 # Pack Definitions - Easy to edit hardcoded packs
 PACK_DEFINITIONS = {
     "standard": {
         "name": "Standard (Recommended)",
-        "description": "The default experience. Includes core, search, embeddings, and local file scanning.",
+        "description": "Core workspace with search, embeddings, thumbnailing, and local storage.",
         "includes": ["minimal"],
         "plugins": [
             "embeddr-search",
             "embeddr-embeddings",
-            "embeddr-fs-scanner",
             "embeddr-thumbnailer",
-            "embeddr-inspect",
+            "embeddr-llm",
+            "embeddr-editor-types",
+            "embeddr-media-tools",
+            "embeddr-transport-mcp",
+            "embeddr-transport-graphql",
+            "embeddr-zen-effect-grid",
         ],
     },
     "creative": {
         "name": "Creative (ComfyUI)",
-        "description": "Includes Standard plus ComfyUI integration and basic image tooling.",
+        "description": "Standard plus ComfyUI integration for AI image generation workflows.",
         "includes": ["standard"],
         "plugins": [
             "embeddr-comfyui",
-            "embeddr-editor-image",
-            "embeddr-page-gallery",
         ],
     },
-    "data-science": {
-        "name": "Data Science Pack",
-        "description": "Includes standard tools plus UMAP visualization and dataset management.",
-        "includes": ["minimal"],
+    "full": {
+        "name": "Full (All Release Plugins)",
+        "description": "Everything in the 0.2.0 release — standard + creative + S3 storage.",
+        "includes": ["creative"],
         "plugins": [
-            "embeddr-embeddings",
-            "embeddr-umap",
-            "embeddr-dataset",
+            "embeddr-storage-s3",
         ],
     },
     "minimal": {
@@ -64,6 +64,7 @@ PACK_DEFINITIONS = {
         "description": "Just the bare essentials. Good for building custom pipelines from scratch.",
         "plugins": [
             "embeddr-core",
+            "embeddr-lotus",
             "embeddr-storage-local",
         ],
     },

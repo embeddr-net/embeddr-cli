@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import os
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Request
 from sqlmodel import Session
 
 from embeddr.db.session import get_session
-from embeddr.core.config import is_dev_mode
+from embeddr.core.config import is_cloud_mode, is_dev_mode
 from embeddr_core.services.config_service import resolve_plugin_config
 
 router = APIRouter()
@@ -42,7 +43,48 @@ def get_public_system_info(session: Session = Depends(get_session)) -> Dict[str,
     return {
         "instance": instance_profile,
         "dev_mode": is_dev_mode(),
+        "cloud_mode": is_cloud_mode(),
     }
+
+
+@router.get("/defaults")
+def get_instance_defaults() -> Dict[str, Any]:
+    """Return instance-level defaults for client settings.
+
+    In cloud mode these are driven by EMBEDDR_DEFAULT_* env vars.
+    The frontend should apply these on first visit (no existing localStorage).
+    Non-cloud instances return an empty dict (use client-side defaults).
+    """
+    if not is_cloud_mode():
+        return {}
+
+    theme_mode = os.environ.get("EMBEDDR_DEFAULT_THEME_MODE", "").strip() or None
+    theme_light = os.environ.get("EMBEDDR_DEFAULT_THEME_LIGHT", "").strip() or None
+    theme_dark = os.environ.get("EMBEDDR_DEFAULT_THEME_DARK", "").strip() or None
+    effects_enabled_raw = os.environ.get(
+        "EMBEDDR_DEFAULT_EFFECTS_ENABLED", "").strip().lower()
+    effects_enabled = effects_enabled_raw in ("1", "true", "yes") if effects_enabled_raw else None
+
+    # Comma-separated list of effect plugin IDs that should be enabled
+    effects_raw = os.environ.get("EMBEDDR_DEFAULT_EFFECTS", "").strip()
+    effects: Optional[List[str]] = (
+        [e.strip() for e in effects_raw.split(",") if e.strip()]
+        if effects_raw else None
+    )
+
+    defaults: Dict[str, Any] = {}
+    if theme_mode is not None:
+        defaults["themeMode"] = theme_mode
+    if theme_light is not None:
+        defaults["themePackLightId"] = theme_light
+    if theme_dark is not None:
+        defaults["themePackDarkId"] = theme_dark
+    if effects_enabled is not None:
+        defaults["effectsEnabled"] = effects_enabled
+    if effects is not None:
+        defaults["defaultEffects"] = effects
+
+    return defaults
 
 
 @wellknown_router.get("/.well-known/embeddr-auth")

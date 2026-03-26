@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from embeddr.api.security import get_auth_context, require_admin
 from embeddr.services.worker_registry import worker_registry
 from embeddr.api.v1.system import _load_instance_profile, _get_backend_version
+from embeddr_core.models.api_responses import OkResponse
 
 logger = logging.getLogger("embeddr.api.v1.workers")
 
@@ -39,16 +40,49 @@ class JobSubmitResponse(BaseModel):
     capability: str
 
 
+class WorkerInfoResponse(BaseModel):
+    """Single worker node info."""
+    worker_id: str
+    name: Optional[str] = None
+    capabilities: List[str] = []
+    status: str = "connected"
+    current_job_id: Optional[str] = None
+    connected_at: Optional[str] = None
+    last_heartbeat: Optional[str] = None
+
+
+class WorkerListResponse(BaseModel):
+    items: List[Dict[str, Any]]
+    total: int
+
+
+class JobInfoResponse(BaseModel):
+    job_id: str
+    capability: str
+    status: str
+    progress: Optional[float] = None
+    stage: Optional[str] = None
+    assigned_worker_id: Optional[str] = None
+    created_at: Optional[str] = None
+    output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class JobListResponse(BaseModel):
+    items: List[JobInfoResponse]
+    total: int
+
+
 # ── Worker List / Management ───────────────────────────────────────────
 
-@router.get("")
+@router.get("", response_model=WorkerListResponse)
 def list_workers(auth=Depends(require_admin)):
     """List all connected worker nodes."""
     workers = worker_registry.list_workers()
-    return {
-        "items": [w.to_dict() for w in workers],
-        "total": len(workers),
-    }
+    return WorkerListResponse(
+        items=[w.to_dict() for w in workers],
+        total=len(workers),
+    )
 
 
 @router.get("/{worker_id}")
@@ -60,12 +94,12 @@ def get_worker(worker_id: str, auth=Depends(require_admin)):
     return worker.to_dict()
 
 
-@router.post("/{worker_id}/drain")
+@router.post("/{worker_id}/drain", response_model=OkResponse)
 def drain_worker(worker_id: str, auth=Depends(require_admin)):
     """Put a worker in drain mode — it will finish current jobs but accept no new ones."""
     if not worker_registry.drain_worker(worker_id):
         raise HTTPException(status_code=404, detail="Worker not found")
-    return {"ok": True, "message": f"Worker {worker_id} entering drain mode"}
+    return OkResponse(message=f"Worker {worker_id} entering drain mode")
 
 
 @router.delete("/{worker_id}")
@@ -83,12 +117,12 @@ async def disconnect_worker(worker_id: str, auth=Depends(require_admin)):
             pass
 
     worker_registry.unregister_worker(worker_id)
-    return {"ok": True, "message": f"Worker {worker_id} disconnected"}
+    return OkResponse(message=f"Worker {worker_id} disconnected")
 
 
 # ── Job Management ─────────────────────────────────────────────────────
 
-@router.get("/jobs")
+@router.get("/jobs", response_model=JobListResponse)
 def list_jobs(
     status: Optional[str] = Query(None, description="Filter by status"),
     capability: Optional[str] = Query(
@@ -97,22 +131,22 @@ def list_jobs(
 ):
     """List all jobs."""
     jobs = worker_registry.list_jobs(status=status, capability=capability)
-    return {
-        "items": [
-            {
-                "job_id": j.job_id,
-                "capability": j.capability,
-                "status": j.status,
-                "progress": j.progress,
-                "stage": j.stage,
-                "assigned_worker_id": j.assigned_worker_id,
-                "created_at": j.created_at,
-                "error": j.error,
-            }
+    return JobListResponse(
+        items=[
+            JobInfoResponse(
+                job_id=j.job_id,
+                capability=j.capability,
+                status=j.status,
+                progress=j.progress,
+                stage=j.stage,
+                assigned_worker_id=j.assigned_worker_id,
+                created_at=j.created_at,
+                error=j.error,
+            )
             for j in jobs
         ],
-        "total": len(jobs),
-    }
+        total=len(jobs),
+    )
 
 
 @router.post("/jobs")
@@ -132,23 +166,23 @@ async def submit_job(
     )
 
 
-@router.get("/jobs/{job_id}")
+@router.get("/jobs/{job_id}", response_model=JobInfoResponse)
 def get_job(job_id: str, auth=Depends(require_admin)):
     """Get status of a specific job."""
     job = worker_registry.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {
-        "job_id": job.job_id,
-        "capability": job.capability,
-        "status": job.status,
-        "progress": job.progress,
-        "stage": job.stage,
-        "assigned_worker_id": job.assigned_worker_id,
-        "created_at": job.created_at,
-        "output": job.output_data,
-        "error": job.error,
-    }
+    return JobInfoResponse(
+        job_id=job.job_id,
+        capability=job.capability,
+        status=job.status,
+        progress=job.progress,
+        stage=job.stage,
+        assigned_worker_id=job.assigned_worker_id,
+        created_at=job.created_at,
+        output=job.output_data,
+        error=job.error,
+    )
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -159,7 +193,7 @@ async def cancel_job(job_id: str, auth=Depends(require_admin)):
             status_code=400,
             detail="Job not found or already completed/failed",
         )
-    return {"ok": True, "message": f"Job {job_id} cancelled"}
+    return OkResponse(message=f"Job {job_id} cancelled")
 
 
 # ── Worker WebSocket ───────────────────────────────────────────────────

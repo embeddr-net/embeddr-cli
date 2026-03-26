@@ -1,8 +1,6 @@
 from typing import List, Optional, Any, Dict
-import re
 from uuid import UUID
 import copy
-import os
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlmodel import Session, select
 from sqlalchemy import or_
@@ -11,8 +9,6 @@ from pydantic import BaseModel
 from embeddr.db.session import get_session
 from embeddr_core.models.artifact import Artifact
 from embeddr_core.models.workflow import WorkflowArtifactMetadata, WorkflowPort, WorkflowImplementation
-from embeddr.core.execution_spine import ExecutionSpine
-from embeddr_core.services.config_service import resolve_plugin_config
 from embeddr.core.plugin_loader import get_all_plugin_instances, get_lotus_registry, _PLUGIN_CAPABILITY_REGISTRY
 from embeddr.core.event_bus import _EVENT_BUS
 from embeddr_core.plugin_interface import PluginContext
@@ -32,7 +28,7 @@ router = APIRouter(
 )
 
 TYPE_WORKFLOW = "workflow"
-LEGACY_WORKFLOW_TYPES = {"action:comfy.workflow"}
+LEGACY_WORKFLOW_TYPES: set[str] = set()
 
 
 def _require_operator_scope(auth) -> Optional[UUID]:
@@ -137,8 +133,7 @@ async def create_workflow(
     auth=Depends(get_auth_context),
 ):
     """
-    Creates a new Workflow Artifact.
-    Supports 'comfy-graph' import or 'core-transform' empty/template.
+    Creates a new Workflow Artifact from a template or payload.
     """
     name = payload.get("name", "Untitled Workflow")
     description = payload.get("description")
@@ -151,7 +146,7 @@ async def create_workflow(
     if graph:
         raise HTTPException(
             status_code=400,
-            detail="Direct ComfyUI graph import is deprecated. Use the workflow importer capabilities."
+            detail="Direct graph import is deprecated. Use the workflow importer capabilities."
         )
     elif template:
         # Load from defaults
@@ -352,7 +347,7 @@ async def run_workflow(
 ):
     """
     Run a workflow. 
-    Currently defaults to ComfyUI execution, but eventually this should be plugin-aware.
+    Run a workflow via its implementation type (lotus-action or lotus-composed).
     """
     artifact = session.get(Artifact, workflow_id)
     # Relax check to allow all "action:" types, and legacy "workflow"
@@ -503,122 +498,20 @@ async def run_workflow(
                     detail="core-transform workflows are deprecated. Use a Lotus action instead.",
                 )
 
-            implementation = workflow_meta.get("implementation", {})
-            graph = copy.deepcopy(implementation.get("payload", {}))
+            # For any other implementation type (e.g. plugin-specific graphs),
+            # dispatch through the plugin's Lotus capability instead of
+            # hardcoding execution logic here.  The plugin should register
+            # a "run_workflow" action that handles graph patching,
+            # endpoint resolution, and job submission.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported implementation type: {impl_type}. "
+                       "Use lotus-action or lotus-composed, or run via the plugin's Lotus dispatch.",
+            )
+
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Invalid workflow structure: {e}")
 
-    if not graph:
-        # For core-transform, graph might be empty but operation is in payload.
-        # But for ComfyUI, empty graph is an error.
-        if impl_type != "core-transform":
-            raise HTTPException(
-                status_code=400, detail="Workflow payload is empty")
-
-    # 2. Patch the graph with inputs
-    # Handle flat inputs via interface mapping
-    interface = artifact.metadata_json.get(
-        "interface") or artifact.metadata_json.get("graph", {}).get("interface", {})
-    exposed_inputs = interface.get("exposed_inputs", [])
-
-    for key, value in req.inputs.items():
-        # Check if direct node override (legacy/advanced)
-        # Assuming Node ID keys are usually distinct from label keys?
-        # A dictionary value almost certainly means node Override.
-        if isinstance(value, dict) and key in graph:
-            if "inputs" not in graph[key]:
-                graph[key]["inputs"] = {}
-            for k, v in value.items():
-                graph[key]["inputs"][k] = v
-            continue
-
-        # Try to resolve key from interface
-        target_input = None
-        # 1. Exact Label Match
-        for inp in exposed_inputs:
-            if inp.get("label") == key:
-                target_input = inp
-                break
-
-        # 1b. Fuzzy/Strip Match
-        if not target_input:
-            for inp in exposed_inputs:
-                lbl = inp.get("label")
-                if lbl and str(lbl).strip() == str(key).strip():
-                    target_input = inp
-                    break
-
-        # 2. Node_Port Match
-        if not target_input:
-            for inp in exposed_inputs:
-                if f"{inp.get('node')}_{inp.get('port')}" == key:
-                    target_input = inp
-                    break
-
-        # Apply if found
-        if target_input:
-            node_id = str(target_input.get("node"))
-            port_name = target_input.get("port")
-            if node_id in graph:
-                if "inputs" not in graph[node_id]:
-                    graph[node_id]["inputs"] = {}
-                graph[node_id]["inputs"][port_name] = value
-            # Case where graph has int keys (unlikely but possible if manually constructed)
-            elif int(node_id) in graph:
-                pass  # Cannot handle easily without normalizing graph keys, assuming strings
-
-    # Fix defaults for Embeddr nodes
-    for node_id, node in graph.items():
-        class_type = node.get("class_type") or node.get("type")
-        if class_type == "embeddr.SaveToFolder":
-            node_inputs = node.get("inputs", {})
-            if "library" not in node_inputs or not node_inputs["library"]:
-                node_inputs["library"] = "Default"
-            if "collection" not in node_inputs or not node_inputs["collection"]:
-                node_inputs["collection"] = "None"
-            if "caption" not in node_inputs:
-                node_inputs["caption"] = ""
-            node["inputs"] = node_inputs
-
-    endpoint_url = None
-    try:
-        cfg = resolve_plugin_config(
-            session=session,
-            plugin_name="embeddr-comfyui",
-            scope="global",
-            scope_id=None,
-        )
-        if isinstance(cfg, dict):
-            endpoint_url = cfg.get("endpoint_url")
-    except Exception:
-        endpoint_url = None
-
-    if not endpoint_url:
-        endpoint_url = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
-
-    if not endpoint_url:
-        raise HTTPException(
-            status_code=503, detail="ComfyUI endpoint is not configured")
-
-    job = ExecutionSpine.submit_job(
-        job_type="comfy.generate",
-        inputs={
-            "workflow": graph,
-            "inputs": req.inputs,
-            "client_id": "embeddr-workflows",
-            "endpoint_url": endpoint_url,
-            "workflow_artifact_id": str(workflow_id),
-        },
-        plugin_name="embeddr-comfyui",
-        resource_class="gpu",
-        priority=0,
-        parent_execution_id=None,
-        trigger="user",
-    )
-
-    return {
-        "status": "queued",
-        "execution_id": str(job.id),
-        "prompt_id": None,
-    }
+    # Should not reach here — all valid paths return above
+    raise HTTPException(status_code=400, detail="Workflow payload is empty")

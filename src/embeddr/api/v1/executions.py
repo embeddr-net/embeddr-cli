@@ -74,7 +74,7 @@ async def create_execution(
 
     # Extract auth context for execution ownership (enables WS event scoping)
     operator_id = getattr(auth, "operator_id", None) if auth else None
-    api_key_id = str(getattr(auth, "api_key_id", None)) if getattr(auth, "api_key_id", None) else None
+    api_key_id = getattr(auth, "api_key_id", None) if auth else None
     client_id = (request.headers.get("x-embeddr-client-id") or "").strip() or None
     tags = {}
     if client_id:
@@ -106,6 +106,13 @@ async def create_execution(
 
 
 # Legacy/Background Task runner removed - handled by Spine Worker
+
+
+@router.get("/active-count")
+def get_active_count(session: Session = Depends(get_session)):
+    """Fast count of pending + running executions for status widgets."""
+    from embeddr.core.execution_spine import _get_active_count
+    return {"active": _get_active_count(session)}
 
 
 @router.get("", response_model=List[ArtifactExecution])
@@ -196,25 +203,24 @@ async def wait_execution(
     """
     _notifier.activate()
 
-    # Check if already terminal
-    ex = await _fetch_execution(execution_id)
-    if not ex:
-        raise HTTPException(404, "Execution not found")
-    if ex.status in {"completed", "failed", "canceled"}:
-        return ex
-
-    # Register and await the event bus signal
+    # Register FIRST to avoid race where job completes between check and register
     loop = asyncio.get_running_loop()
     future = _notifier.register_async(execution_id, loop)
+
+    # Now check if already terminal
+    ex = await _fetch_execution(execution_id)
+    if not ex:
+        _notifier.unregister_async(execution_id)
+        raise HTTPException(404, "Execution not found")
+    if ex.status in {"completed", "failed", "canceled"}:
+        _notifier.unregister_async(execution_id)
+        return ex
+
+    # Await the event bus signal
     try:
         await asyncio.wait_for(future, timeout=max(0.0, timeout_s))
     except asyncio.TimeoutError:
         _notifier.unregister_async(execution_id)
-        # Return current state on timeout (same as before)
-        ex = await _fetch_execution(execution_id)
-        if not ex:
-            raise HTTPException(404, "Execution not found")
-        return ex
 
     # Re-fetch to return the full object
     ex = await _fetch_execution(execution_id)

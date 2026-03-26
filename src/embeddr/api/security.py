@@ -4,7 +4,7 @@ import logging
 from datetime import timedelta
 from fastapi import Security, HTTPException, Request, Depends, Response
 from fastapi.security import APIKeyHeader, APIKeyQuery
-from starlette.status import HTTP_403_FORBIDDEN
+from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 from sqlmodel import Session
 
 from embeddr.db.session import get_engine
@@ -53,7 +53,7 @@ async def get_api_key(
 
     if not raw_key:
         raise HTTPException(
-            status_code=HTTP_403_FORBIDDEN, detail="Missing credentials"
+            status_code=HTTP_401_UNAUTHORIZED, detail="Missing credentials"
         )
 
     # DB-backed keys/sessions
@@ -61,7 +61,7 @@ async def get_api_key(
         ctx = auth_service.resolve_auth_context(session, raw_key)
         if not ctx:
             raise HTTPException(
-                status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
+                status_code=HTTP_401_UNAUTHORIZED, detail="Could not validate credentials"
             )
         return raw_key
 
@@ -102,7 +102,7 @@ async def get_auth_context(
             request.url.path if request else "unknown",
         )
         raise HTTPException(
-            status_code=HTTP_403_FORBIDDEN, detail="Missing credentials"
+            status_code=HTTP_401_UNAUTHORIZED, detail="Missing credentials"
         )
 
     with Session(get_engine()) as session:
@@ -114,7 +114,7 @@ async def get_auth_context(
                 request.url.path if request else "unknown",
             )
             raise HTTPException(
-                status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
+                status_code=HTTP_401_UNAUTHORIZED, detail="Could not validate credentials"
             )
         logger.debug(
             "auth_success user=%s operator=%s is_admin=%s is_root=%s session_id=%s path=%s",

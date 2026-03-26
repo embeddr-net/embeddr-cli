@@ -47,6 +47,17 @@ def session_fixture(engine):
 
 
 # ---------------------------------------------------------------------------
+# Event bus fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(name="event_bus")
+def event_bus_fixture():
+    """Fresh SimpleEventBus instance per test."""
+    from embeddr.core.event_bus import SimpleEventBus
+    return SimpleEventBus()
+
+
+# ---------------------------------------------------------------------------
 # Execution spine fixtures
 # ---------------------------------------------------------------------------
 

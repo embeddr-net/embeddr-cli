@@ -76,7 +76,8 @@ def _load_content_config() -> dict:
                 _load_content_config._cache = cfg.get("content", {})
             else:
                 _load_content_config._cache = {}
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to load content config: %s", e)
             _load_content_config._cache = {}
     return _load_content_config._cache
 
@@ -274,6 +275,20 @@ def _resolve_uri_response(
     if not uri:
         return None
 
+    if uri.startswith("cloud://"):
+        key = uri[len("cloud://"):]
+        blob_ref = BlobRef(
+            provider="cloud",
+            bucket="cloud",
+            key=key,
+            path=uri,
+            etag=None,
+            content_type=None,
+            size=None,
+            artifact_id=artifact_id,
+        )
+        return resolve_response(blob_ref, purpose)
+
     if uri.startswith("s3://"):
         parsed = urlparse(uri)
         bucket = parsed.netloc
@@ -325,7 +340,8 @@ def _should_proxy_redirect(request: Request, url: Optional[str]) -> bool:
         request_netloc = urlparse(str(request.url)).netloc
         target_netloc = urlparse(url).netloc
         return bool(target_netloc and request_netloc and target_netloc != request_netloc)
-    except Exception:
+    except Exception as e:
+        logger.debug("Proxy redirect check failed: %s", e)
         return False
 
 
@@ -379,7 +395,8 @@ def _select_s3_provider(bucket: Optional[str]) -> str:
                 plugin_name="embeddr-storage-s3",
                 config_id="embeddr-storage-s3.config",
             ) or {}
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to load S3 plugin config for bucket %r: %s", bucket, e)
         return "s3"
 
     instances = cfg.get("instances")
@@ -538,8 +555,14 @@ def _owner_match_expr(auth):
 def _is_owner_of_artifact(artifact: Artifact, auth) -> bool:
     if not auth:
         return True
-    if getattr(auth, "is_open", False) or getattr(auth, "is_admin", False) or getattr(auth, "is_root", False):
+    if getattr(auth, "is_open", False) or getattr(auth, "is_root", False):
         return True
+    # is_admin is operator-scoped — still check operator boundary
+    if getattr(auth, "is_admin", False):
+        operator_id = getattr(auth, "operator_id", None)
+        if not operator_id or not artifact.owner_operator_id:
+            return True  # No operator scoping in play
+        return artifact.owner_operator_id == operator_id
 
     operator_id = getattr(auth, "operator_id", None)
     user_id = getattr(auth, "user_id", None)
@@ -667,15 +690,17 @@ def _apply_owner_filter(query, auth, access_scope: str = "instance"):
         query = query.where(_owner_match_expr(auth))
         return query
 
-    if auth and not auth.is_open and not auth.is_admin and not getattr(auth, "is_root", False):
-        # Operator-scoped: see own operator's artifacts + public artifacts
+    if auth and not auth.is_open and not getattr(auth, "is_root", False):
+        # Operator-scoped: see own operator's artifacts + public artifacts.
+        # is_admin grants admin within the operator, NOT cross-operator access.
+        # Only is_root (system superuser) bypasses operator scoping.
         query = query.where(
             or_(_owner_match_expr(auth), _public_visibility_expr()))
     return query
 
 
 def _filter_allowed_ids(session: Session, ids: List[UUID], auth) -> Set[UUID]:
-    if not auth or auth.is_open or auth.is_admin or getattr(auth, "is_root", False):
+    if not auth or auth.is_open or getattr(auth, "is_root", False):
         return set(ids)
 
     allowed_query = select(Artifact.id).where(Artifact.id.in_(ids))
@@ -1333,6 +1358,9 @@ def list_artifacts(
     import_source: Optional[str] = None,
     import_instance: Optional[str] = None,
     origin: Optional[str] = None,
+    source: Optional[str] = Query(None, description="Filter by source_namespace on relation edges (e.g. comfyui, plugin:stash)"),
+    created_after: Optional[str] = Query(None, description="ISO datetime — only artifacts created after this time"),
+    created_before: Optional[str] = Query(None, description="ISO datetime — only artifacts created before this time"),
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
@@ -1545,6 +1573,47 @@ def list_artifacts(
         query = query.where(origin_condition)
         count_query = count_query.where(origin_condition)
 
+    # Filter by source_namespace on relation edges
+    if source:
+        source = source.strip()
+        # Find artifacts that appear in any relation created by this source
+        source_subq = select(ArtifactRelation.source_id).where(
+            ArtifactRelation.source_namespace == source
+        )
+        target_subq = select(ArtifactRelation.target_id).where(
+            ArtifactRelation.source_namespace == source
+        )
+        # Also check metadata_json "source" field as fallback
+        source_meta = or_(
+            cast(Artifact.metadata_json, String).contains(f'"source": "{source}"'),
+            cast(Artifact.metadata_json, String).contains(f'"source":"{source}"'),
+        )
+        source_condition = or_(
+            Artifact.id.in_(source_subq),
+            Artifact.id.in_(target_subq),
+            source_meta,
+        )
+        query = query.where(source_condition)
+        count_query = count_query.where(source_condition)
+
+    # Date range filters
+    if created_after:
+        try:
+            from datetime import datetime as dt
+            after_dt = dt.fromisoformat(created_after)
+            query = query.where(Artifact.created_at >= after_dt)
+            count_query = count_query.where(Artifact.created_at >= after_dt)
+        except (ValueError, TypeError):
+            pass
+    if created_before:
+        try:
+            from datetime import datetime as dt
+            before_dt = dt.fromisoformat(created_before)
+            query = query.where(Artifact.created_at <= before_dt)
+            count_query = count_query.where(Artifact.created_at <= before_dt)
+        except (ValueError, TypeError):
+            pass
+
     total_count = session.exec(count_query).one()
 
     # Sort
@@ -1638,6 +1707,29 @@ def get_artifact(
         artifact,
         include_owner_profiles=include_owner_profiles,
     )
+
+
+@router.get("/{artifact_id}/provenance")
+def get_artifact_provenance(
+    artifact_id: str,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Get the provenance chain for an artifact — its creation story.
+
+    Returns the artifact's inputs (what it was made from), outputs (what was
+    made from it), the execution that created it, semantic relations, and
+    brand info for each source system involved.
+    """
+    from embeddr.services.provenance_service import get_artifact_provenance as _get_provenance
+
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+    _ensure_artifact_access(session, artifact_uuid, auth)
+
+    try:
+        return _get_provenance(session, artifact_uuid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/{artifact_id}/content")
@@ -2132,13 +2224,43 @@ def get_artifact_subgraph(
 @router.get("/{artifact_id}/relations", deprecated=True,
             description="Deprecated: use GET /api/graph/relations?source_id={id} instead.")
 def get_artifact_relations(
-    artifact_id: UUID,
+    artifact_id: str,
     session: Session = Depends(get_session),
     auth=Depends(get_auth_context),
 ):
     """Deprecated — use GET /api/graph/relations?source_id={artifact_id}."""
-    from embeddr.api.v1.graph import list_relations
-    return list_relations(source_id=artifact_id, session=session, auth=auth)
+    artifact_uuid = _coerce_uuid(artifact_id, "artifact_id")
+
+    outgoing = session.exec(
+        select(ArtifactRelation).where(
+            ArtifactRelation.source_id == artifact_uuid
+        ).limit(100)
+    ).all()
+    incoming = session.exec(
+        select(ArtifactRelation).where(
+            ArtifactRelation.target_id == artifact_uuid
+        ).limit(100)
+    ).all()
+
+    results = []
+    for rel in outgoing:
+        results.append({
+            "id": str(rel.id) if hasattr(rel, "id") else None,
+            "source_id": str(rel.source_id),
+            "target_id": str(rel.target_id),
+            "relation_type": rel.relation_type,
+            "source_namespace": rel.source_namespace,
+        })
+    for rel in incoming:
+        results.append({
+            "id": str(rel.id) if hasattr(rel, "id") else None,
+            "source_id": str(rel.source_id),
+            "target_id": str(rel.target_id),
+            "relation_type": rel.relation_type,
+            "source_namespace": rel.source_namespace,
+        })
+
+    return results
 
 
 @router.get("/{artifact_id}/preview")

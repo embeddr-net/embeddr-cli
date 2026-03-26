@@ -1121,6 +1121,40 @@ def login_with_password(
     }
 
 
+@router.get("/auth/session")
+def auth_session_from_key(
+    request: Request,
+    key: str = Query(..., description="API key to authenticate with"),
+    redirect: str = Query("/", description="URL to redirect to after auth"),
+    session: Session = Depends(get_session),
+):
+    """
+    Authenticate via API key and redirect. Sets the auth cookie so the
+    browser session is authenticated for subsequent requests.
+    Used by the hosted dashboard to log users into their workspace.
+    """
+    from fastapi.responses import RedirectResponse as _Redirect
+
+    ctx = auth_service.resolve_auth_context(session, key)
+    if not ctx or not ctx.authenticated:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    auth_session_obj, session_token = auth_service.create_auth_session(
+        session,
+        user_id=ctx.user_id,
+        operator_id=ctx.operator_id,
+        api_key_id=ctx.api_key_id,
+        session_name="dashboard-login",
+        auth_method="api_key",
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_request_client_ip(request),
+    )
+
+    resp = _Redirect(url=redirect, status_code=302)
+    set_auth_cookie(resp, request, session_token)
+    return resp
+
+
 @router.post("/logout")
 def logout(
     request: Request,

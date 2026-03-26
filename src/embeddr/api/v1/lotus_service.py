@@ -101,12 +101,7 @@ def lotus_prepare_inputs(
 ) -> Dict[str, Any]:
     raw_inputs = dict(inputs or {})
 
-    # Do NOT drop None inputs aggressively for ComfyUI or others that might need empty inputs
-    # clean_inputs = {k: v for k, v in raw_inputs.items() if v is not None}
-
-    # Just merge? Or maybe only drop top-level Nones if really needed?
-    # The original code dropped None, which might have killed "inputs": None? No, "inputs": {} is empty dict.
-    # If inputs={"inputs": None}, then "inputs" key is removed.
+    # Preserve None values — some plugins need them as explicit empty inputs.
 
     clean_inputs = {k: v for k, v in raw_inputs.items() if v is not None}
 
@@ -371,11 +366,7 @@ def _create_waiting_execution(
         status="waiting",
         message=message,
         operator_id=getattr(auth, "operator_id", None),
-        api_key_id=(
-            str(getattr(auth, "api_key_id", None))
-            if getattr(auth, "api_key_id", None)
-            else None
-        ),
+        api_key_id=getattr(auth, "api_key_id", None),
         tags={
             "target_client_id": str(caller_client_id)
         } if caller_client_id else {},

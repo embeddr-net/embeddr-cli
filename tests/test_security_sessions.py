@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -14,8 +15,11 @@ from embeddr_core.models.operator import Operator
 from embeddr_core.models.user_account import UserAccount
 
 
-os.environ["EMBEDDR_AUTH_MODE"] = "multi"
-os.environ["EMBEDDR_AUTH_SALT"] = "test-auth-salt-0123456789abcdef0123456789abcdef"
+@pytest.fixture(autouse=True)
+def _auth_env(monkeypatch):
+    """Set auth env vars for this module only, restore after each test."""
+    monkeypatch.setenv("EMBEDDR_AUTH_MODE", "multi")
+    monkeypatch.setenv("EMBEDDR_AUTH_SALT", "test-auth-salt-0123456789abcdef0123456789abcdef")
 
 
 def _build_app(engine) -> FastAPI:
@@ -118,7 +122,7 @@ def test_logout_revokes_only_current_session(engine):
             whoami_one = client_one.get("/api/v1/security/whoami")
             whoami_two = client_two.get("/api/v1/security/whoami")
 
-            assert whoami_one.status_code == 403
+            assert whoami_one.status_code == 401
             assert whoami_two.status_code == 200
 
 
@@ -148,7 +152,7 @@ def test_sessions_endpoint_lists_and_revokes_owned_sessions(engine):
             assert revoke.status_code == 200
 
             whoami = client.get("/api/v1/security/whoami")
-            assert whoami.status_code == 403
+            assert whoami.status_code == 401
 
 
 def test_refresh_session_rotates_token_and_keeps_auth(engine):
@@ -210,7 +214,7 @@ def test_logout_all_revokes_other_sessions_but_keeps_current_by_default(engine):
             whoami_one = client_one.get("/api/v1/security/whoami")
             whoami_two = client_two.get("/api/v1/security/whoami")
             assert whoami_one.status_code == 200
-            assert whoami_two.status_code == 403
+            assert whoami_two.status_code == 401
 
 
 def test_switch_client_session_within_operator(engine):

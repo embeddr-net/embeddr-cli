@@ -134,9 +134,11 @@ class AuthContext:
 class BootstrapAdminResult:
     root_user: UserAccount
     root_key: str
+    root_password: Optional[str] = None
     user_operator_name: Optional[str] = None
     user_username: Optional[str] = None
     user_key: Optional[str] = None
+    user_password: Optional[str] = None
 
 
 def get_auth_mode() -> str:
@@ -153,6 +155,10 @@ def get_auth_mode() -> str:
                 return cfg_mode
     except Exception:
         pass
+    # Cloud mode defaults to "db" auth (full RBAC)
+    from embeddr.core.config import is_cloud_mode
+    if is_cloud_mode():
+        return "db"
     return "open"
 
 
@@ -178,6 +184,12 @@ def _auth_salt() -> str:
         return fallback
 
     if not salt or salt == "embeddr-local":
+        from embeddr.core.config import is_cloud_mode
+        if is_cloud_mode():
+            raise RuntimeError(
+                "Cloud mode requires EMBEDDR_AUTH_SALT to be set. "
+                "Set EMBEDDR_AUTH_SALT (recommended >=32 random chars) before starting."
+            )
         recovered = _recover_or_create_auth_salt()
         if recovered:
             return recovered
@@ -618,14 +630,10 @@ def ensure_first_party_clients(
     """Ensure built-in first-party service clients exist. Returns status per client."""
     from embeddr_core.models.service_client import ServiceClient
 
+    # Only core first-party clients go here. Plugin-specific clients
+    # (e.g. ComfyUI) should be registered by their respective plugins
+    # via the service client API.
     first_party = {
-        "embeddr:comfyui": {
-            "name": "ComfyUI",
-            "description": "Embeddr ComfyUI integration",
-            "redirect_uris": ["http://localhost:8188/embeddr/callback", "http://127.0.0.1:8188/embeddr/callback"],
-            "allowed_scopes": ["artifacts:read", "artifacts:write", "collections:read", "executions:read"],
-            "grant_types": ["authorization_code", "client_credentials"],
-        },
         "embeddr:nelumbo": {
             "name": "Nelumbo",
             "description": "Embeddr admin panel",
@@ -688,6 +696,23 @@ def touch_auth_session(session: Session, auth_session: AuthSession) -> None:
     auth_session.last_used_at = datetime.now(timezone.utc)
     session.add(auth_session)
     session.commit()
+
+
+def cleanup_expired_sessions(session: Session) -> int:
+    """Remove expired and revoked sessions. Returns count of deleted rows."""
+    now = datetime.now(timezone.utc)
+    expired = session.exec(
+        select(AuthSession).where(
+            (AuthSession.expires_at != None) & (AuthSession.expires_at < now)  # noqa: E711
+            | (AuthSession.revoked_at != None)  # noqa: E711
+        )
+    ).all()
+    count = len(expired)
+    for s in expired:
+        session.delete(s)
+    if count > 0:
+        session.commit()
+    return count
 
 
 def revoke_auth_session(session: Session, auth_session: AuthSession) -> None:
@@ -787,6 +812,16 @@ def resolve_auth_context(session: Session, raw_credential: str) -> Optional[Auth
                 session_id=auth_session.id,
             )
 
+        # Verify the operator is still active
+        if ctx and ctx.operator_id:
+            operator = session.get(Operator, ctx.operator_id)
+            if operator and not operator.is_active:
+                logger.warning(
+                    "auth_rejected reason=inactive_operator operator_id=%s user=%s",
+                    ctx.operator_id, ctx.username,
+                )
+                return None
+
         touch_auth_session(session, auth_session)
         ctx.session_id = auth_session.id
         return ctx
@@ -795,6 +830,17 @@ def resolve_auth_context(session: Session, raw_credential: str) -> Optional[Auth
     if not api_key:
         return None
     ctx = build_auth_context(session, api_key, raw_credential)
+
+    # Verify the operator is still active for API key auth too
+    if ctx and ctx.operator_id:
+        operator = session.get(Operator, ctx.operator_id)
+        if operator and not operator.is_active:
+            logger.warning(
+                "auth_rejected reason=inactive_operator operator_id=%s key_prefix=%s",
+                ctx.operator_id, raw_credential[:8] if raw_credential else "?",
+            )
+            return None
+
     touch_api_key(session, api_key)
     return ctx
 
@@ -807,8 +853,10 @@ def create_api_key(
     name: str,
     scopes: Optional[List[str]] = None,
     permissions: Optional[List[str]] = None,
+    raw_key: Optional[str] = None,
 ) -> Tuple[ApiKey, str]:
-    raw_key = f"em_{secrets.token_urlsafe(32)}"
+    if not raw_key:
+        raw_key = f"em_{secrets.token_urlsafe(32)}"
     key_hash = hash_api_key(raw_key)
     key_prefix = raw_key[:8]
 
@@ -931,15 +979,23 @@ def ensure_default_admin(
         default_password="password",
     )
 
+    # Use pre-determined API key from env if provided (cloud mode provisioning)
+    bootstrap_key = os.environ.get("EMBEDDR_BOOTSTRAP_API_KEY", "").strip() or None
+
     root_api_key, root_raw_key = create_api_key(
         session,
         user_id=root_user.id,
         operator_id=root_operator.id,
         name="server-admin",
         scopes=["*"],
+        raw_key=bootstrap_key,
     )
 
-    result = BootstrapAdminResult(root_user=root_user, root_key=root_raw_key)
+    result = BootstrapAdminResult(
+        root_user=root_user,
+        root_key=root_raw_key,
+        root_password="password",
+    )
 
     if mode == "single":
         user_operator = _ensure_operator(
@@ -965,6 +1021,7 @@ def ensure_default_admin(
         result.user_operator_name = user_operator.name
         result.user_username = user.username
         result.user_key = user_raw_key
+        result.user_password = "password"
 
     return result
 

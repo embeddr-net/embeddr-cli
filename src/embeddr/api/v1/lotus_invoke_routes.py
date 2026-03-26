@@ -141,31 +141,13 @@ def _normalize_legacy_inputs(
     action_name: str,
     inputs: Dict[str, Any],
 ) -> Dict[str, Any]:
-    normalized = dict(inputs or {})
+    """Normalize inputs for legacy compatibility.
 
-    is_comfy = plugin_name == "embeddr-comfyui"
-    comfy_workflow_actions = {
-        "embeddr-comfyui.get_workflow",
-        "embeddr-comfyui.run_workflow",
-        "embeddr-comfyui.resolve_workflow_inputs",
-    }
-    if (
-        is_comfy
-        and cap_id in comfy_workflow_actions
-        and "workflow_id" not in normalized
-        and normalized.get("id")
-    ):
-        normalized["workflow_id"] = normalized["id"]
-
-    if (
-        is_comfy
-        and action_name in comfy_workflow_actions
-        and "workflow_id" not in normalized
-        and normalized.get("id")
-    ):
-        normalized["workflow_id"] = normalized["id"]
-
-    return normalized
+    Plugin-specific input transformations should be handled in plugin
+    middleware, not here.  This function only applies generic
+    normalisations.
+    """
+    return dict(inputs or {})
 
 
 def _resolve_wait_timeout_seconds(inputs: Dict[str, Any]) -> float:
@@ -276,7 +258,16 @@ async def lotus_invoke(
             if _config_caps:
                 _config_cap_id = _config_caps[0].id
         except Exception:
-            pass
+            logger.warning(
+                "Failed to resolve config capability for plugin %s", plugin_name, exc_info=True,
+            )
+
+        from contextlib import contextmanager as _cm
+
+        @_cm
+        def _make_session():
+            with Session(get_engine()) as s:
+                yield s
 
         ctx = PluginContext(
             bus=_EVENT_BUS,
@@ -288,6 +279,7 @@ async def lotus_invoke(
                 config_id=_config_cap_id,
             ),
             lotus=LotusContext(session=session),
+            db_session_factory=_make_session,
             user_id=getattr(auth, "user_id", None),
             operator_id=getattr(auth, "operator_id", None),
             is_admin=bool(getattr(auth, "is_admin", False)),

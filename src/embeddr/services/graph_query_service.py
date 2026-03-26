@@ -258,9 +258,17 @@ def get_graph_taxonomy_payload(session: Session) -> Dict[str, Any]:
         for key, values in sorted(group_map.items(), key=lambda item: item[0])
     ]
 
+    # Include registered source brands from plugin-driven registry
+    try:
+        from embeddr_core.services.source_brand_registry import get_source_brand_registry
+        source_brands = get_source_brand_registry().to_dict()
+    except Exception:
+        source_brands = {}
+
     return {
         "relation_families": taxonomy["families"],
         "relation_types": taxonomy["types"],
         "source_namespaces": namespaces,
         "namespace_groups": namespace_groups,
+        "source_brands": source_brands,
     }

@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Request, HTTPException, Response, Depends, Body
 from starlette.routing import Mount
 from pydantic import BaseModel
@@ -51,6 +52,7 @@ from embeddr.core.plugin_loader import get_lotus_registry
 from embeddr_core.models.lotus import LotusKind
 
 router = APIRouter()
+logger = logging.getLogger("embeddr.api.v1.system")
 
 
 class AuthSessionRequest(BaseModel):
@@ -119,6 +121,48 @@ class ArtifactTypeCountsResponse(BaseModel):
     total_artifacts: int
 
 
+class SystemInfoDbResponse(BaseModel):
+    provider: str = ""
+    url: Dict[str, Any] = {}
+    supports_backup: bool = False
+    latest_backup: Optional[str] = None
+    ok: Optional[bool] = None
+    error: Optional[str] = None
+
+
+class SystemInfoStatsResponse(BaseModel):
+    images: int = 0
+    libraries: int = 0
+    artifacts: int = 0
+    collections: int = 0
+
+
+class SystemInfoResponse(BaseModel):
+    version: str
+    dev_mode: bool = False
+    instance: Dict[str, Any] = {}
+    db_version: Optional[str] = None
+    db: SystemInfoDbResponse = SystemInfoDbResponse()
+    stats: SystemInfoStatsResponse = SystemInfoStatsResponse()
+
+
+class SystemBannerResponse(BaseModel):
+    name: str = "Embeddr"
+    description: Optional[str] = None
+    motd: Optional[str] = None
+    logo_url: Optional[str] = None
+    favicon_url: Optional[str] = None
+    banner_text: Optional[str] = None
+    banner_type: str = "info"
+    banner_enabled: bool = False
+    version: Optional[str] = None
+
+
+class ResourceInfoResponse(BaseModel):
+    resources: List[Dict[str, Any]]
+    total_memory_bytes: int = 0
+
+
 def _relation_ontology_snapshot() -> RelationOntologyResponse:
     relation_types = [
         RelationTypeDefResponse(
@@ -174,8 +218,8 @@ def _load_instance_profile(session: Session) -> Dict[str, Any]:
         row = session.exec(stmt).first()
         if row and isinstance(row.value, dict):
             return {**fallback, **row.value}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load instance profile: %s", e)
     return fallback
 
 
@@ -235,7 +279,8 @@ def _get_db_revision(engine) -> Optional[str]:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection)
             return context.get_current_revision()
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to get DB revision: %s", e)
         return None
 
 
@@ -288,7 +333,8 @@ def _get_latest_sqlite_backup() -> Optional[str]:
             return None
         backups = sorted(backup_dir.glob(f"{db_path.name}.*.bak"))
         return str(backups[-1]) if backups else None
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to find latest SQLite backup: %s", e)
         return None
 
 
@@ -392,9 +438,12 @@ def get_artifact_registry(
 
             origin = metadata.get("origin")
             if not origin:
-                comfy_meta = metadata.get("comfy_meta") or {}
-                if isinstance(comfy_meta, dict):
-                    origin = comfy_meta.get("origin")
+                # Fallback: plugins may store origin under nested metadata keys
+                for nested_key in ("comfy_meta", "plugin_meta"):
+                    nested = metadata.get(nested_key) or {}
+                    if isinstance(nested, dict) and nested.get("origin"):
+                        origin = nested["origin"]
+                        break
             if origin:
                 origins.add(str(origin))
 
@@ -607,7 +656,8 @@ def upsert_automation(
         if payload.id:
             try:
                 automation = session.get(Automation, UUID(payload.id))
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to look up automation %r: %s", payload.id, e)
                 automation = None
 
         if automation is None:
@@ -834,8 +884,8 @@ def apply_ingestion_defaults(
     }
 
 
-@router.get("/info")
-def get_system_info(auth=Depends(require_permission("system:read"))) -> Dict[str, Any]:
+@router.get("/info", response_model=SystemInfoResponse)
+def get_system_info(auth=Depends(require_permission("system:read"))):
     engine = get_engine()
     db_url = settings.DATABASE_URL
     db_provider = (settings.DATABASE_URL or "").split(":", 1)[0]
@@ -872,7 +922,8 @@ def get_system_info(auth=Depends(require_permission("system:read"))) -> Dict[str
             """,
             {"base": "collection", "type_like": "collection:%"},
         )
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to query artifact counts for system info: %s", e)
         images = 0
         libraries = 0
         artifacts = 0
@@ -965,7 +1016,7 @@ def set_instance_profile(
     return InstanceProfile(**(row.value if isinstance(row.value, dict) else next_value))
 
 
-@router.get("/banner")
+@router.get("/banner", response_model=SystemBannerResponse)
 def get_system_banner(
     session: Session = Depends(get_session),
 ):
@@ -974,17 +1025,17 @@ def get_system_banner(
     No auth required so workers and unauthenticated clients can read it.
     """
     profile = _load_instance_profile(session)
-    return {
-        "name": profile.get("name", "Embeddr"),
-        "description": profile.get("description"),
-        "motd": profile.get("motd"),
-        "logo_url": profile.get("logo_url"),
-        "favicon_url": profile.get("favicon_url"),
-        "banner_text": profile.get("banner_text"),
-        "banner_type": profile.get("banner_type", "info"),
-        "banner_enabled": profile.get("banner_enabled", False),
-        "version": _get_backend_version(),
-    }
+    return SystemBannerResponse(
+        name=profile.get("name", "Embeddr"),
+        description=profile.get("description"),
+        motd=profile.get("motd"),
+        logo_url=profile.get("logo_url"),
+        favicon_url=profile.get("favicon_url"),
+        banner_text=profile.get("banner_text"),
+        banner_type=profile.get("banner_type", "info"),
+        banner_enabled=profile.get("banner_enabled", False),
+        version=_get_backend_version(),
+    )
 
 
 class BackupRequest(BaseModel):
@@ -1045,7 +1096,7 @@ def run_cli_command(
     # Construct command: python -m embeddr.cli [args]
     # We use sys.executable to ensure we use the same venv
     full_cmd = [sys.executable, "-m", "embeddr.cli"] + cmd.args
-    print(f"Executing CLI command: {' '.join(full_cmd)}")
+    logger.info("Executing CLI command: %s", " ".join(full_cmd))
 
     try:
         result = subprocess.run(
@@ -1057,9 +1108,9 @@ def run_cli_command(
 
         # Log output to server console for debugging
         if result.stdout:
-            print(f"CLI STDOUT:\n{result.stdout}")
+            logger.debug("CLI STDOUT:\n%s", result.stdout)
         if result.stderr:
-            print(f"CLI STDERR:\n{result.stderr}")
+            logger.warning("CLI STDERR:\n%s", result.stderr)
 
         return {
             "success": result.returncode == 0,
@@ -1069,7 +1120,7 @@ def run_cli_command(
             "command": " ".join(full_cmd)
         }
     except Exception as e:
-        print(f"CLI EXECUTION ERROR: {e}")
+        logger.error("CLI execution error for %r: %s", " ".join(full_cmd), e)
         return {
             "success": False,
             "error": str(e),
@@ -1186,8 +1237,8 @@ def debug_status(
         lotus_info["plugins"] = sorted(set(
             c.plugin for c in actions + features if c.plugin
         ))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load lotus registry for debug status: %s", e)
 
     return {
         "executions": {

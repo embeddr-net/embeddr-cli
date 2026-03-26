@@ -285,17 +285,3 @@ def process_event_sync(msg_type, msg_data):
     pass
 
 
-async def monitor_comfy_events():
-    """
-    LEGACY / DEPRECATED
-    Logic moved to embeddr-plugins/plugins/core/embeddr_comfyui/monitor.py
-    This function should no longer be called.
-    """
-    pass
-
-
-async def poll_stuck_generations():
-    """
-    LEGACY / DEPRECATED
-    """
-    pass

@@ -7,6 +7,20 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def is_cloud_mode() -> bool:
+    """Check if running in cloud/hosted mode.
+
+    Set EMBEDDR_CLOUD_MODE=1 (or true/yes) to enable.
+    Cloud mode:
+    - Uses DATABASE_URL env var (no default SQLite)
+    - Reads auth salt from env var (no filesystem fallback)
+    - Disables plugin auto-install
+    - Suppresses interactive console output
+    - Sets auth mode to 'db' by default
+    """
+    return os.environ.get("EMBEDDR_CLOUD_MODE", "").lower() in ("1", "true", "yes")
+
+
 def get_data_dir() -> Path:
     """
     Return the data directory path.
@@ -37,6 +51,13 @@ def get_data_dir() -> Path:
 
 
 def get_db_url():
+    """Return the database URL.
+
+    Priority: DATABASE_URL env var > SQLite at data_dir/embeddr.db.
+    """
+    if env := os.environ.get("DATABASE_URL"):
+        return env
+
     data_dir = get_data_dir()
     os.makedirs(data_dir, exist_ok=True)
     return f"sqlite:///{os.path.join(data_dir, 'embeddr.db')}"
@@ -71,6 +92,7 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 20
     DB_POOL_TIMEOUT: int = 60
     VECTOR_STORAGE_DIR: Path = Field(default_factory=get_vector_storage_dir)
+    EMBEDDR_CLOUD_MODE: bool = Field(default=False)
 
 
 @lru_cache()

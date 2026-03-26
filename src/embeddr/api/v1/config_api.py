@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from embeddr_core.services.config_service import resolve_plugin_config, set_plugin_config
@@ -80,6 +81,18 @@ def put_config(
             scope_id=payload.scope_id,
             config_id=payload.config_id,
         )
+
+        # Notify the plugin that its config changed
+        try:
+            from embeddr.core.plugin_loader import get_plugin_instance
+            plugin = get_plugin_instance(plugin_name)
+            if plugin and hasattr(plugin, "on_config_changed"):
+                plugin.on_config_changed(value)
+        except Exception:
+            logging.getLogger("embeddr.api.config").warning(
+                "Plugin %s on_config_changed callback failed", plugin_name, exc_info=True,
+            )
+
         return ConfigSetResponse(
             plugin=plugin_name,
             config_id=payload.config_id,

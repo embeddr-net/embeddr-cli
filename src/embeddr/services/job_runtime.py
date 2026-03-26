@@ -2,6 +2,7 @@ import logging
 import asyncio
 import re
 from typing import Dict, Any, Optional
+from uuid import UUID
 
 from sqlmodel import Session, SQLModel, select
 from sqlalchemy import event
@@ -16,6 +17,36 @@ from embeddr.core.plugin_loader import get_lotus_registry
 
 
 logger = logging.getLogger("embeddr.runtime")
+
+
+def _extract_parent_execution_id(event: EmbeddrEvent) -> Optional[UUID]:
+    """Extract a parent execution ID from event metadata tags.
+
+    Looks for tags matching the pattern ``*_job_id:<uuid>`` (e.g.
+    ``sys_job_id:...``) in the event payload's metadata.  This is a
+    generic mechanism — plugins tag their outputs with a job ID so the
+    runtime can link child executions to parents.
+    """
+    try:
+        payload = event.payload or {}
+        meta = payload.get("metadata_json") or {}
+        tags = meta.get("tags") or []
+        if isinstance(tags, str):
+            tags = tags.split(",")
+
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            tag = tag.strip()
+            if "_job_id:" not in tag:
+                continue
+            try:
+                return UUID(tag.split(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+    except Exception:
+        pass
+    return None
 
 
 class JobRuntime:
@@ -199,32 +230,7 @@ class JobRuntime:
             event.event_type,
         )
 
-        parent_execution_id = None
-        try:
-            payload = event.payload or {}
-            meta = payload.get("metadata_json") or {}
-            tags = (meta.get("comfy_meta") or {}).get(
-                "tags") or meta.get("tags") or []
-            if isinstance(tags, str):
-                tags = tags.split(",")
-
-            for tag in tags:
-                if not isinstance(tag, str):
-                    continue
-                normalized = tag.strip()
-                if not (
-                    normalized.startswith("comfy_job_id:")
-                    or normalized.startswith("sys_job_id:")
-                ):
-                    continue
-                from uuid import UUID
-                try:
-                    parent_execution_id = UUID(normalized.split(":", 1)[1])
-                    break
-                except ValueError:
-                    pass
-        except Exception:
-            pass
+        parent_execution_id = _extract_parent_execution_id(event)
 
         def resolve_value(value: Any, payload: Dict[str, Any]) -> Any:
             if isinstance(value, dict):
@@ -421,11 +427,11 @@ class JobRuntime:
 
         try:
             batch_size = int(batch_size or 1)
-        except Exception:
+        except (ValueError, TypeError):
             batch_size = 1
         try:
             batch_wait_s = float(batch_wait_s or 2.0)
-        except Exception:
+        except (ValueError, TypeError):
             batch_wait_s = 2.0
 
         return max(1, batch_size), max(0.5, batch_wait_s)

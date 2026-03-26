@@ -97,7 +97,8 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
                 registry_data = manifest_data.get("registry")
                 if isinstance(registry_data, dict):
                     registry_meta = registry_data
-            except Exception:
+            except (OSError, json.JSONDecodeError, ValueError) as e:
+                logger.debug("Failed to read plugin manifest %s: %s", manifest_path, e)
                 registry_meta = {}
 
         display_name = registry_meta.get("name") if isinstance(registry_meta.get("name"), str) else None
@@ -208,7 +209,8 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
     logger.debug(f"Scanning for Python plugins in {plugins_dir}...")
     import typer
 
-    disabled_plugins = load_disabled_plugins()
+    from embeddr.core.plugin_discovery import resolve_plugin_filter
+    plugin_filter = resolve_plugin_filter()
 
     def _maybe_install_requirements(p_dir: Path) -> None:
         if str(os.environ.get("EMBEDDR_PLUGINS_AUTO_INSTALL", "")).lower() not in (
@@ -240,9 +242,13 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
                 "[PluginLoader] Dependency install failed for %s: %s", p_dir.name, exc)
 
     def process_plugin_dir(p_dir: Path):
-        if p_dir.name in disabled_plugins:
-            logger.info(
-                "[PluginLoader] Skipping disabled plugin %s", p_dir.name)
+        if not plugin_filter.should_load(p_dir.name):
+            logger.debug(
+                "[PluginLoader] Skipping plugin %s (filter: %s%s)",
+                p_dir.name,
+                plugin_filter.mode,
+                f", profile={plugin_filter.profile_name}" if plugin_filter.profile_name else "",
+            )
             return
         plugin_file = p_dir / "plugin.py"
         if not plugin_file.exists():
@@ -290,7 +296,10 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
             spec.loader.exec_module(module)
 
             # 1) Class-based Plugin (New System)
+            # The loader discovers the first EmbeddrPlugin subclass
+            # defined in the module and instantiates it.
             plugin_instance = None
+            plugin_candidates = []
             for name, obj in inspect.getmembers(module):
                 if (
                     inspect.isclass(obj)
@@ -298,8 +307,18 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
                     and obj is not EmbeddrPlugin
                     and obj.__module__ == module.__name__
                 ):
-                    plugin_instance = obj()
-                    break
+                    plugin_candidates.append((name, obj))
+
+            if len(plugin_candidates) > 1:
+                names = [n for n, _ in plugin_candidates]
+                logger.warning(
+                    "[PluginLoader] Multiple EmbeddrPlugin subclasses in %s: %s — using %s. "
+                    "Define a single plugin class per module.",
+                    folder_module_name, names, names[0],
+                )
+
+            if plugin_candidates:
+                plugin_instance = plugin_candidates[0][1]()
 
             if plugin_instance:
                 # Canonical module name based on the plugin's declared name
@@ -753,7 +772,12 @@ def _reconcile_artifact_types() -> None:
             spec = ArtifactTypeSpec.model_validate(entry["spec"])
             pending.append({"spec": spec, "plugin": entry.get("plugin")})
         except Exception as e:
-            logger.warning("Invalid artifact type spec: %s", e)
+            logger.warning(
+                "Invalid artifact type spec from plugin %s: %s (keys: %s)",
+                entry.get("plugin", "unknown"),
+                e,
+                list(entry["spec"].keys()) if isinstance(entry.get("spec"), dict) else "?",
+            )
 
     if not pending:
         return
