@@ -11,5 +11,8 @@ wheels/
 .venv
 *venv
 
+.env
+
 # Local API frontend build
 src/embeddr/web/*
+src/embeddr/nelumbo/web/*
