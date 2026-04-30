@@ -177,7 +177,7 @@ def lotus_list(
     kind: Optional[LotusKind] = Query(None),
     plugin: Optional[str] = Query(None),
     slot: Optional[str] = Query(None),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     auth=Depends(get_auth_context),
 ):

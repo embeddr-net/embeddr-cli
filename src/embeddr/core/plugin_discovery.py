@@ -238,6 +238,16 @@ def load_disabled_plugins() -> set[str]:
 
 
 def iter_plugin_dirs(plugins_dir: Path) -> Iterable[Path]:
+    """Yield plugin directories from a plugins root.
+
+    Auto-detects whether a top-level directory is a plugin or a category:
+      - has its own `plugin.py` → it's a plugin, yield it
+      - has children with `plugin.py` → it's a category, yield each child
+      - falls back to the legacy PLUGIN_CATEGORY_FOLDERS allowlist
+
+    This means users can group plugins under any folder name (apps/, dev/,
+    effects/, my-grouping/) without editing a hardcoded list.
+    """
     if not plugins_dir.exists() or not plugins_dir.is_dir():
         return
 
@@ -245,10 +255,21 @@ def iter_plugin_dirs(plugins_dir: Path) -> Iterable[Path]:
         if not item.is_dir():
             continue
 
-        if item.name in PLUGIN_CATEGORY_FOLDERS:
+        # 1. If this directory is itself a plugin, yield it directly.
+        if (item / "plugin.py").exists():
+            yield item
+            continue
+
+        # 2. If any of its children are plugins, treat it as a category.
+        has_plugin_children = any(
+            (sub / "plugin.py").exists()
+            for sub in item.iterdir()
+            if sub.is_dir()
+        )
+        if has_plugin_children or item.name in PLUGIN_CATEGORY_FOLDERS:
             for sub in item.iterdir():
                 if sub.is_dir():
                     yield sub
             continue
 
-        yield item
+        # 3. Otherwise it's neither — skip silently.

@@ -245,6 +245,114 @@ async def lotus_invoke(
     if caller_client_id:
         event_target_payload["target_client_id"] = caller_client_id
 
+    # System-level config get/set capabilities — handled inline because they
+    # aren't tied to a plugin's @action methods, they call the config_service
+    # directly. Registered in `core_caps.py` so the frontend can discover them
+    # via /api/lotus/list, but dispatch lives here.
+    if cap_id == "embeddr-core.resource.resolve":
+        # Resolve embeddr:// reactive URIs to the most-recent artifact in a
+        # channel. Plugins drag reactive elements (e.g. comfyui's latest output)
+        # into panels using these URIs; without resolution the panels render
+        # nothing. This is a minimal implementation — sufficient for "show me
+        # the latest" without the full event-stream system the Go server had.
+        from urllib.parse import urlparse, parse_qs
+        url = (inputs.get("url") or inputs.get("uri") or "").strip()
+        if not url:
+            return {"ok": False, "error": "url required"}
+
+        parsed = urlparse(url)
+        if parsed.scheme != "embeddr" or parsed.netloc != "reactive":
+            # Pass non-reactive URLs through as-is — the caller may have its
+            # own resolver chain.
+            return {"ok": True, "url": url, "type": "passthrough"}
+
+        path = (parsed.path or "").lstrip("/").rstrip("/")
+        params = {k: v[0] if v else "" for k, v in parse_qs(parsed.query).items()}
+
+        if path == "latest":
+            channel = params.get("channel", "")
+            # Look up the most-recent artifact with metadata.channel matching.
+            # Cheap implementation: pull recent artifacts and filter in Python.
+            from embeddr_core.models.artifact import Artifact
+            from sqlmodel import select as _select
+            rows = session.exec(
+                _select(Artifact)
+                .order_by(Artifact.created_at.desc())
+                .limit(200)
+            ).all()
+            for art in rows:
+                meta = art.metadata_json or {}
+                if str(meta.get("channel") or "") == channel:
+                    return {
+                        "ok": True,
+                        "type": "artifact",
+                        "artifact": {
+                            "id": str(art.id),
+                            "type_name": art.type_name,
+                            "uri": art.uri,
+                            "metadata_json": dict(meta),
+                        },
+                    }
+            return {"ok": False, "error": f"no recent artifact in channel '{channel}'"}
+
+        if path == "lineage-parent":
+            # Resolve to the source artifact whose URI matches the `source` param.
+            # This is a stand-in until lineage relations are wired through.
+            return {"ok": False, "error": "lineage-parent resolution not implemented"}
+
+        return {"ok": False, "error": f"unsupported reactive path: {path}"}
+
+    if cap_id in ("embeddr-core.config.get", "embeddr-core.config.set"):
+        # `resolve_plugin_config` is already imported at module level (line 21);
+        # importing it again *inside* the function makes Python treat the name
+        # as a local for the whole function and breaks the existing reference
+        # below (line 329) with UnboundLocalError. Only import the new name.
+        from embeddr_core.services.config_service import set_plugin_config
+        target_plugin = inputs.get("plugin_name") or ""
+        target_config_id = inputs.get("config_id") or None
+        target_scope = inputs.get("scope") or "global"
+        if not target_plugin:
+            raise HTTPException(400, "plugin_name required")
+
+        if cap_id == "embeddr-core.config.get":
+            value = resolve_plugin_config(
+                session=session,
+                plugin_name=target_plugin,
+                scope=target_scope,
+                config_id=target_config_id,
+            ) or {}
+            out: Dict[str, Any] = {
+                "ok": True,
+                "plugin_name": target_plugin,
+                "config_id": target_config_id,
+                "scope": target_scope,
+                "value": value,
+            }
+            if inputs.get("include_capability"):
+                target_cap = reg.get(target_config_id) if target_config_id else None
+                if target_cap:
+                    out["capability"] = target_cap.model_dump()
+            return out
+
+        # set
+        new_value = inputs.get("value")
+        if not isinstance(new_value, dict):
+            raise HTTPException(400, "value must be an object")
+        saved = set_plugin_config(
+            session=session,
+            plugin_name=target_plugin,
+            value=new_value,
+            scope=target_scope,
+            config_id=target_config_id,
+        )
+        return {
+            "ok": True,
+            "plugin_name": target_plugin,
+            "config_id": target_config_id,
+            "scope": target_scope,
+            "value": saved,
+        }
+
     # ✅ SYNC path (returns outputs immediately)
     if mode == "sync":
         plugin = get_plugin_instance(plugin_name)

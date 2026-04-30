@@ -13,7 +13,7 @@ from embeddr_core.services.lotus_registry import LotusRegistry
 from embeddr_core.models.lotus import LotusKind, LotusCapability
 from embeddr_core.models.artifact_type import ArtifactType, ArtifactTypeSpec
 from embeddr.db.session import get_engine
-from sqlmodel import Session
+from sqlmodel import Session, select
 from fastapi import FastAPI, APIRouter, Depends
 from embeddr_core.plugin_interface import (
     EmbeddrPlugin,
@@ -155,6 +155,13 @@ def get_loaded_plugins() -> List[Dict[str, Any]]:
             ],
             "pages": [c.model_dump() for c in getattr(p, "pages", [])],
             "widgets": [c.model_dump() for c in getattr(p, "widgets", [])],
+            # Reactive renderables — zen-shell's loader reads these and
+            # populates BOTH the renderable + reactive-context registries.
+            # Returned as plain dicts (already serialized by the adapter).
+            "renderables": [
+                (r if isinstance(r, dict) else r.model_dump())
+                for r in (getattr(p, "renderables", []) or [])
+            ],
         }
 
         # Only add URL if the plugin actually has a dist (frontend build)
@@ -319,6 +326,43 @@ def load_python_plugins(plugins_dir: Path, app: Optional[FastAPI] = None, cli_ap
 
             if plugin_candidates:
                 plugin_instance = plugin_candidates[0][1]()
+            else:
+                # 1b) Petal-style Plugin — wrap via adapter so the rest of the
+                # registration pipeline can treat it as an EmbeddrPlugin.
+                from embeddr.core.petal_adapter import (
+                    is_petal_plugin_class,
+                    PetalEmbeddrAdapter,
+                )
+                petal_candidates = [
+                    (n, obj) for n, obj in inspect.getmembers(module)
+                    if is_petal_plugin_class(obj) and obj.__module__ == module.__name__
+                ]
+                if len(petal_candidates) > 1:
+                    names = [n for n, _ in petal_candidates]
+                    logger.warning(
+                        "[PluginLoader] Multiple petal Plugin subclasses in %s: %s — using %s.",
+                        folder_module_name, names, names[0],
+                    )
+                if petal_candidates:
+                    petal_obj = petal_candidates[0][1]()
+                    plugin_instance = PetalEmbeddrAdapter(petal_obj)
+                    # Register petal @action methods as Lotus capabilities so
+                    # /api/lotus/{cap_id} can resolve and dispatch them.
+                    try:
+                        lotus_reg = get_lotus_registry()
+                        registered = 0
+                        for cap in plugin_instance.build_lotus_capabilities():
+                            lotus_reg.register(cap)
+                            registered += 1
+                        logger.info(
+                            "[PluginLoader] Wrapped petal plugin %s via adapter (+%d lotus caps)",
+                            plugin_instance.name, registered,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[PluginLoader] Failed to register lotus caps for %s: %s",
+                            plugin_instance.name, exc,
+                        )
 
             if plugin_instance:
                 # Canonical module name based on the plugin's declared name
@@ -805,6 +849,22 @@ def _reconcile_artifact_types() -> None:
 
                 existing = session.get(ArtifactType, spec.name)
                 if existing:
+                    # Stamp registered_by + un-deprecate when a plugin re-registers
+                    # one of its types. Catches existing rows from before this
+                    # tracking was added, so the orphan-detection pass below
+                    # doesn't deprecate types that ARE actively claimed.
+                    existing_meta = dict(existing.metadata_json or {})
+                    meta_dirty = False
+                    if existing_meta.pop("deprecated", None):
+                        meta_dirty = True
+                    if plugin and existing_meta.get("registered_by") != plugin:
+                        existing_meta["registered_by"] = plugin
+                        meta_dirty = True
+                    if meta_dirty:
+                        existing.metadata_json = existing_meta
+                        session.add(existing)
+                    # Mark as claimed-this-run so the orphan pass below leaves it alone.
+                    created.add(spec.name)
                     if spec.parent_name and existing.parent_name != spec.parent_name:
                         conflict_count += 1
                         _emit_schema_event(
@@ -824,7 +884,14 @@ def _reconcile_artifact_types() -> None:
                         )
                     continue
 
-                session.add(ArtifactType(**spec.model_dump()))
+                # Stamp registered_by so we can detect orphans later when the
+                # plugin isn't loaded anymore.
+                spec_dict = spec.model_dump()
+                spec_meta = dict(spec_dict.get("metadata_json") or {})
+                if plugin and "registered_by" not in spec_meta:
+                    spec_meta["registered_by"] = plugin
+                spec_dict["metadata_json"] = spec_meta
+                session.add(ArtifactType(**spec_dict))
                 created.add(spec.name)
                 progress = True
                 created_count += 1
@@ -848,6 +915,31 @@ def _reconcile_artifact_types() -> None:
                 {"name": spec.name, "reason": "missing_parent"},
             )
 
+    # Deprecate orphaned types: ones that no currently-loaded plugin claimed
+    # in this reconcile pass. We don't delete — artifacts may still reference
+    # them and they need to render. The frontend hides deprecated types from
+    # pickers and trees by default.
+    #
+    # `created` collects type names just-now-created or just-re-registered
+    # (the existing-type branch above adds to created when it stamps).
+    # We use that as "claimed-this-run" and deprecate everything else.
+    deprecated_count = 0
+    with Session(get_engine()) as session:
+        all_types = session.exec(select(ArtifactType)).all()
+        for t in all_types:
+            meta = dict(t.metadata_json or {})
+            if meta.get("deprecated"):
+                continue
+            if t.name in created:
+                continue
+            # Not claimed this run — orphan. Mark deprecated; if its plugin
+            # comes back later, the main loop will revive it.
+            meta["deprecated"] = True
+            t.metadata_json = meta
+            session.add(t)
+            deprecated_count += 1
+        session.commit()
+
     # Summary line instead of per-type noise
     parts = []
     if created_count:
@@ -858,5 +950,7 @@ def _reconcile_artifact_types() -> None:
         parts.append(f"{conflict_count} conflicts")
     if skipped_count:
         parts.append(f"{skipped_count} skipped")
+    if deprecated_count:
+        parts.append(f"{deprecated_count} deprecated")
     if parts:
         logger.info("Artifact types reconciled: %s", ", ".join(parts))

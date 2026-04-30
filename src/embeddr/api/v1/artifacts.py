@@ -4,10 +4,11 @@ from sqlalchemy import literal
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Any, Dict, List, Optional, Set
 from uuid import UUID, uuid5, NAMESPACE_URL
+import json
 import os
 from time import perf_counter
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, Response, RedirectResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session, select, col, func, or_, cast, String, delete
@@ -684,6 +685,13 @@ def _apply_visibility_filter(query, count_query, visibility: Optional[str]):
 
 
 def _apply_owner_filter(query, auth, access_scope: str = "instance"):
+    # Open mode (single-user, no operator scoping) sees everything regardless
+    # of access_scope. Without this, the Explorer's `access_scope=personal`
+    # request resolves to WHERE False (no user_id, no operator_id) and the
+    # browser shows zero artifacts.
+    if not auth or getattr(auth, "is_open", False) or getattr(auth, "is_root", False):
+        return query
+
     scope = (access_scope or "instance").strip().lower()
 
     if scope == "personal":
@@ -812,6 +820,103 @@ async def ingest_artifacts(
         count += 1
 
     return {"status": "accepted", "queued": count}
+
+
+@router.post("/upload")
+async def upload_atomic(
+    file: UploadFile = File(...),
+    type_name: str = Form("artifact"),
+    metadata_json: Optional[str] = Form(None),
+    artifact_id: Optional[str] = Form(None),
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Single-shot upload: stores content first, then commits an artifact.
+
+    Either everything lands or nothing does — no orphan artifacts when storage
+    or the request fails. Use this from plugins like devtools that just want
+    "give me a file and a type and produce an artifact" without orchestrating
+    the two-phase /ingest/upload-request + /uploads/{id} flow.
+    """
+    import json
+
+    try:
+        meta = json.loads(metadata_json) if metadata_json else {}
+        if not isinstance(meta, dict):
+            meta = {}
+    except (ValueError, TypeError):
+        meta = {}
+
+    # Resolve target artifact: existing if id provided, otherwise a fresh
+    # in-memory instance (NOT yet added to the session).
+    if artifact_id:
+        try:
+            existing_id = UUID(artifact_id)
+        except (ValueError, TypeError):
+            raise HTTPException(400, "invalid artifact_id")
+        artifact = session.get(Artifact, existing_id)
+        if not artifact:
+            raise HTTPException(404, "Artifact not found")
+        is_new = False
+    else:
+        artifact = Artifact(
+            type_name=type_name or "artifact",
+            metadata_json=meta,
+            owner_user_id=getattr(auth, "user_id", None),
+            owner_operator_id=getattr(auth, "operator_id", None),
+        )
+        is_new = True
+
+    filename = Path(file.filename or "upload.bin").name
+    content_type = file.content_type
+
+    # Store content FIRST. If storage fails, the in-memory artifact is
+    # discarded — never added to the session, never committed.
+    try:
+        blob_ref = storage_service.store_upload(
+            session=None,  # type: ignore
+            artifact=artifact,
+            upload_file=file,
+            filename=filename,
+            content_type=content_type,
+            backend_hint="local",
+            confirmed=True,
+        )
+    except Exception as exc:
+        logger.error("Atomic upload storage failed: %s", exc)
+        raise HTTPException(500, f"Upload failed: {exc}")
+
+    storage_path = blob_ref_storage_path(blob_ref)
+    if not storage_path:
+        raise HTTPException(500, "blob_storage_path_missing")
+
+    # Storage succeeded — now persist artifact + blob in a single transaction.
+    artifact.uri = storage_path
+    if is_new:
+        session.add(artifact)
+
+    blob = ArtifactBlob(
+        artifact_id=artifact.id,
+        storage_backend=blob_ref.provider,
+        path=storage_path,
+        sha256=blob_ref.etag,
+        size=blob_ref.size,
+        content_type=blob_ref.content_type,
+    )
+    session.add(blob)
+    session.commit()
+    session.refresh(artifact)
+
+    if is_new:
+        publish_artifact_created(artifact, source="api/v1/artifacts/upload")
+
+    return {
+        "id": str(artifact.id),
+        "uri": artifact.uri,
+        "type_name": artifact.type_name,
+        "size": blob_ref.size,
+        "content_type": blob_ref.content_type,
+    }
 
 
 @router.post("/uploads/{upload_id}")
@@ -983,6 +1088,34 @@ async def create_artifact(
     publish_artifact_created(new_art, source="api/v2/artifacts")
 
     return new_art
+
+
+@router.put("/{artifact_id}/metadata", response_model=Artifact)
+def update_artifact_metadata(
+    artifact_id: UUID,
+    body: Dict[str, Any],
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Replace-merge a single artifact's metadata.
+
+    Matches what `embeddr_client.artifacts.update_metadata` sends:
+    PUT /artifacts/{id}/metadata with body {"metadata": {...}}.
+    Shallow-merged into existing metadata_json (same semantics as PATCH).
+    """
+    artifact = _ensure_artifact_access(
+        session, artifact_id, auth, for_write=True)
+    metadata = body.get("metadata") if isinstance(body, dict) else None
+    if not isinstance(metadata, dict):
+        raise HTTPException(
+            status_code=400, detail="body must be {'metadata': {...}}")
+    current = dict(artifact.metadata_json or {})
+    current.update(metadata)
+    artifact.metadata_json = current
+    session.add(artifact)
+    session.commit()
+    session.refresh(artifact)
+    return artifact
 
 
 @router.patch("/{artifact_id}", response_model=Artifact)
@@ -1337,6 +1470,7 @@ def bulk_operations(
             status_code=400, detail=f"Unknown operation {request.operation}")
 
 
+@router.get("", response_model=PaginatedArtifacts, include_in_schema=False)
 @router.get("/", response_model=PaginatedArtifacts)
 def list_artifacts(
     limit: int = 50,
@@ -2143,6 +2277,116 @@ def get_artifact_embeddings(
     query = select(ArtifactEmbedding).where(
         ArtifactEmbedding.artifact_id == artifact_id)
     return session.exec(query).all()
+
+
+@router.post("/{artifact_id}/features", response_model=ArtifactFeatureRef, status_code=201)
+def attach_artifact_feature(
+    artifact_id: UUID,
+    body: Dict[str, Any],
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Attach (or upsert) a plugin-produced feature to an artifact.
+
+    Matches `embeddr_client.features.attach(...)`: POST body is
+    {feature_type, name, storage_ref, metadata_json, producer_plugin, ...}.
+    The (artifact_id, feature_type, name) tuple is unique — re-attaching
+    overwrites the previous payload. This is the path comfyui generation
+    provenance lands on.
+    """
+    _ensure_artifact_access(session, artifact_id, auth, for_write=True)
+
+    feature_type = (body.get("feature_type") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not feature_type or not name:
+        raise HTTPException(
+            status_code=400, detail="feature_type and name are required")
+
+    storage_ref_raw = body.get("storage_ref")
+    if isinstance(storage_ref_raw, str):
+        try:
+            storage_ref: Dict[str, Any] = json.loads(storage_ref_raw)
+        except (ValueError, TypeError):
+            storage_ref = {"raw": storage_ref_raw}
+    elif isinstance(storage_ref_raw, dict):
+        storage_ref = storage_ref_raw
+    else:
+        storage_ref = {}
+
+    metadata_raw = body.get("metadata_json")
+    metadata_json: Dict[str, Any] = (
+        metadata_raw if isinstance(metadata_raw, dict) else {}
+    )
+
+    existing = session.exec(
+        select(ArtifactFeatureRef).where(
+            ArtifactFeatureRef.artifact_id == artifact_id,
+            ArtifactFeatureRef.feature_type == feature_type,
+            ArtifactFeatureRef.name == name,
+        )
+    ).first()
+
+    if existing:
+        existing.producer_plugin = body.get("producer_plugin") or existing.producer_plugin
+        existing.producer_version = body.get("producer_version") or existing.producer_version
+        existing.schema_version = body.get("schema_version") or existing.schema_version
+        existing.storage_kind = (body.get("storage_kind") or "json")
+        existing.storage_ref = storage_ref
+        existing.metadata_json = metadata_json
+        if "model_name" in body:
+            existing.model_name = body.get("model_name")
+        if "space" in body:
+            existing.space = body.get("space")
+        if "vector_dim" in body:
+            existing.vector_dim = body.get("vector_dim")
+        if "content_hash" in body:
+            existing.content_hash = body.get("content_hash")
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        return existing
+
+    feature = ArtifactFeatureRef(
+        artifact_id=artifact_id,
+        feature_type=feature_type,
+        name=name,
+        producer_plugin=body.get("producer_plugin"),
+        producer_version=body.get("producer_version"),
+        schema_version=body.get("schema_version"),
+        content_hash=body.get("content_hash"),
+        storage_kind=(body.get("storage_kind") or "json"),
+        storage_ref=storage_ref,
+        model_name=body.get("model_name"),
+        space=body.get("space"),
+        vector_dim=body.get("vector_dim"),
+        metadata_json=metadata_json,
+    )
+    session.add(feature)
+    session.commit()
+    session.refresh(feature)
+    return feature
+
+
+@router.delete("/{artifact_id}/features/{feature_id}")
+def delete_artifact_feature(
+    artifact_id: UUID,
+    feature_id: UUID,
+    session: Session = Depends(get_session),
+    auth=Depends(get_auth_context),
+):
+    """Remove a feature reference from an artifact (matches client.features.delete)."""
+    _ensure_artifact_access(session, artifact_id, auth, for_write=True)
+    feature = session.exec(
+        select(ArtifactFeatureRef).where(
+            ArtifactFeatureRef.id == feature_id,
+            ArtifactFeatureRef.artifact_id == artifact_id,
+        )
+    ).first()
+    if not feature:
+        raise HTTPException(status_code=404, detail="Feature not found")
+    session.delete(feature)
+    session.commit()
+    return {"status": "deleted", "id": str(feature_id)}
 
 
 @router.get("/{artifact_id}/features", response_model=List[ArtifactFeatureRef])

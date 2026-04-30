@@ -39,6 +39,85 @@ def register_core_lotus_capabilities() -> None:
 def _core_capabilities() -> list[LotusCapability]:
     return [
         LotusCapability(
+            id="embeddr-core.resource.resolve",
+            kind=LotusKind.action,
+            title="Resolve resource URL",
+            description="Resolve an embeddr:// or external URL to artifact info / playable content.",
+            plugin="embeddr-core",
+            tags=["core", "resource", "system"],
+            data={
+                "type": "action",
+                "plugin_name": "embeddr-core",
+                "action": "embeddr-core.resource.resolve",
+                "exec": {"mode": "sync"},
+                "expose": {"lotus": True, "api": True, "cli": False},
+                "input": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "uri": {"type": "string"},
+                            "hint_type": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ),
+        LotusCapability(
+            id="embeddr-core.config.get",
+            kind=LotusKind.action,
+            title="Get plugin config",
+            description="Read a plugin's persisted configuration (or model defaults).",
+            plugin="embeddr-core",
+            tags=["core", "config", "system"],
+            data={
+                "type": "action",
+                "plugin_name": "embeddr-core",
+                "action": "embeddr-core.config.get",
+                "exec": {"mode": "sync"},
+                "expose": {"lotus": True, "api": True, "cli": False},
+                "input": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "plugin_name": {"type": "string"},
+                            "config_id": {"type": "string"},
+                            "scope": {"type": "string", "default": "global"},
+                            "include_capability": {"type": "boolean", "default": False},
+                        },
+                        "required": ["plugin_name"],
+                    },
+                },
+            },
+        ),
+        LotusCapability(
+            id="embeddr-core.config.set",
+            kind=LotusKind.action,
+            title="Set plugin config",
+            description="Persist a plugin's configuration value.",
+            plugin="embeddr-core",
+            tags=["core", "config", "system"],
+            data={
+                "type": "action",
+                "plugin_name": "embeddr-core",
+                "action": "embeddr-core.config.set",
+                "exec": {"mode": "sync"},
+                "expose": {"lotus": True, "api": True, "cli": False},
+                "input": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "plugin_name": {"type": "string"},
+                            "config_id": {"type": "string"},
+                            "scope": {"type": "string", "default": "global"},
+                            "value": {"type": "object"},
+                        },
+                        "required": ["plugin_name", "value"],
+                    },
+                },
+            },
+        ),
+        LotusCapability(
             id="embeddr-core.transport.policy",
             kind=LotusKind.config,
             title="Transport Policy",

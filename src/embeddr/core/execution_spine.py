@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 import traceback
 from datetime import UTC, datetime
@@ -1586,11 +1587,34 @@ class ExecutionSpine:
                     job.plugin_name,
                     _redact_inputs(job.inputs),
                 )
-                # Run the handler (support async or sync)
-                if asyncio.iscoroutinefunction(handler):
-                    outputs = await handler(ctx)
-                else:
-                    outputs = await asyncio.to_thread(handler, ctx)
+                # Run the handler (support async or sync) under a hard timeout.
+                # Without this, a deadlocked plugin (e.g. one that holds the
+                # Python import lock during a failed lazy import) leaves the
+                # worker slot held forever and eventually starves the dispatcher.
+                # Default 10 minutes; raise EMBEDDR_JOB_HANDLER_TIMEOUT for
+                # legitimately long-running jobs.
+                handler_timeout = float(
+                    os.environ.get("EMBEDDR_JOB_HANDLER_TIMEOUT", "600"))
+                try:
+                    if asyncio.iscoroutinefunction(handler):
+                        outputs = await asyncio.wait_for(
+                            handler(ctx), timeout=handler_timeout)
+                    else:
+                        outputs = await asyncio.wait_for(
+                            asyncio.to_thread(handler, ctx),
+                            timeout=handler_timeout,
+                        )
+                except asyncio.TimeoutError:
+                    # Sync handlers run in a thread that wait_for cannot cancel.
+                    # The thread keeps running but the worker slot is freed so
+                    # the server stays responsive.
+                    logger.error(
+                        "Job %s exceeded %ss timeout (type=%s plugin=%s); "
+                        "worker slot freed, underlying thread may still run",
+                        job_id, handler_timeout, job.type, job.plugin_name,
+                    )
+                    raise RuntimeError(
+                        f"Handler exceeded {handler_timeout}s timeout") from None
 
                 logger.info(
                     "Job completed: id=%s type=%s plugin=%s outputs=%s",

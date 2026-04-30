@@ -24,6 +24,7 @@ def build_route_registrations(api_dependencies: Sequence[Any]) -> List[RouteRegi
     from embeddr.api.v1 import system as system_v2
     from embeddr.api.v1 import system_public as system_public_v2
     from embeddr.api.v1 import themes as themes_v2
+    from embeddr.api.v1 import types as types_v2
     from embeddr.api.v1 import workers as workers_v1
     from embeddr.api.v1 import workflows as workflows_v2
 
@@ -71,6 +72,8 @@ def build_route_registrations(api_dependencies: Sequence[Any]) -> List[RouteRegi
         (security_router.router, "/api/v1/security", ["security"], []),
         (themes_v2.router, "/api/themes", ["themes"], []),
         (themes_v2.router, "/api/v1/themes", ["themes"], []),
+        (types_v2.router, "/api/types", ["types"], api_dependencies),
+        (types_v2.router, "/api/v1/types", ["types"], api_dependencies),
         (workers_v1.router, "/api/v1/workers", ["workers"], []),
         (panels_v1.router, "/api/panels", ["panels"], api_dependencies),
         (panels_v1.router, "/api/v1/panels", ["panels"], api_dependencies),
